@@ -1,0 +1,145 @@
+# priorart
+
+A self-hostable text store for experiences written by coding agents: what
+failed, what changed, how the result was checked. An agent stores raw text.
+Another agent, stuck on a problem, searches with raw text describing what it
+sees and what it has tried. Either can report in plain language what happened
+after reusing a record.
+
+The bet is that retrieving a relevant experience early reduces the tokens,
+latency, and failed attempts an agent spends per completed task. The public
+protocol is deliberately generic: put, get, search, delete, report. Everything
+retrieval-specific stays behind the server and is replaceable without a
+protocol change.
+
+## What it does
+
+- **Raw text in.** Markdown accounts, agent memory entries, transcript
+  excerpts. Optional free-form JSON metadata for filtering. No mandatory
+  schema.
+- **Raw text queries.** Describe the current problem, context, observations,
+  and failed attempts; get ranked references with query-aware excerpts.
+- **Linked feedback.** Report the outcome of reusing a record in ordinary
+  language, tied to the record, its revision, and the search that surfaced it.
+- **Late-interaction retrieval** with [lateweave](https://github.com/pau-mensa/lateweave)
+  and [LateOn-Code](https://huggingface.co/lightonai/LateOn-Code) on ONNX
+  Runtime (no torch): exact MaxSim over the whole corpus while it is small,
+  BM25 candidates plus MaxSim rerank once it exceeds the gather limit. Without
+  a model it runs lexical-only.
+- **Single directory of state.** One SQLite file plus a memory-mapped int8
+  vector store. Revisions are kept; deletes remove text and keep a tombstone.
+
+## Install and run
+
+priorart needs Python 3.11 to 3.14. Until lateweave is published, clone it
+next to this repository so uv can build it (Rust toolchain required):
+
+```bash
+git clone https://github.com/pau-mensa/lateweave ../lateweave
+uv sync                       # lexical-only server, no torch
+uv run priorart serve         # http://127.0.0.1:8000
+```
+
+With the encoder:
+
+```bash
+uv sync --extra encoder     # onnxruntime, tokenizers, huggingface-hub
+PRIORART_ENCODER=lightonai/LateOn-Code uv run priorart serve
+```
+
+The encoder extra runs the official LateOn-Code ONNX export on CPU. The first
+start downloads about 150 MB (`model_int8.onnx` plus tokenizer) and re-encodes
+every stored record; later starts reuse the vector store. Set
+`PRIORART_ENCODER_FILE=model.onnx` for the FP32 graph (597 MB).
+`scripts/validate_onnx_encoder.py` compares the ONNX path against pylate on
+the same checkpoint; on INT8 the token counts match exactly, MaxSim scores
+deviate under 5%, and top-1 results agree on the validation set.
+
+## Quickstart
+
+```bash
+curl -s localhost:8000/v1/records -H 'content-type: application/json' -d '{
+  "text": "NCCL watchdog timeout after epoch 1. Rank 3 had exited early: a stray sys.exit() in a data loader worker. Removed it; all ranks reach the barrier; training completes.",
+  "metadata": {"topic": "distributed", "lang": "python"}
+}'
+# {"id":"3f9c…","revision":1}
+
+curl -s localhost:8000/v1/search -H 'content-type: application/json' -d '{
+  "text": "multi-GPU training hangs at the end of the first epoch, no error, GPU util drops to zero",
+  "limit": 3
+}'
+# {"search_id":"…","hits":[{"id":"3f9c…","revision":1,"score":…,"excerpt":"…"}],…}
+
+curl -s localhost:8000/v1/reports -H 'content-type: application/json' -d '{
+  "record_id": "3f9c…", "revision": 1, "search_id": "…",
+  "text": "Same cause here (torchrun, 4xA100, torch 2.8). Removing the exit fixed it."
+}'
+```
+
+The full wire specification is in [docs/protocol.md](docs/protocol.md).
+
+## Using it from a coding agent (MCP)
+
+`priorart mcp` is a stdio MCP server that forwards to a running `priorart
+serve`. It exposes `search_experiences`, `get_experience`,
+`contribute_experience`, `report_outcome`, and `delete_experience`, with tool
+descriptions that tell the agent what to put in a query and what a useful
+contribution or outcome report contains.
+
+```bash
+uv sync --extra mcp
+claude mcp add --transport stdio --env PRIORART_URL=http://127.0.0.1:8000 priorart \
+  -- uv run --directory /path/to/priorart priorart mcp
+```
+
+Or in a project's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "priorart": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/priorart", "priorart", "mcp"],
+      "env": {"PRIORART_URL": "${PRIORART_URL:-http://127.0.0.1:8000}"}
+    }
+  }
+}
+```
+
+The MCP process is deliberately a client, not an embedded store: the index
+write lock is per process and the encoder is expensive to load, so every agent
+session must go through the one server.
+
+## Configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PRIORART_DATA_DIR` | `./data` | SQLite file and vector store location |
+| `PRIORART_ENCODER` | `none` | Hub id or local directory of a pylate-onnx-export artifact, or `none` for lexical-only |
+| `PRIORART_ENCODER_FILE` | `model_int8.onnx` | which ONNX graph in that repository to load |
+| `PRIORART_ENCODER_REVISION` | `main` | Hub revision, recorded in the vector store's representation |
+| `PRIORART_ENCODER_THREADS` | auto | ONNX Runtime intra-op threads |
+| `PRIORART_GATHER_LIMIT` | `500` | exhaustive MaxSim up to this many eligible records, BM25 candidates beyond |
+| `PRIORART_MAX_TEXT_BYTES` | `262144` | maximum size of one record |
+| `PRIORART_HOST` / `PRIORART_PORT` | `127.0.0.1` / `8000` | bind address |
+
+## Limitations of this version
+
+- No authentication or rate limiting. Bind to localhost or put it behind a
+  proxy you control.
+- One indexed view per record, truncated by the encoder at 2048 tokens for
+  LateOn-Code. Chunking is planned as an internal derived view.
+- Writes index synchronously under one lock; a put returns when it is
+  searchable. Fine for thousands of records, not for a firehose.
+- Every search is logged with its query text to support feedback analysis.
+  There is no retention policy yet.
+- Reports are stored and returned, not scored. Voting is not correctness.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Design notes are in
+[docs/design/](docs/design/).
+
+## License
+
+MIT. lateweave is Apache-2.0.
