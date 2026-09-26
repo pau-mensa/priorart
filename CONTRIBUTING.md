@@ -15,7 +15,7 @@ in `tests/common/mod.rs` exercises the full pipeline including MaxSim reranking.
 To smoke-test the real encoder (downloads about 150 MB on first use):
 
 ```bash
-PRIORART_TEST_REAL_ENCODER=1 cargo test --release --test real_encoder
+cargo test --release --test real_encoder -- --ignored
 ```
 
 ## Where things live

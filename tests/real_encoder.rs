@@ -1,5 +1,5 @@
-//! Opt-in smoke test against the official LateOn-Code ONNX artifact:
-//! `PRIORART_TEST_REAL_ENCODER=1 cargo test --test real_encoder`.
+//! Smoke tests against the official LateOn-Code ONNX artifact, ignored by
+//! default: `cargo test --release --test real_encoder -- --ignored`.
 //! The first run downloads about 150 MB.
 #![cfg(feature = "onnx")]
 
@@ -11,24 +11,19 @@ use priorart::service::Service;
 
 const MODEL: &str = "lightonai/LateOn-Code";
 
-fn encoder() -> Option<Arc<OnnxEncoder>> {
-    if std::env::var("PRIORART_TEST_REAL_ENCODER").as_deref() != Ok("1") {
-        eprintln!("set PRIORART_TEST_REAL_ENCODER=1 to run");
-        return None;
-    }
+fn encoder() -> Arc<OnnxEncoder> {
     static ENCODER: OnceLock<Arc<OnnxEncoder>> = OnceLock::new();
-    Some(
-        ENCODER
-            .get_or_init(|| {
-                Arc::new(OnnxEncoder::load(MODEL, "model_int8.onnx", "main", None).unwrap())
-            })
-            .clone(),
-    )
+    ENCODER
+        .get_or_init(|| {
+            Arc::new(OnnxEncoder::load(MODEL, "model_int8.onnx", "main", None).unwrap())
+        })
+        .clone()
 }
 
 #[test]
+#[ignore = "downloads LateOn-Code"]
 fn representation_and_vectors() {
-    let Some(encoder) = encoder() else { return };
+    let encoder = encoder();
     let representation = encoder.representation();
     assert_eq!(representation.dimension(), 128);
     assert!(representation.normalized());
@@ -57,8 +52,9 @@ fn representation_and_vectors() {
 }
 
 #[test]
+#[ignore = "downloads LateOn-Code"]
 fn end_to_end() {
-    let Some(encoder) = encoder() else { return };
+    let encoder = encoder();
     let directory = tempfile::tempdir().unwrap();
     let settings = Settings {
         data_dir: directory.path().to_path_buf(),
