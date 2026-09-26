@@ -40,7 +40,7 @@ uv run scripts/validate_onnx_encoder.py --file model.onnx    # FP32
 | `api.py` | FastAPI routes and schemas |
 | `mcp_server.py` | stdio MCP tools forwarding to the HTTP API |
 
-Design documents are in `docs/design/`. The wire protocol is `docs/protocol.md`.
+The wire protocol is `docs/protocol.md`.
 
 ## Ground rules
 

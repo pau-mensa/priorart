@@ -137,8 +137,7 @@ session must go through the one server.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Design notes are in
-[docs/design/](docs/design/).
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
