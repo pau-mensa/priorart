@@ -88,7 +88,9 @@ Returns:
 - `score_semantics` names the stage that ranked the hits so scores from
   different configurations are never compared blindly.
 - `gatherer` is `exhaustive` when every eligible record was scored by the
-  reranker, `bm25s` when a lexical candidate stage ran first.
+  reranker, `bm25` when a lexical candidate stage ran first, and `none` when
+  no record was eligible. Lexical-only servers report `score_semantics`
+  `bm25-lucene`.
 - Every search is logged with its `search_id`, query, filters, and returned
   hits so a later report can be joined to the query that surfaced a record.
 

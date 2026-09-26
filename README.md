@@ -28,32 +28,32 @@ protocol change.
   a model it runs lexical-only.
 - **Single directory of state.** One SQLite file plus a memory-mapped int8
   vector store. Revisions are kept; deletes remove text and keep a tombstone.
+- **One binary.** Written in Rust; the HTTP server and the MCP client ship in
+  the same `priorart` executable.
 
 ## Install and run
 
-priorart needs Python 3.11 to 3.14. Until lateweave is published, clone it
-next to this repository so uv can build it (Rust toolchain required):
+priorart needs a Rust toolchain (1.88 or newer). lateweave is fetched as a git
+dependency, so no sibling checkout is required.
 
 ```bash
-git clone https://github.com/pau-mensa/lateweave ../lateweave
-uv sync                       # lexical-only server, no torch
-uv run priorart serve         # http://127.0.0.1:8000
+cargo install --path .        # or: cargo build --release
+priorart serve                # lexical-only, http://127.0.0.1:8000
 ```
 
 With the encoder:
 
 ```bash
-uv sync --extra encoder     # onnxruntime, tokenizers, huggingface-hub
-PRIORART_ENCODER=lightonai/LateOn-Code uv run priorart serve
+PRIORART_ENCODER=lightonai/LateOn-Code priorart serve
 ```
 
-The encoder extra runs the official LateOn-Code ONNX export on CPU. The first
-start downloads about 150 MB (`model_int8.onnx` plus tokenizer) and re-encodes
-every stored record; later starts reuse the vector store. Set
-`PRIORART_ENCODER_FILE=model.onnx` for the FP32 graph (597 MB).
-`scripts/validate_onnx_encoder.py` compares the ONNX path against pylate on
-the same checkpoint; on INT8 the token counts match exactly, MaxSim scores
-deviate under 5%, and top-1 results agree on the validation set.
+The default `onnx` feature runs the official LateOn-Code ONNX export on CPU
+through ONNX Runtime (the runtime library is downloaded at build time). The
+first start downloads about 150 MB (`model_int8.onnx` plus tokenizer) into the
+Hugging Face cache and re-encodes every stored record; later starts reuse the
+vector store. Set `PRIORART_ENCODER_FILE=model.onnx` for the FP32 graph
+(597 MB). `cargo build --no-default-features` produces a lexical-only binary
+without ONNX Runtime; configuring an encoder in that build is a startup error.
 
 ## Quickstart
 
@@ -87,9 +87,8 @@ descriptions that tell the agent what to put in a query and what a useful
 contribution or outcome report contains.
 
 ```bash
-uv sync --extra mcp
 claude mcp add --transport stdio --env PRIORART_URL=http://127.0.0.1:8000 priorart \
-  -- uv run --directory /path/to/priorart priorart mcp
+  -- priorart mcp
 ```
 
 Or in a project's `.mcp.json`:
@@ -98,8 +97,8 @@ Or in a project's `.mcp.json`:
 {
   "mcpServers": {
     "priorart": {
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/priorart", "priorart", "mcp"],
+      "command": "priorart",
+      "args": ["mcp"],
       "env": {"PRIORART_URL": "${PRIORART_URL:-http://127.0.0.1:8000}"}
     }
   }
@@ -136,6 +135,10 @@ For database upgrades and recovery behavior, see [storage versions](docs/storage
   LateOn-Code. Chunking is planned as an internal derived view.
 - Writes index synchronously under one lock; a put returns when it is
   searchable. Fine for thousands of records, not for a firehose.
+- A record write and its vector-store update are not atomic together, and the
+  vector store publishes each mutation as several file renames. Startup
+  compares the database, index mirror, and vector store and rebuilds the index
+  from SQLite on any disagreement.
 - Every search is logged with its query text to support feedback analysis.
   There is no retention policy yet.
 - Reports are stored and returned, not scored. Voting is not correctness.
