@@ -8,6 +8,7 @@ import sys
 from . import __version__
 from .config import Settings
 from .encoder import EncoderUnavailable
+from .migrations import SchemaError
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -48,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
         from .service import Service
 
         service = Service.open(settings)
-    except EncoderUnavailable as error:
+    except (EncoderUnavailable, SchemaError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
     print(

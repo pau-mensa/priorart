@@ -125,6 +125,8 @@ session must go through the one server.
 
 ## Limitations of this version
 
+For database upgrades and recovery behavior, see [storage versions](docs/storage.md).
+
 - No authentication or rate limiting. Bind to localhost or put it behind a
   proxy you control.
 - One indexed view per record, truncated by the encoder at 2048 tokens for

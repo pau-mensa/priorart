@@ -22,6 +22,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .migrations import migrate
+
 
 class RecordNotFound(KeyError):
     """No record, revision, or report target with that id."""
@@ -55,50 +57,6 @@ class Report:
     created_at: str
 
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS records (
-    id TEXT PRIMARY KEY,
-    created_at TEXT NOT NULL,
-    deleted_at TEXT
-);
-CREATE TABLE IF NOT EXISTS revisions (
-    record_id TEXT NOT NULL REFERENCES records(id),
-    revision INTEGER NOT NULL,
-    text TEXT,
-    metadata TEXT,
-    text_sha256 TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (record_id, revision)
-);
-CREATE TABLE IF NOT EXISTS reports (
-    id TEXT PRIMARY KEY,
-    record_id TEXT NOT NULL REFERENCES records(id),
-    revision INTEGER,
-    search_id TEXT,
-    text TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS reports_record ON reports(record_id, created_at);
-CREATE TABLE IF NOT EXISTS searches (
-    id TEXT PRIMARY KEY,
-    text TEXT NOT NULL,
-    filters TEXT,
-    hits TEXT NOT NULL,
-    timings TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS index_documents (
-    internal_id INTEGER PRIMARY KEY,
-    record_id TEXT NOT NULL UNIQUE,
-    revision INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS index_state (
-    key TEXT PRIMARY KEY,
-    value TEXT
-);
-"""
-
-
 def _now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -116,9 +74,14 @@ class Store:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
-        self._connection.execute("PRAGMA journal_mode=WAL")
-        self._connection.execute("PRAGMA foreign_keys=ON")
-        self._connection.executescript(_SCHEMA)
+        try:
+            self._connection.execute("PRAGMA foreign_keys=ON")
+            migrate(self._connection)
+            # Reject unsupported schemas before changing persistent journal settings.
+            self._connection.execute("PRAGMA journal_mode=WAL")
+        except BaseException:
+            self._connection.close()
+            raise
 
     def close(self) -> None:
         self._connection.close()

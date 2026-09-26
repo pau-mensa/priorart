@@ -33,6 +33,7 @@ uv run scripts/validate_onnx_encoder.py --file model.onnx    # FP32
 | Module | Responsibility |
 |---|---|
 | `store.py` | SQLite: records, revisions, reports, searches, index mirror |
+| `migrations.py` | transactional schema versions and legacy database adoption |
 | `index.py` | vector store, lexical index, corpus manifest, recovery |
 | `gather.py` | exhaustive and bm25s candidate generators |
 | `encoder.py` | `Encoder` protocol and the ONNX Runtime implementation |
@@ -41,6 +42,8 @@ uv run scripts/validate_onnx_encoder.py --file model.onnx    # FP32
 | `mcp_server.py` | stdio MCP tools forwarding to the HTTP API |
 
 The wire protocol is `docs/protocol.md`.
+
+Schema changes follow [the storage migration guidance](docs/storage.md).
 
 ## Ground rules
 
