@@ -36,4 +36,5 @@ default = ["onnx"]
 onnx = ["dep:ort", "dep:tokenizers", "dep:hf-hub"]
 
 [dev-dependencies]
+rmcp = { version = "2.2.0", features = ["client"] }
 tempfile = "3.27.0"
