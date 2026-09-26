@@ -13,7 +13,7 @@ from .config import Settings
 from .encoder import Encoder, load_encoder
 from .excerpt import excerpt
 from .index import Index
-from .store import Report, Revision, Store
+from .store import LOCAL_COLLECTION_ID, LOCAL_PRINCIPAL_ID, Report, Revision, Store
 
 RECORD_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 MAX_LIMIT = 100
@@ -26,6 +26,7 @@ class InvalidInput(ValueError):
 
 @dataclass(frozen=True)
 class Hit:
+    collection_id: str
     id: str
     revision: int
     score: float
@@ -45,10 +46,12 @@ class SearchOutcome:
 class Service:
     def __init__(self, settings: Settings, encoder: Encoder | None) -> None:
         self.settings = settings
+        # The existing v1 service is an explicit local single-collection adapter.
+        self.collection_id = LOCAL_COLLECTION_ID
         settings.data_dir.mkdir(parents=True, exist_ok=True)
         self.store = Store(settings.data_dir / "priorart.sqlite")
         self.encoder = encoder
-        self.index = Index(settings.data_dir, self.store, encoder)
+        self.index = Index(settings.data_dir, self.store, encoder, collection_id=self.collection_id)
         self._lock = threading.Lock()
 
     @classmethod
@@ -78,16 +81,22 @@ class Service:
         if record_id is not None and not RECORD_ID.match(record_id):
             raise InvalidInput("id must match ^[A-Za-z0-9_.:-]{1,128}$")
         with self._lock:
-            record_id, revision = self.store.put(text, metadata, record_id)
-            self.index.upsert(record_id, revision, text)
-        return record_id, revision
+            ref = self.store.put(
+                text,
+                metadata,
+                record_id,
+                collection_id=self.collection_id,
+                author_principal_id=LOCAL_PRINCIPAL_ID,
+            )
+            self.index.upsert(ref.record_id, ref.revision, text)
+        return ref.record_id, ref.revision
 
     def get(self, record_id: str, revision: int | None = None) -> Revision:
-        return self.store.get(record_id, revision)
+        return self.store.get(record_id, revision, collection_id=self.collection_id)
 
     def delete(self, record_id: str) -> None:
         with self._lock:
-            if self.store.delete(record_id):
+            if self.store.delete(record_id, collection_id=self.collection_id):
                 self.index.remove(record_id)
 
     # -- search -----------------------------------------------------------------
@@ -117,7 +126,9 @@ class Service:
             subset = None
             eligible = self.index.document_count
             if filters is not None:
-                subset = self.index.internal_ids(self.store.matching_record_ids(filters))
+                subset = self.index.internal_ids(
+                    self.store.matching_record_ids(filters, collection_id=self.collection_id)
+                )
                 eligible = len(subset)
             if eligible > 0:
                 gather_limit = max(self.settings.gather_limit, limit)
@@ -135,9 +146,14 @@ class Service:
                 semantics = str(result.diagnostics["score_semantics"])
                 for ranked in result.documents:
                     record_id = self.index.record_ids[ranked.document_id]
-                    revision = self.store.get(record_id, self.index.revisions[ranked.document_id])
+                    revision = self.store.get(
+                        record_id,
+                        self.index.revisions[ranked.document_id],
+                        collection_id=self.collection_id,
+                    )
                     hits.append(
                         Hit(
+                            collection_id=revision.collection_id,
                             id=record_id,
                             revision=revision.revision,
                             score=float(ranked.score),
@@ -149,8 +165,18 @@ class Service:
             search_id = self.store.log_search(
                 text,
                 filters,
-                [{"id": hit.id, "revision": hit.revision, "score": hit.score} for hit in hits],
+                [
+                    {
+                        "collection_id": hit.collection_id,
+                        "id": hit.id,
+                        "revision": hit.revision,
+                        "score": hit.score,
+                    }
+                    for hit in hits
+                ],
                 timings,
+                collection_id=self.collection_id,
+                requester_principal_id=LOCAL_PRINCIPAL_ID,
             )
         return SearchOutcome(search_id=search_id, hits=hits, timings=timings, gatherer=gatherer)
 
@@ -165,10 +191,17 @@ class Service:
     ) -> str:
         if not isinstance(text, str) or not text.strip():
             raise InvalidInput("report text must be a non-empty string")
-        return self.store.add_report(record_id, revision, search_id, text)
+        return self.store.add_report(
+            record_id,
+            revision,
+            search_id,
+            text,
+            collection_id=self.collection_id,
+            reporter_principal_id=LOCAL_PRINCIPAL_ID,
+        )
 
     def reports(self, record_id: str) -> list[Report]:
-        return self.store.reports_for(record_id)
+        return self.store.reports_for(record_id, collection_id=self.collection_id)
 
     # -- health -----------------------------------------------------------------
 

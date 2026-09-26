@@ -129,6 +129,9 @@ For database upgrades and recovery behavior, see [storage versions](docs/storage
 
 - No authentication or rate limiting. Bind to localhost or put it behind a
   proxy you control.
+- Persistence is collection-scoped, but HTTP/MCP still serve only the local
+  collection. Restricted visibility does not yet provide access control. Storage
+  is unencrypted.
 - One indexed view per record, truncated by the encoder at 2048 tokens for
   LateOn-Code. Chunking is planned as an internal derived view.
 - Writes index synchronously under one lock; a put returns when it is

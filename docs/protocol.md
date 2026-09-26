@@ -9,6 +9,11 @@ operations as MCP tools (`search_experiences`, `get_experience`,
 `contribute_experience`, `report_outcome`, `delete_experience`) by forwarding
 to a running server; it adds no operations and no fields.
 
+V1 is the local single-collection interface. All routes use collection `local`;
+record IDs in this protocol are relative to that collection. The collection-aware
+storage layer does not add remote collection selection, authentication, or hosted
+access. See [storage versions and upgrades](storage.md) for migration details.
+
 All bodies are JSON. Errors use one envelope:
 
 ```json
@@ -95,7 +100,8 @@ Returns:
 ```
 
 Returns `201 {"id": "…"}`. `revision` and `search_id` are optional; an unknown
-`search_id` is a 404. Reports on deleted records are accepted. There is no
+`search_id` is a 404. A supplied revision must exist in the local record's history,
+otherwise it is a `record_not_found` 404. Reports on deleted records are accepted. There is no
 vote, success label, or outcome taxonomy: say what environment received the
 change, what was applied, what check passed or failed, and any side effects.
 

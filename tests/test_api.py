@@ -41,6 +41,16 @@ def test_record_lifecycle(client):
     assert client.delete("/v1/records/missing").status_code == 404
 
 
+def test_report_rejects_nonexistent_revision(client):
+    client.post("/v1/records", json={"id": "record", "text": "local content"})
+    response = client.post(
+        "/v1/reports", json={"record_id": "record", "revision": 99, "text": "feedback"}
+    )
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "record_not_found"
+    assert client.get("/v1/records/record/reports").json() == {"reports": []}
+
+
 def test_search_and_report(client):
     client.post("/v1/records", json={"text": "CUDA illegal address in bf16 attention", "id": "a"})
     client.post("/v1/records", json={"text": "NCCL worker never reached the barrier", "id": "b"})

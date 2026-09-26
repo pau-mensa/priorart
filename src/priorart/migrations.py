@@ -7,6 +7,7 @@ Append future migrations; never edit an already released migration.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 
@@ -96,7 +97,163 @@ def _initialize_v1(connection: sqlite3.Connection) -> None:
         )
 
 
-_MIGRATIONS = (_initialize_v1,)
+def _scope_collections(connection: sqlite3.Connection) -> None:
+    # Freeze these bootstrap IDs as part of the on-disk migration contract.
+    local_collection, local_account, local_principal = "local", "local-account", "local-principal"
+    tables = ("records", "revisions", "reports", "searches", "index_documents", "index_state")
+    for table in tables:
+        connection.execute(f"ALTER TABLE {table} RENAME TO legacy_{table}")
+    connection.execute("DROP INDEX reports_record")
+    statements = (
+        """CREATE TABLE principals (id TEXT PRIMARY KEY, created_at TEXT NOT NULL)""",
+        """CREATE TABLE accounts (
+            id TEXT PRIMARY KEY,
+            owner_principal_id TEXT NOT NULL REFERENCES principals(id),
+            created_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE collections (
+            id TEXT PRIMARY KEY,
+            owner_account_id TEXT NOT NULL REFERENCES accounts(id),
+            visibility TEXT NOT NULL DEFAULT 'restricted'
+                CHECK (visibility IN ('public', 'restricted')),
+            created_at TEXT NOT NULL
+        )""",
+        """CREATE TRIGGER collection_visibility_immutable
+            BEFORE UPDATE OF visibility ON collections
+            WHEN NEW.visibility != OLD.visibility
+            BEGIN SELECT RAISE(ABORT, 'collection visibility is immutable'); END""",
+        """CREATE TABLE records (
+            collection_id TEXT NOT NULL REFERENCES collections(id),
+            id TEXT NOT NULL,
+            author_principal_id TEXT REFERENCES principals(id),
+            created_at TEXT NOT NULL,
+            deleted_at TEXT,
+            PRIMARY KEY (collection_id, id)
+        )""",
+        """CREATE TABLE revisions (
+            collection_id TEXT NOT NULL,
+            record_id TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK (revision > 0),
+            text TEXT,
+            metadata TEXT,
+            text_sha256 TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (collection_id, record_id, revision),
+            FOREIGN KEY (collection_id, record_id) REFERENCES records(collection_id, id)
+        )""",
+        """CREATE TABLE searches (
+            collection_id TEXT NOT NULL REFERENCES collections(id),
+            id TEXT NOT NULL,
+            requester_principal_id TEXT REFERENCES principals(id),
+            text TEXT NOT NULL,
+            filters TEXT,
+            timings TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (collection_id, id)
+        )""",
+        """CREATE TABLE search_hits (
+            collection_id TEXT NOT NULL,
+            search_id TEXT NOT NULL,
+            position INTEGER NOT NULL CHECK (position >= 0),
+            record_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            score REAL NOT NULL,
+            PRIMARY KEY (collection_id, search_id, position),
+            FOREIGN KEY (collection_id, search_id) REFERENCES searches(collection_id, id),
+            FOREIGN KEY (collection_id, record_id, revision)
+                REFERENCES revisions(collection_id, record_id, revision)
+        )""",
+        """CREATE TABLE reports (
+            collection_id TEXT NOT NULL,
+            id TEXT NOT NULL,
+            reporter_principal_id TEXT REFERENCES principals(id),
+            record_id TEXT NOT NULL,
+            revision INTEGER,
+            search_id TEXT,
+            text TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (collection_id, id),
+            FOREIGN KEY (collection_id, record_id) REFERENCES records(collection_id, id),
+            FOREIGN KEY (collection_id, record_id, revision)
+                REFERENCES revisions(collection_id, record_id, revision),
+            FOREIGN KEY (collection_id, search_id) REFERENCES searches(collection_id, id)
+        )""",
+        "CREATE INDEX reports_record ON reports(collection_id, record_id, created_at)",
+        """CREATE TABLE index_documents (
+            collection_id TEXT NOT NULL,
+            internal_id INTEGER NOT NULL CHECK (internal_id >= 0),
+            record_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            PRIMARY KEY (collection_id, internal_id),
+            UNIQUE (collection_id, record_id),
+            FOREIGN KEY (collection_id, record_id, revision)
+                REFERENCES revisions(collection_id, record_id, revision)
+        )""",
+        """CREATE TABLE index_state (
+            collection_id TEXT NOT NULL REFERENCES collections(id),
+            key TEXT NOT NULL,
+            value TEXT,
+            PRIMARY KEY (collection_id, key)
+        )""",
+    )
+    for statement in statements:
+        connection.execute(statement)
+    (now,) = connection.execute("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')").fetchone()
+    connection.execute("INSERT INTO principals VALUES (?, ?)", (local_principal, now))
+    connection.execute(
+        "INSERT INTO accounts VALUES (?, ?, ?)", (local_account, local_principal, now)
+    )
+    connection.execute(
+        "INSERT INTO collections VALUES (?, ?, 'restricted', ?)",
+        (local_collection, local_account, now),
+    )
+    # Unknown authorship/requester identity stays NULL; ownership is not authorship.
+    copies = (
+        ("records", "id, created_at, deleted_at"),
+        ("revisions", "record_id, revision, text, metadata, text_sha256, created_at"),
+        ("searches", "id, text, filters, timings, created_at"),
+        ("reports", "id, record_id, revision, search_id, text, created_at"),
+        ("index_documents", "internal_id, record_id, revision"),
+        ("index_state", "key, value"),
+    )
+    try:
+        for table, columns in copies:
+            connection.execute(
+                f"INSERT INTO {table} (collection_id, {columns})"
+                f" SELECT ?, {columns} FROM legacy_{table}",
+                (local_collection,),
+            )
+        for search_id, encoded in connection.execute("SELECT id, hits FROM legacy_searches"):
+            hits = json.loads(encoded)
+            if not isinstance(hits, list):
+                raise ValueError("legacy hits must be a list")
+            for position, hit in enumerate(hits):
+                # V1's persisted hit contract has exactly these three fields.
+                # Fail rather than silently strip unknown data on migration.
+                if set(hit) != {"id", "revision", "score"}:
+                    raise ValueError("unrecognized legacy hit fields")
+                connection.execute(
+                    "INSERT INTO search_hits VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        local_collection,
+                        search_id,
+                        position,
+                        hit["id"],
+                        hit["revision"],
+                        hit["score"],
+                    ),
+                )
+    except (sqlite3.IntegrityError, ValueError, TypeError, KeyError) as error:
+        raise SchemaError(
+            "Collection migration cannot preserve invalid legacy references or search hits. "
+            "The upgrade was rolled back; inspect reports, revisions, searches, and index mirror "
+            "in a backup before retrying."
+        ) from error
+    for table in ("reports", "index_documents", "index_state", "searches", "revisions", "records"):
+        connection.execute(f"DROP TABLE legacy_{table}")
+
+
+_MIGRATIONS = (_initialize_v1, _scope_collections)
 SCHEMA_VERSION = len(_MIGRATIONS)
 
 

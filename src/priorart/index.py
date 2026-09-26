@@ -30,14 +30,21 @@ from lateweave import (
 
 from .encoder import Encoder, pack
 from .gather import LexicalGatherer, choose_gatherer
-from .store import Store
+from .store import LOCAL_COLLECTION_ID, Store
 
 VECTORS_DIRECTORY = "vectors"
 ENCODE_BATCH = 32
 
 
 class Index:
-    def __init__(self, data_dir: str | Path, store: Store, encoder: Encoder | None) -> None:
+    def __init__(
+        self, data_dir: str | Path, store: Store, encoder: Encoder | None, *, collection_id: str
+    ) -> None:
+        if collection_id != LOCAL_COLLECTION_ID:
+            raise ValueError(
+                "only the local collection can be indexed until index isolation exists"
+            )
+        self.collection_id = collection_id
         self.data_dir = Path(data_dir)
         self.vectors_path = self.data_dir / VECTORS_DIRECTORY
         self.store = store
@@ -58,8 +65,11 @@ class Index:
         return len(self.record_ids)
 
     def open(self) -> None:
-        live = {doc.record_id: doc for doc in self.store.live_documents()}
-        mirror = self.store.index_documents()
+        live = {
+            doc.record_id: doc
+            for doc in self.store.live_documents(collection_id=self.collection_id)
+        }
+        mirror = self.store.index_documents(collection_id=self.collection_id)
         consistent = {(record_id, revision) for _, record_id, revision in mirror} == {
             (doc.record_id, doc.revision) for doc in live.values()
         } and [row[0] for row in mirror] == list(range(len(mirror)))
@@ -94,7 +104,7 @@ class Index:
         )
 
     def rebuild(self) -> None:
-        documents = self.store.live_documents()
+        documents = self.store.live_documents(collection_id=self.collection_id)
         self._drop_vectors()
         self.record_ids = [doc.record_id for doc in documents]
         self.revisions = [doc.revision for doc in documents]
@@ -160,7 +170,9 @@ class Index:
     def _write_mirror(self) -> None:
         encoder = None if self.encoder is None else self.encoder.representation.encoder
         self.store.replace_index_documents(
-            list(zip(self.record_ids, self.revisions, strict=True)), encoder
+            list(zip(self.record_ids, self.revisions, strict=True)),
+            encoder,
+            collection_id=self.collection_id,
         )
 
     def _refresh(self) -> None:
