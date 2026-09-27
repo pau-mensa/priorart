@@ -15,6 +15,7 @@ pub struct Settings {
     pub encoder_revision: String,
     pub encoder_threads: Option<usize>,
     pub gather_limit: usize,
+    pub max_loaded_indexes: usize,
     pub max_text_bytes: usize,
     pub host: String,
     pub port: u16,
@@ -29,6 +30,7 @@ impl Default for Settings {
             encoder_revision: "main".to_owned(),
             encoder_threads: None,
             gather_limit: 500,
+            max_loaded_indexes: 8,
             max_text_bytes: 262_144,
             host: "127.0.0.1".to_owned(),
             port: 8000,
@@ -62,6 +64,9 @@ impl Settings {
                 _ => Some(parse("PRIORART_ENCODER_THREADS", &value)?),
             };
         }
+        if let Some(value) = get("MAX_LOADED_INDEXES") {
+            settings.max_loaded_indexes = parse("PRIORART_MAX_LOADED_INDEXES", &value)?;
+        }
         if let Some(value) = get("GATHER_LIMIT") {
             settings.gather_limit = parse("PRIORART_GATHER_LIMIT", &value)?;
         }
@@ -80,6 +85,9 @@ impl Settings {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         let invalid = |message: &str| Err(ConfigError(message.to_owned()));
+        if self.max_loaded_indexes == 0 {
+            return invalid("max_loaded_indexes must be positive");
+        }
         if self.gather_limit == 0 {
             return invalid("gather_limit must be positive");
         }
@@ -139,6 +147,7 @@ mod tests {
         for (key, value) in [
             ("PRIORART_ENCODER_THREADS", "0"),
             ("PRIORART_GATHER_LIMIT", "0"),
+            ("PRIORART_MAX_LOADED_INDEXES", "0"),
             ("PRIORART_MAX_TEXT_BYTES", "-1"),
             ("PRIORART_PORT", "0"),
             ("PRIORART_PORT", "70000"),

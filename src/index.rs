@@ -12,7 +12,10 @@
 //! Zero documents means no `vectors/` directory: lateweave stores cannot be
 //! empty, so absence is the empty state.
 
-use std::collections::{HashMap, HashSet};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -23,15 +26,90 @@ use lateweave::{
 
 use crate::encoder::{pack, Encoder, EncoderError};
 use crate::gather::{Bm25, ExhaustiveGatherer, LexicalGatherer};
-use crate::store::{Store, StoreError, LOCAL_COLLECTION_ID};
+use crate::store::{Store, StoreError};
 
 pub const VECTORS_DIRECTORY: &str = "vectors";
-const CORPUS_ID: &str = "priorart";
+/// Storage components are derived from identity, never interpreted as paths.
+pub fn collection_index_path(data_dir: &Path, collection_id: &str) -> PathBuf {
+    data_dir.join("indexes").join(
+        Sha256::digest(collection_id.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+    )
+}
+
+/// Bounded LRU of loaded indexes. The mutable borrow prevents eviction while an
+/// index is in use. Callers must serialize store mutations with index operations.
+pub struct CollectionIndexManager {
+    data_dir: PathBuf,
+    encoder: Option<Arc<dyn Encoder>>,
+    capacity: NonZeroUsize,
+    loaded: HashMap<String, Index>,
+    lru: VecDeque<String>,
+}
+
+impl CollectionIndexManager {
+    pub fn new(data_dir: &Path, encoder: Option<Arc<dyn Encoder>>, capacity: NonZeroUsize) -> Self {
+        Self {
+            data_dir: data_dir.to_owned(),
+            encoder,
+            capacity,
+            loaded: HashMap::new(),
+            lru: VecDeque::new(),
+        }
+    }
+
+    pub fn get(&mut self, store: &Store, collection_id: &str) -> Result<&mut Index> {
+        store.get_collection(collection_id)?;
+        if !self.loaded.contains_key(collection_id) {
+            // Evict before loading, so even a rebuild respects the loaded-count bound.
+            if self.loaded.len() == self.capacity.get() {
+                let oldest = self
+                    .lru
+                    .pop_front()
+                    .expect("a full cache has an oldest index");
+                self.loaded.remove(&oldest);
+            }
+            let index = Index::open(&self.data_dir, store, self.encoder.clone(), collection_id)?;
+            self.loaded.insert(collection_id.to_owned(), index);
+        }
+        self.lru.retain(|id| id != collection_id);
+        self.lru.push_back(collection_id.to_owned());
+        let index = self.loaded.get_mut(collection_id).expect("loaded above");
+        index.ensure_current(store)?;
+        Ok(index)
+    }
+
+    pub fn loaded_count(&self) -> usize {
+        self.loaded.len()
+    }
+
+    pub fn loaded(&self, collection_id: &str) -> Option<&Index> {
+        self.loaded.get(collection_id)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Snapshot {
+    collection_id: String,
+    version: String,
+    recipe: String,
+    generation: u64,
+    representation: Option<lateweave::Representation>,
+    vector_generation: Option<u64>,
+    records: Vec<(String, i64)>,
+}
+
+// Version of the current single-record indexing and lexical recipe.
+const INDEX_RECIPE: &str = "priorart-record-bm25-v1";
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
-    #[error("only the local collection can be indexed until index isolation exists")]
-    UnsupportedCollection,
+    #[error(transparent)]
+    Manifest(#[from] serde_json::Error),
+    #[error("the index requires recovery before retrieval")]
+    Stale,
     #[error("the index is empty")]
     Empty,
     #[error(transparent)]
@@ -49,6 +127,7 @@ pub type Result<T, E = IndexError> = std::result::Result<T, E>;
 pub struct Index {
     collection_id: String,
     corpus_version: String,
+    manifest_path: PathBuf,
     vectors_path: PathBuf,
     encoder: Option<Arc<dyn Encoder>>,
     vectors: Option<Arc<VectorStore>>,
@@ -71,13 +150,14 @@ impl Index {
         encoder: Option<Arc<dyn Encoder>>,
         collection_id: &str,
     ) -> Result<Self> {
-        if collection_id != LOCAL_COLLECTION_ID {
-            return Err(IndexError::UnsupportedCollection);
-        }
+        store.get_collection(collection_id)?;
+        let directory = collection_index_path(data_dir, collection_id);
+        std::fs::create_dir_all(&directory)?;
         let mut index = Self {
             collection_id: collection_id.to_owned(),
-            corpus_version: data_dir.display().to_string(),
-            vectors_path: data_dir.join(VECTORS_DIRECTORY),
+            corpus_version: uuid::Uuid::new_v4().to_string(),
+            manifest_path: directory.join("manifest.json"),
+            vectors_path: directory.join(VECTORS_DIRECTORY),
             encoder,
             vectors: None,
             record_ids: Vec::new(),
@@ -108,7 +188,26 @@ impl Index {
             .iter()
             .map(|entry| (entry.record_id.as_str(), entry.revision))
             .collect();
-        let consistent = mirror.len() == live.len()
+        let snapshot = std::fs::read(&self.manifest_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Snapshot>(&bytes).ok());
+        let snapshot_matches = snapshot.as_ref().is_some_and(|saved| {
+            saved.collection_id == self.collection_id
+                && saved.recipe == INDEX_RECIPE
+                && !saved.version.is_empty()
+                && saved.representation == self.encoder.as_ref().map(|e| e.representation().clone())
+                && saved.records
+                    == mirror
+                        .iter()
+                        .map(|e| (e.record_id.clone(), e.revision))
+                        .collect::<Vec<_>>()
+        });
+        if let Some(saved) = snapshot.as_ref().filter(|_| snapshot_matches) {
+            self.corpus_version = saved.version.clone();
+            self.generation = saved.generation;
+        }
+        let consistent = snapshot_matches
+            && mirror.len() == live.len()
             && mirror
                 .iter()
                 .enumerate()
@@ -117,7 +216,11 @@ impl Index {
                 mirrored.contains(&(record_id.as_str(), *revision))
             });
         let vectors = if consistent {
-            self.matching_vectors(store, mirror.len())?
+            self.matching_vectors(
+                store,
+                mirror.len(),
+                snapshot.as_ref().and_then(|s| s.vector_generation),
+            )?
         } else {
             None
         };
@@ -147,6 +250,7 @@ impl Index {
         &self,
         store: &Store,
         expected: usize,
+        generation: Option<u64>,
     ) -> Result<Option<Option<VectorStore>>> {
         let Some(encoder) = &self.encoder else {
             return Ok(Some(None));
@@ -164,7 +268,8 @@ impl Index {
         Ok(VectorStore::open(&self.vectors_path)
             .ok()
             .and_then(|vectors| {
-                (vectors.format() == StoreFormat::Int8
+                (Some(vectors.generation()) == generation
+                    && vectors.format() == StoreFormat::Int8
                     && vectors.document_count() == expected as u64
                     && vectors.representation() == encoder.representation())
                 .then_some(Some(vectors))
@@ -173,6 +278,7 @@ impl Index {
 
     /// Re-encodes every live record and replaces the vector store and mirror.
     pub fn rebuild(&mut self, store: &Store) -> Result<()> {
+        self.stale = true;
         let documents = store.live_documents(&self.collection_id)?;
         self.drop_vectors()?;
         self.record_ids = documents
@@ -207,7 +313,7 @@ impl Index {
                 .collect::<Vec<_>>(),
             self.encoder_name(),
         )?;
-        self.refresh();
+        self.publish()?;
         self.stale = false;
         Ok(())
     }
@@ -299,7 +405,7 @@ impl Index {
             Some((record_id, revision)),
             self.encoder_name(),
         )?;
-        self.refresh();
+        self.publish()?;
         Ok(())
     }
 
@@ -314,7 +420,7 @@ impl Index {
             None,
             self.encoder_name(),
         )?;
-        self.refresh();
+        self.publish()?;
         Ok(())
     }
 
@@ -362,11 +468,33 @@ impl Index {
             .collect();
     }
 
-    fn refresh(&mut self) {
+    fn publish(&mut self) -> Result<()> {
         self.generation += 1;
+        let snapshot = Snapshot {
+            collection_id: self.collection_id.clone(),
+            version: self.corpus_version.clone(),
+            recipe: INDEX_RECIPE.to_owned(),
+            generation: self.generation,
+            representation: self.encoder.as_ref().map(|e| e.representation().clone()),
+            vector_generation: self.vectors.as_ref().map(|v| v.generation()),
+            records: self
+                .record_ids
+                .iter()
+                .cloned()
+                .zip(self.revisions.iter().copied())
+                .collect(),
+        };
+        let temporary = self.manifest_path.with_extension("tmp");
+        std::fs::write(&temporary, serde_json::to_vec(&snapshot)?)?;
+        std::fs::rename(temporary, &self.manifest_path)?;
+        self.refresh();
+        Ok(())
+    }
+
+    fn refresh(&mut self) {
         self.manifest = (!self.record_ids.is_empty()).then(|| {
             CorpusManifest::new(
-                CORPUS_ID,
+                self.collection_id.clone(),
                 self.corpus_version.clone(),
                 self.record_ids.len() as u64,
                 document_ids_digest(&self.record_ids),
@@ -435,6 +563,9 @@ impl Index {
     /// Exhaustive MaxSim while `eligible` fits in `gather_limit`, BM25
     /// candidates beyond it or without an encoder.
     pub fn pipeline(&self, eligible: usize, gather_limit: usize) -> Result<SearchPipeline> {
+        if self.stale {
+            return Err(IndexError::Stale);
+        }
         let manifest = self.manifest.clone().ok_or(IndexError::Empty)?;
         let gatherer: Arc<dyn CandidateGenerator> =
             if self.encoder.is_none() || eligible > gather_limit {

@@ -1,7 +1,10 @@
 # Storage versions, recovery, and upgrades
 
-A data directory holds `priorart.sqlite` (with its WAL files) and, when an encoder
-is configured and at least one record is live, the `vectors/` store. On startup,
+A data directory holds `priorart.sqlite` (with its WAL files) and an `indexes/`
+directory. Each collection's storage directory is the lowercase SHA-256 hex digest
+of its ID, computed by the server; IDs are never interpreted as paths. It contains
+`manifest.json` and, when an encoder is configured and at least one record is live,
+a `vectors/` store. On startup,
 priorart reads the schema version from the `schema_version` table, applies pending
 migrations, and only then opens the index. A schema version is the tag of the
 release that introduced that schema, so an unsupported version names the release
@@ -46,30 +49,56 @@ changed by an update.
 Composite primary and foreign keys scope revisions, reports, search hits, and index
 mirror entries to their collection and exact target revision. Report revisions are
 nullable. Index state is keyed by collection and key; internal vector IDs are unique
-within a collection only. The index is local-only and refuses other collections.
+within a collection only. The trusted index API accepts an explicit existing
+collection; it does not provide authorization. HTTP/MCP still select only `local`.
+
+The service uses a collection-index manager with lazy loading and LRU eviction.
+`PRIORART_MAX_LOADED_INDEXES` defaults to 8 and must be positive. Eviction releases
+the manager's in-memory lexical/vector state without deleting persisted artifacts;
+reopening validates only the selected collection. This bounds resident index count,
+not bytes or record count. Index handles are mutable borrows of the manager and
+must not be used concurrently with store mutations. The service still serializes
+requests with its existing mutex. Per-collection locking, connection ownership,
+and enforced single-writer process ownership remain later work.
 
 ## Index recovery
 
 The index mirror (`index_documents`) records which record revision each dense
 internal vector ID holds, and `index_state` records the encoder that wrote it.
 A write commits the record in SQLite first, then updates the vector store, then
-the mirror. These steps are not atomic together, and lateweave publishes each
+the mirror, then publishes that collection's manifest. These steps are not atomic together, and lateweave publishes each
 vector-store mutation as several file renames (each array, the offsets, and
 `storage.json`), so a crash can leave a half-published store.
 
-priorart therefore coordinates database and index recovery on every start: the
-mirror must list exactly the live records' latest revisions with contiguous IDs,
+Each manifest persists collection identity, an index incarnation UUID, its mutation
+generation, the full encoder `Representation`, the current single-record/lexical
+recipe version, the ordered record/revision mapping, and the vector-store generation.
+A consistent reopen preserves the manifest and generation without re-encoding.
+Rebuilds and writes advance that collection's generation. A missing or incompatible
+manifest starts a new incarnation. Tokenizer artifact fingerprints and full chunking
+recipe versions are deferred to the retrieval-recipe step; current encoder identity
+is only as precise as the configured representation (pin model revisions).
+
+priorart coordinates database and index recovery on every load: the manifest must
+match the collection, recipe, representation, ordered mirror and vector generation;
+the mirror must list exactly the live records' latest revisions with contiguous IDs,
 and, with an encoder, the vector store must open, be INT8, hold the mirrored
 document count, carry the configured representation, and have been written by
 the same encoder the mirror records. Any disagreement, including an unreadable
-store, rebuilds the whole index from SQLite. Vectors left behind by an earlier
+store, rebuilds only that collection's index from SQLite. Vectors left behind by an earlier
 encoder run are never trusted after a lexical-only run has written the mirror.
 A running server applies the same rule when an index step fails after its record
 commits: it rebuilds from SQLite at once, and if that rebuild fails too, every
 later write and search retries it before touching the index. Documents are
 encoded before the record is written, so an encoder failure stores nothing.
+The manifest is published through a temporary file and rename, but this is not
+atomic activation of an entire index generation or a power-loss durability promise.
 Journaled mutations with atomic generation activation are planned to replace
 this rebuild-on-mismatch model.
+
+The former top-level `vectors/` directory is never read or adopted. If present, it
+is left untouched; the selected collection's derived index is rebuilt from its
+SQLite records under `indexes/`. Remove obsolete artifacts separately after review.
 
 ## Operating an upgrade
 

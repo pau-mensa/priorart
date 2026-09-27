@@ -356,7 +356,8 @@ fn a_failed_index_step_is_rebuilt_before_the_next_search() {
     use std::os::unix::fs::PermissionsExt;
 
     let (directory, service) = seeded();
-    let vectors = directory.path().join(priorart::index::VECTORS_DIRECTORY);
+    let vectors = priorart::index::collection_index_path(directory.path(), LOCAL_COLLECTION_ID)
+        .join(priorart::index::VECTORS_DIRECTORY);
     let set_mode =
         |mode| std::fs::set_permissions(&vectors, std::fs::Permissions::from_mode(mode)).unwrap();
     set_mode(0o555);

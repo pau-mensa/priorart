@@ -119,6 +119,7 @@ session must go through the one server.
 | `PRIORART_ENCODER_REVISION` | `main` | Hub revision, recorded in the vector store's representation |
 | `PRIORART_ENCODER_THREADS` | auto | ONNX Runtime intra-op threads |
 | `PRIORART_GATHER_LIMIT` | `500` | exhaustive MaxSim up to this many eligible records, BM25 candidates beyond |
+| `PRIORART_MAX_LOADED_INDEXES` | `8` | maximum resident collection indexes (LRU eviction; count, not a byte limit) |
 | `PRIORART_MAX_TEXT_BYTES` | `262144` | maximum size of one record |
 | `PRIORART_HOST` / `PRIORART_PORT` | `127.0.0.1` / `8000` | bind address |
 

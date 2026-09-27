@@ -6,7 +6,7 @@ use std::sync::Arc;
 use common::FakeEncoder;
 use lateweave::{SearchRequest, SearchResult};
 use priorart::encoder::Encoder;
-use priorart::index::{Index, IndexError};
+use priorart::index::{collection_index_path, CollectionIndexManager, Index};
 use priorart::store::{IndexEntry, Store, Visibility, LOCAL_COLLECTION_ID, LOCAL_PRINCIPAL_ID};
 use tempfile::TempDir;
 
@@ -69,7 +69,8 @@ fn mirror(store: &Store) -> Vec<(u64, String, i64)> {
 fn upsert_update_remove() {
     for encoder in [fake(), None] {
         let (directory, store) = setup();
-        let vectors = directory.path().join("vectors");
+        let vectors = priorart::index::collection_index_path(directory.path(), LOCAL_COLLECTION_ID)
+            .join("vectors");
         let with_vectors = encoder.is_some();
         let mut index = open(&directory, &store, encoder);
         assert_eq!(index.document_count(), 0);
@@ -204,7 +205,11 @@ fn a_stale_revision_or_missing_vectors_rebuild() {
         .unwrap();
     open(&directory, &store, fake());
     assert_eq!(mirror(&store), [(0, "a".to_owned(), 2)]);
-    std::fs::remove_dir_all(directory.path().join("vectors")).unwrap();
+    std::fs::remove_dir_all(
+        priorart::index::collection_index_path(directory.path(), LOCAL_COLLECTION_ID)
+            .join("vectors"),
+    )
+    .unwrap();
     let reopened = open(&directory, &store, fake());
     assert_eq!(reopened.vectors().unwrap().document_count(), 1);
 }
@@ -216,7 +221,12 @@ fn a_half_published_vector_store_rebuilds() {
     put(&store, &mut index, "a", "alpha");
     put(&store, &mut index, "b", "beta");
     drop(index);
-    std::fs::write(directory.path().join("vectors/storage.json"), b"{").unwrap();
+    std::fs::write(
+        priorart::index::collection_index_path(directory.path(), LOCAL_COLLECTION_ID)
+            .join("vectors/storage.json"),
+        b"{",
+    )
+    .unwrap();
     let reopened = open(&directory, &store, fake());
     assert_eq!(reopened.vectors().unwrap().document_count(), 2);
 }
@@ -229,7 +239,11 @@ fn a_representation_change_rebuilds() {
     let other: Arc<dyn Encoder> = Arc::new(FakeEncoder::with("other", 8));
     let reopened = open(&directory, &store, Some(other));
     assert_eq!(reopened.vectors().unwrap().representation().dimension(), 8);
-    let metadata = std::fs::read_to_string(directory.path().join("vectors/storage.json")).unwrap();
+    let metadata = std::fs::read_to_string(
+        priorart::index::collection_index_path(directory.path(), LOCAL_COLLECTION_ID)
+            .join("vectors/storage.json"),
+    )
+    .unwrap();
     assert!(metadata.contains("\"other\""));
 }
 
@@ -238,7 +252,11 @@ fn switching_encoders_on_and_off() {
     let (directory, store) = setup();
     let mut index = open(&directory, &store, None);
     put(&store, &mut index, "a", "alpha");
-    assert!(!directory.path().join("vectors").exists());
+    assert!(
+        !priorart::index::collection_index_path(directory.path(), LOCAL_COLLECTION_ID)
+            .join("vectors")
+            .exists()
+    );
     let reopened = open(&directory, &store, fake());
     assert_eq!(reopened.vectors().unwrap().document_count(), 1);
     let mut lexical = open(&directory, &store, None);
@@ -290,15 +308,195 @@ fn lexical_scores_after_writes_match_a_reopened_index() {
     assert_eq!(ranked(&index).len(), 2);
 }
 
-#[test]
-fn only_the_local_collection_is_indexed() {
-    let (directory, store) = setup();
+fn collection(store: &Store) -> String {
     let account = store.create_account(LOCAL_PRINCIPAL_ID).unwrap();
-    let other = store
+    store
         .create_collection(&account, Visibility::Restricted)
+        .unwrap()
+}
+
+fn scoped_put(store: &Store, index: &mut Index, collection: &str, text: &str) {
+    let encoded = index.encode(text).unwrap();
+    let revision = store
+        .put(collection, text, None, Some("same"), LOCAL_PRINCIPAL_ID)
         .unwrap();
-    assert!(matches!(
-        Index::open(directory.path(), &store, None, &other),
-        Err(IndexError::UnsupportedCollection)
-    ));
+    index
+        .upsert(store, "same", revision.revision, text, encoded)
+        .unwrap();
+}
+
+#[test]
+fn collection_rebuilds_and_mutations_are_isolated() {
+    for encoder in [fake(), None] {
+        let (directory, store) = setup();
+        let other = collection(&store);
+        let mut manager =
+            CollectionIndexManager::new(directory.path(), encoder, 2.try_into().unwrap());
+        scoped_put(&store, manager.get(&store, LOCAL).unwrap(), LOCAL, "alpha");
+        scoped_put(
+            &store,
+            manager.get(&store, &other).unwrap(),
+            &other,
+            "beta beta",
+        );
+        let local_manifest = manager
+            .get(&store, LOCAL)
+            .unwrap()
+            .manifest()
+            .unwrap()
+            .clone();
+        let other_manifest = manager
+            .get(&store, &other)
+            .unwrap()
+            .manifest()
+            .unwrap()
+            .clone();
+        assert_ne!(local_manifest.corpus_id(), other_manifest.corpus_id());
+        let other_path = collection_index_path(directory.path(), &other).join("manifest.json");
+        let other_bytes = std::fs::read(&other_path).unwrap();
+        let other_mirror = store.index_documents(&other).unwrap();
+        let index = manager.get(&store, LOCAL).unwrap();
+        index.rebuild(&store).unwrap();
+        assert_eq!(index.record_ids(), ["same"]);
+        assert!(index
+            .pipeline(2, 1)
+            .unwrap()
+            .search(&index.query("beta"), &SearchRequest::new(1, 1))
+            .unwrap()
+            .documents
+            .is_empty());
+        store.delete(LOCAL, "same").unwrap();
+        index.remove(&store, "same").unwrap();
+        assert_eq!(std::fs::read(other_path).unwrap(), other_bytes);
+        assert_eq!(store.index_documents(&other).unwrap(), other_mirror);
+        let index = manager.get(&store, &other).unwrap();
+        assert_eq!(index.manifest().unwrap(), &other_manifest);
+        assert_eq!(top(index, &search(index, "beta", 500, 5)), "same");
+        assert_eq!(index.revisions(), [1]);
+    }
+}
+
+#[test]
+fn lru_eviction_reopens_without_reencoding_or_changing_generation() {
+    let (directory, store) = setup();
+    let other = collection(&store);
+    let third = collection(&store);
+    let encoder = Arc::new(FakeEncoder::new());
+    let mut manager = CollectionIndexManager::new(
+        directory.path(),
+        Some(encoder.clone()),
+        2.try_into().unwrap(),
+    );
+    scoped_put(&store, manager.get(&store, LOCAL).unwrap(), LOCAL, "alpha");
+    let manifest = manager
+        .get(&store, LOCAL)
+        .unwrap()
+        .manifest()
+        .unwrap()
+        .clone();
+    scoped_put(&store, manager.get(&store, &other).unwrap(), &other, "beta");
+    manager.get(&store, LOCAL).unwrap(); // touch local, evict other
+    manager.get(&store, &third).unwrap();
+    assert!(manager.loaded(&other).is_none());
+    assert!(manager.loaded(LOCAL).is_some());
+    manager.get(&store, &other).unwrap(); // evict local
+    assert!(manager.loaded(LOCAL).is_none());
+    let calls = encoder.calls();
+    assert_eq!(
+        manager.get(&store, LOCAL).unwrap().manifest().unwrap(),
+        &manifest
+    );
+    assert_eq!(encoder.calls(), calls);
+    assert_eq!(manager.loaded_count(), 2);
+    assert!(manager.get(&store, "missing").is_err());
+    assert_eq!(manager.loaded_count(), 2);
+}
+
+#[test]
+fn generated_storage_components_do_not_interpret_collection_ids_as_paths() {
+    let (directory, store) = setup();
+    let ids = [
+        "local",
+        "LOCAL",
+        "../local",
+        "/tmp/local",
+        "a/b",
+        "a_b",
+        "..",
+        "",
+    ];
+    let paths: HashSet<_> = ids
+        .iter()
+        .map(|id| collection_index_path(directory.path(), id))
+        .collect();
+    assert_eq!(paths.len(), ids.len());
+    for path in paths {
+        assert_eq!(path.parent().unwrap(), directory.path().join("indexes"));
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert_eq!(name.len(), 64);
+        assert!(name.bytes().all(|c| c.is_ascii_hexdigit()));
+    }
+    assert!(Index::open(directory.path(), &store, None, "../missing").is_err());
+    assert!(!directory.path().join("indexes").exists());
+}
+
+#[test]
+fn foreign_or_mismatched_manifests_rebuild_only_the_selected_collection() {
+    let (directory, store) = setup();
+    let other = collection(&store);
+    let encoder = Arc::new(FakeEncoder::new());
+    let mut local = open(&directory, &store, Some(encoder.clone()));
+    scoped_put(&store, &mut local, LOCAL, "alpha");
+    let mut second = Index::open(directory.path(), &store, Some(encoder.clone()), &other).unwrap();
+    scoped_put(&store, &mut second, &other, "beta");
+    let local_path = collection_index_path(directory.path(), LOCAL).join("manifest.json");
+    let other_path = collection_index_path(directory.path(), &other).join("manifest.json");
+    let other_bytes = std::fs::read(&other_path).unwrap();
+    std::fs::copy(&other_path, &local_path).unwrap();
+    let calls = encoder.calls();
+    let reopened = open(&directory, &store, Some(encoder.clone()));
+    assert_eq!(encoder.calls(), calls + 1);
+    assert_eq!(reopened.manifest().unwrap().corpus_id(), LOCAL);
+    for field in ["representation", "records", "vector_generation", "recipe"] {
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&local_path).unwrap()).unwrap();
+        match field {
+            "representation" => manifest[field]["dimension"] = 99.into(),
+            "records" => manifest[field][0][1] = 99.into(),
+            "vector_generation" => manifest[field] = 999.into(),
+            _ => manifest[field] = "unknown-recipe".into(),
+        }
+        std::fs::write(&local_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let calls = encoder.calls();
+        open(&directory, &store, Some(encoder.clone()));
+        assert_eq!(encoder.calls(), calls + 1, "{field}");
+    }
+    assert_eq!(std::fs::read(other_path).unwrap(), other_bytes);
+}
+
+#[test]
+fn failed_rebuild_and_failed_load_remain_recoverable() {
+    let (directory, store) = setup();
+    let other = collection(&store);
+    let encoder = Arc::new(FakeEncoder::new());
+    let mut manager = CollectionIndexManager::new(
+        directory.path(),
+        Some(encoder.clone()),
+        1.try_into().unwrap(),
+    );
+    scoped_put(&store, manager.get(&store, LOCAL).unwrap(), LOCAL, "alpha");
+    store
+        .put(&other, "beta", None, Some("same"), LOCAL_PRINCIPAL_ID)
+        .unwrap();
+    encoder.set_failing(true);
+    assert!(manager.get(&store, LOCAL).unwrap().rebuild(&store).is_err());
+    assert!(manager.loaded(LOCAL).unwrap().pipeline(1, 1).is_err());
+    assert!(manager.get(&store, LOCAL).is_err());
+    assert!(manager.get(&store, &other).is_err());
+    assert_eq!(manager.loaded_count(), 0);
+    encoder.set_failing(false);
+    let index = manager.get(&store, LOCAL).unwrap();
+    assert_eq!(top(index, &search(index, "alpha", 500, 5)), "same");
+    let index = manager.get(&store, &other).unwrap();
+    assert_eq!(top(index, &search(index, "beta", 500, 5)), "same");
 }

@@ -15,7 +15,7 @@ use crate::analyzer::tokens;
 use crate::config::Settings;
 use crate::encoder::{load_encoder, Encoder, EncoderError};
 use crate::excerpt::{excerpt, DEFAULT_WIDTH};
-use crate::index::{Index, IndexError};
+use crate::index::{CollectionIndexManager, IndexError};
 use crate::store::{
     Metadata, Report, Revision, SearchHit, Store, StoreError, LOCAL_COLLECTION_ID,
     LOCAL_PRINCIPAL_ID,
@@ -94,7 +94,7 @@ pub struct Health {
 
 struct State {
     store: Store,
-    index: Index,
+    indexes: CollectionIndexManager,
 }
 
 pub struct Service {
@@ -115,11 +115,21 @@ impl Service {
         let encoder_name = encoder
             .as_ref()
             .map(|encoder| encoder.representation().encoder().to_owned());
-        let index = Index::open(&settings.data_dir, &store, encoder, LOCAL_COLLECTION_ID)?;
+        let mut indexes = CollectionIndexManager::new(
+            &settings.data_dir,
+            encoder,
+            settings.max_loaded_indexes.try_into().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "max_loaded_indexes must be positive",
+                )
+            })?,
+        );
+        indexes.get(&store, LOCAL_COLLECTION_ID)?;
         Ok(Self {
             settings,
             encoder_name,
-            state: Mutex::new(State { store, index }),
+            state: Mutex::new(State { store, indexes }),
         })
     }
 
@@ -153,7 +163,8 @@ impl Service {
             return invalid(RECORD_ID_RULE);
         }
         let mut state = self.state();
-        let State { store, index } = &mut *state;
+        let State { store, indexes } = &mut *state;
+        let index = indexes.get(store, LOCAL_COLLECTION_ID)?;
         let encoded = index.encode(text)?;
         let created = store.put(
             LOCAL_COLLECTION_ID,
@@ -175,7 +186,8 @@ impl Service {
 
     pub fn delete(&self, record_id: &str) -> Result<()> {
         let mut state = self.state();
-        let State { store, index } = &mut *state;
+        let State { store, indexes } = &mut *state;
+        let index = indexes.get(store, LOCAL_COLLECTION_ID)?;
         if store.delete(LOCAL_COLLECTION_ID, record_id)? {
             index.remove(store, record_id)?;
         }
@@ -205,8 +217,8 @@ impl Service {
         let filters = filters.filter(|filters| !filters.is_empty());
 
         let mut state = self.state();
-        let State { store, index } = &mut *state;
-        index.ensure_current(store)?;
+        let State { store, indexes } = &mut *state;
+        let index = indexes.get(store, LOCAL_COLLECTION_ID)?;
         let subset = match filters {
             Some(filters) => {
                 let matching: HashSet<String> =
@@ -329,7 +341,12 @@ impl Service {
     pub fn health(&self) -> Health {
         Health {
             status: "ok",
-            document_count: self.state().index.document_count(),
+            document_count: self
+                .state()
+                .indexes
+                .loaded(LOCAL_COLLECTION_ID)
+                .expect("local index stays loaded")
+                .document_count(),
             encoder: self.encoder_name.clone(),
             gather_limit: self.settings.gather_limit,
         }
