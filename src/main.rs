@@ -77,10 +77,30 @@ fn serve(host: Option<String>, port: Option<u16>) -> Result<(), AnyError> {
         let listener = tokio::net::TcpListener::bind(address).await?;
         eprintln!("priorart: listening on http://{address}");
         axum::serve(listener, api::router(service))
-            .with_graceful_shutdown(async {
-                let _ = tokio::signal::ctrl_c().await;
-            })
+            .with_graceful_shutdown(shutdown_signal())
             .await?;
         Ok(())
     })
+}
+
+/// Ctrl-C, or SIGTERM from `docker stop` and service managers.
+async fn shutdown_signal() {
+    let interrupt = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                terminate.recv().await;
+            }
+            Err(_) => std::future::pending().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = interrupt => {}
+        () = terminate => {}
+    }
 }
