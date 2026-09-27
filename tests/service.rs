@@ -99,7 +99,7 @@ fn put_and_search() {
 #[test]
 fn an_update_supersedes() {
     let (_directory, service) = seeded();
-    let (_, revision) = service
+    let mutation = service
         .put(
             &CALLER,
             LOCAL,
@@ -107,12 +107,13 @@ fn an_update_supersedes() {
             None,
             Some("nccl"),
             WriteOptions {
+                idempotency_key: None,
                 publish: false,
                 expected_revision: Some(1),
             },
         )
         .unwrap();
-    assert_eq!(revision, 2);
+    assert_eq!(mutation.value.1, 2);
     let outcome = service
         .search(&CALLER, LOCAL, "borrow checker lifetime", None, 10)
         .unwrap();
@@ -137,7 +138,17 @@ fn an_update_supersedes() {
 #[test]
 fn delete_hides() {
     let (_directory, service) = seeded();
-    service.delete(&CALLER, LOCAL, "nccl", Some(1)).unwrap();
+    service
+        .delete(
+            &CALLER,
+            LOCAL,
+            "nccl",
+            priorart::service::DeleteOptions {
+                expected_revision: Some(1),
+                idempotency_key: None,
+            },
+        )
+        .unwrap();
     let outcome = service
         .search(&CALLER, LOCAL, "worker never reached barrier", None, 10)
         .unwrap();
@@ -146,9 +157,27 @@ fn delete_hides() {
         service.get(&CALLER, LOCAL, "nccl", None),
         Err(ServiceError::Store(StoreError::RecordDeleted { .. }))
     ));
-    service.delete(&CALLER, LOCAL, "nccl", Some(1)).unwrap();
+    service
+        .delete(
+            &CALLER,
+            LOCAL,
+            "nccl",
+            priorart::service::DeleteOptions {
+                expected_revision: Some(1),
+                idempotency_key: None,
+            },
+        )
+        .unwrap();
     assert!(matches!(
-        service.delete(&CALLER, LOCAL, "missing", Some(1)),
+        service.delete(
+            &CALLER,
+            LOCAL,
+            "missing",
+            priorart::service::DeleteOptions {
+                expected_revision: Some(1),
+                idempotency_key: None
+            }
+        ),
         Err(ServiceError::Store(StoreError::RecordNotFound { .. }))
     ));
 }
@@ -274,28 +303,59 @@ fn reports() {
             LOCAL,
             "cuda",
             "applied the padding fix, tests pass",
-            Some(1),
-            outcome.search_id.as_deref(),
+            priorart::service::ReportOptions {
+                revision: Some(1),
+                search_id: outcome.search_id.as_deref(),
+                idempotency_key: None,
+            },
         )
         .unwrap();
     let reports = service.reports(&CALLER, LOCAL, "cuda").unwrap();
     assert_eq!(reports.len(), 1);
-    assert_eq!(reports[0].id, report);
+    assert_eq!(reports[0].id, report.value);
     assert_eq!(
         reports[0].search_id.as_deref(),
         outcome.search_id.as_deref()
     );
     assert!(matches!(
-        service.report(&CALLER, LOCAL, "cuda", "x", None, Some("bogus")),
+        service.report(
+            &CALLER,
+            LOCAL,
+            "cuda",
+            "x",
+            priorart::service::ReportOptions {
+                revision: None,
+                search_id: Some("bogus"),
+                idempotency_key: None
+            }
+        ),
         Err(ServiceError::Store(StoreError::SearchNotFound { .. }))
     ));
     assert!(matches!(
-        service.report(&CALLER, LOCAL, "missing", "x", None, None),
+        service.report(
+            &CALLER,
+            LOCAL,
+            "missing",
+            "x",
+            priorart::service::ReportOptions {
+                revision: None,
+                search_id: None,
+                idempotency_key: None
+            }
+        ),
         Err(ServiceError::Store(StoreError::RecordNotFound { .. }))
     ));
-    assert!(invalid(
-        service.report(&CALLER, LOCAL, "cuda", "   ", None, None)
-    ));
+    assert!(invalid(service.report(
+        &CALLER,
+        LOCAL,
+        "cuda",
+        "   ",
+        priorart::service::ReportOptions {
+            revision: None,
+            search_id: None,
+            idempotency_key: None
+        }
+    )));
 }
 
 #[test]
@@ -496,6 +556,7 @@ fn an_encoder_failure_writes_nothing() {
             None,
             Some("cuda"),
             WriteOptions {
+                idempotency_key: None,
                 publish: false,
                 expected_revision: Some(1)
             }
@@ -530,12 +591,19 @@ fn a_failed_index_step_is_rebuilt_before_the_next_search() {
     use std::os::unix::fs::PermissionsExt;
 
     let (directory, service) = seeded();
-    let vectors = priorart::index::collection_index_path(directory.path(), LOCAL_COLLECTION_ID)
-        .join(priorart::index::VECTORS_DIRECTORY);
+    let vectors = priorart::index::collection_index_path(directory.path(), LOCAL_COLLECTION_ID);
     let set_mode =
         |mode| std::fs::set_permissions(&vectors, std::fs::Permissions::from_mode(mode)).unwrap();
     set_mode(0o555);
-    let deleted = service.delete(&CALLER, LOCAL, "nccl", Some(1));
+    let deleted = service.delete(
+        &CALLER,
+        LOCAL,
+        "nccl",
+        priorart::service::DeleteOptions {
+            expected_revision: Some(1),
+            idempotency_key: None,
+        },
+    );
     let search = service.search(&CALLER, LOCAL, "worker never reached barrier", None, 10);
     set_mode(0o755);
     assert!(matches!(deleted, Err(ServiceError::Index(_))));

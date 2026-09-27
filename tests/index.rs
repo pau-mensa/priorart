@@ -76,17 +76,16 @@ fn mirror(store: &Store) -> Vec<(u64, String, i64)> {
 fn upsert_update_remove() {
     for encoder in [fake(), None] {
         let (directory, store) = setup();
-        let vectors = priorart::index::collection_index_path(directory.path(), LOCAL_COLLECTION_ID)
-            .join("vectors");
+        let vectors =
+            || common::active_index_path(directory.path(), LOCAL_COLLECTION_ID).join("vectors");
         let with_vectors = encoder.is_some();
         let mut index = open(&directory, &store, encoder);
         assert_eq!(index.document_count(), 0);
         assert!(index.manifest().is_none());
-        assert!(!vectors.exists());
 
         put(&store, &mut index, "a", "cuda illegal address");
         assert_eq!(index.document_count(), 1);
-        assert_eq!(vectors.exists(), with_vectors);
+        assert_eq!(vectors().exists(), with_vectors);
         let generation = index.manifest().unwrap().generation();
 
         put(
@@ -102,7 +101,7 @@ fn upsert_update_remove() {
         index.remove(&store, "a").unwrap();
         assert_eq!(index.document_count(), 0);
         assert!(index.manifest().is_none());
-        assert!(!vectors.exists());
+        assert!(!vectors().exists());
         assert!(mirror(&store).is_empty());
     }
 }
@@ -220,8 +219,7 @@ fn a_stale_revision_or_missing_vectors_rebuild() {
     open(&directory, &store, fake());
     assert_eq!(mirror(&store), [(0, "a".to_owned(), 2)]);
     std::fs::remove_dir_all(
-        priorart::index::collection_index_path(directory.path(), LOCAL_COLLECTION_ID)
-            .join("vectors"),
+        common::active_index_path(directory.path(), LOCAL_COLLECTION_ID).join("vectors"),
     )
     .unwrap();
     let reopened = open(&directory, &store, fake());
@@ -236,7 +234,7 @@ fn a_half_published_vector_store_rebuilds() {
     put(&store, &mut index, "b", "beta");
     drop(index);
     std::fs::write(
-        priorart::index::collection_index_path(directory.path(), LOCAL_COLLECTION_ID)
+        common::active_index_path(directory.path(), LOCAL_COLLECTION_ID)
             .join("vectors/storage.json"),
         b"{",
     )
@@ -254,7 +252,7 @@ fn a_representation_change_rebuilds() {
     let reopened = open(&directory, &store, Some(other));
     assert_eq!(reopened.vectors().unwrap().representation().dimension(), 8);
     let metadata = std::fs::read_to_string(
-        priorart::index::collection_index_path(directory.path(), LOCAL_COLLECTION_ID)
+        common::active_index_path(directory.path(), LOCAL_COLLECTION_ID)
             .join("vectors/storage.json"),
     )
     .unwrap();
@@ -267,7 +265,7 @@ fn switching_encoders_on_and_off() {
     let mut index = open(&directory, &store, None);
     put(&store, &mut index, "a", "alpha");
     assert!(
-        !priorart::index::collection_index_path(directory.path(), LOCAL_COLLECTION_ID)
+        !common::active_index_path(directory.path(), LOCAL_COLLECTION_ID)
             .join("vectors")
             .exists()
     );
@@ -373,7 +371,7 @@ fn collection_rebuilds_and_mutations_are_isolated() {
             .unwrap()
             .clone();
         assert_ne!(local_manifest.corpus_id(), other_manifest.corpus_id());
-        let other_path = collection_index_path(directory.path(), &other).join("manifest.json");
+        let other_path = common::active_index_path(directory.path(), &other).join("manifest.json");
         let other_bytes = std::fs::read(&other_path).unwrap();
         let other_mirror = store.index_documents(&other).unwrap();
         let index = manager.get(&store, LOCAL).unwrap();
@@ -470,8 +468,8 @@ fn foreign_or_mismatched_manifests_rebuild_only_the_selected_collection() {
     scoped_put(&store, &mut local, LOCAL, "alpha");
     let mut second = Index::open(directory.path(), &store, Some(encoder.clone()), &other).unwrap();
     scoped_put(&store, &mut second, &other, "beta");
-    let local_path = collection_index_path(directory.path(), LOCAL).join("manifest.json");
-    let other_path = collection_index_path(directory.path(), &other).join("manifest.json");
+    let local_path = common::active_index_path(directory.path(), LOCAL).join("manifest.json");
+    let other_path = common::active_index_path(directory.path(), &other).join("manifest.json");
     let other_bytes = std::fs::read(&other_path).unwrap();
     std::fs::copy(&other_path, &local_path).unwrap();
     let calls = encoder.calls();
@@ -479,6 +477,7 @@ fn foreign_or_mismatched_manifests_rebuild_only_the_selected_collection() {
     assert_eq!(encoder.calls(), calls + 1);
     assert_eq!(reopened.manifest().unwrap().corpus_id(), LOCAL);
     for field in ["representation", "records", "vector_generation", "recipe"] {
+        let local_path = common::active_index_path(directory.path(), LOCAL).join("manifest.json");
         let mut manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&local_path).unwrap()).unwrap();
         match field {

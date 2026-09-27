@@ -110,3 +110,11 @@ pub fn service(directory: &tempfile::TempDir) -> std::sync::Arc<priorart::servic
     let encoder: std::sync::Arc<dyn Encoder> = std::sync::Arc::new(FakeEncoder::new());
     std::sync::Arc::new(priorart::service::Service::new(settings, Some(encoder)).unwrap())
 }
+
+/// Test inspection of the activated generation, never a legacy storage path.
+pub fn active_index_path(directory: &std::path::Path, collection: &str) -> std::path::PathBuf {
+    let root = priorart::index::collection_index_path(directory, collection);
+    let pointer: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("CURRENT")).unwrap()).unwrap();
+    root.join(pointer["current"].as_str().unwrap())
+}

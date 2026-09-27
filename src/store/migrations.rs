@@ -30,6 +30,10 @@ const MIGRATIONS: &[Migration] = &[
         version: "v0.3.0",
         apply: create_credential_schema,
     },
+    Migration {
+        version: "v0.4.0",
+        apply: create_mutation_schema,
+    },
 ];
 
 pub const SCHEMA_VERSION: &str = MIGRATIONS[MIGRATIONS.len() - 1].version;
@@ -261,6 +265,25 @@ fn create_credential_schema(transaction: &Transaction<'_>) -> Result<(), StoreEr
     Ok(())
 }
 
+fn create_mutation_schema(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    transaction.execute_batch(
+        "CREATE TABLE mutations (
+        id TEXT PRIMARY KEY,
+        collection_id TEXT NOT NULL REFERENCES collections(id),
+        principal_id TEXT NOT NULL REFERENCES principals(id),
+        operation TEXT NOT NULL CHECK(operation IN ('put', 'delete', 'report')),
+        idempotency_digest TEXT,
+        payload_digest TEXT NOT NULL,
+        authority TEXT NOT NULL,
+        result TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('committed', 'applied')),
+        created_at TEXT NOT NULL,
+        UNIQUE(collection_id, principal_id, operation, idempotency_digest)
+    ); CREATE INDEX pending_mutations ON mutations(collection_id, state);",
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod credential_tests {
     use super::*;
@@ -334,5 +357,58 @@ mod credential_tests {
             stored_version(&reopened.connection).unwrap().as_deref(),
             Some(SCHEMA_VERSION)
         );
+    }
+}
+
+#[cfg(test)]
+mod mutation_tests {
+    use super::*;
+    #[test]
+    fn journal_migration_rolls_back_and_preserves_existing_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("db.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        run(&connection, &MIGRATIONS[..2]).unwrap();
+        connection.execute("INSERT INTO records (collection_id,id,author_principal_id,created_at) VALUES ('local','kept','local-principal','now')", []).unwrap();
+        fn broken(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+            create_mutation_schema(transaction)?;
+            transaction.execute_batch("SELECT missing_function()")?;
+            Ok(())
+        }
+        let migrations = [
+            Migration {
+                version: "v0.2.0",
+                apply: create_collection_schema,
+            },
+            Migration {
+                version: "v0.3.0",
+                apply: create_credential_schema,
+            },
+            Migration {
+                version: "v0.4.0",
+                apply: broken,
+            },
+        ];
+        assert!(run(&connection, &migrations).is_err());
+        assert_eq!(
+            stored_version(&connection).unwrap().as_deref(),
+            Some("v0.3.0")
+        );
+        assert!(connection.prepare("SELECT * FROM mutations").is_err());
+        migrate(&connection).unwrap();
+        assert_eq!(
+            stored_version(&connection).unwrap().as_deref(),
+            Some("v0.4.0")
+        );
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM records WHERE id = 'kept'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM mutations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }

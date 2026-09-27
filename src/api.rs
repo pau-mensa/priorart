@@ -19,7 +19,7 @@ use crate::{
     auth::{AuthError, RequestContext},
     config::ServerMode,
     policy::PolicyError,
-    service::{is_record_id, Service, ServiceError, WriteOptions},
+    service::{is_record_id, DeleteOptions, ReportOptions, Service, ServiceError, WriteOptions},
     store::{Collection, Metadata, StoreError},
 };
 
@@ -60,6 +60,16 @@ impl ApiError {
 impl From<ServiceError> for ApiError {
     fn from(error: ServiceError) -> Self {
         match error {
+            ServiceError::Busy => Self(
+                StatusCode::TOO_MANY_REQUESTS,
+                "resource_limit",
+                "collection execution capacity is busy",
+            ),
+            ServiceError::Store(StoreError::IdempotencyConflict) => Self(
+                StatusCode::CONFLICT,
+                "idempotency_conflict",
+                "idempotency key was used with different input",
+            ),
             ServiceError::Policy(PolicyError::Authentication(AuthError::Unauthenticated)) => {
                 Self::unauthenticated()
             }
@@ -194,9 +204,30 @@ async fn authenticate(
             return Err(ApiError::unauthenticated());
         }
     }
+    let mut keys = request.headers().get_all("idempotency-key").iter();
+    let key = keys
+        .next()
+        .map(|h| h.to_str().map(str::to_owned))
+        .transpose()
+        .map_err(|_| ApiError::invalid())?;
+    if keys.next().is_some()
+        || key.as_ref().is_some_and(|k| {
+            k.is_empty()
+                || k.len() > 128
+                || !k
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b))
+        })
+    {
+        return Err(ApiError::invalid());
+    }
+    request.extensions_mut().insert(IdempotencyKey(key));
     request.extensions_mut().insert(context);
     Ok(next.run(request).await)
 }
+
+#[derive(Clone)]
+struct IdempotencyKey(Option<String>);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -354,16 +385,17 @@ async fn diagnostics(
 async fn put_record(
     State(service): State<Arc<Service>>,
     Extension(context): Extension<RequestContext>,
+    Extension(key): Extension<IdempotencyKey>,
     path: Result<Path<String>, PathRejection>,
     query: Result<Query<EmptyQuery>, QueryRejection>,
     body: Result<Json<PutRequest>, JsonRejection>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
+) -> ApiResult<(StatusCode, [(&'static str, String); 1], Json<Value>)> {
     query?;
     let Path(collection) = path?;
     identifier(&collection)?;
     let Json(body) = body?;
     let response_collection = collection.clone();
-    let (id, revision) = blocking(&service, move |s| {
+    let result = blocking(&service, move |s| {
         s.put(
             &context,
             &collection,
@@ -371,14 +403,17 @@ async fn put_record(
             body.metadata.as_ref(),
             body.id.as_deref(),
             WriteOptions {
+                idempotency_key: key.0.as_deref(),
                 publish: body.publish,
                 expected_revision: body.expected_revision,
             },
         )
     })
     .await?;
+    let (id, revision) = result.value;
     Ok((
         StatusCode::CREATED,
+        [("mutation-id", result.mutation_id)],
         Json(json!({"collection_id": response_collection, "id": id, "revision": revision})),
     ))
 }
@@ -404,19 +439,31 @@ async fn get_record(
 async fn delete_record(
     State(service): State<Arc<Service>>,
     Extension(context): Extension<RequestContext>,
+    Extension(key): Extension<IdempotencyKey>,
     path: Result<Path<(String, String)>, PathRejection>,
     query: Result<Query<DeleteQuery>, QueryRejection>,
-) -> ApiResult<StatusCode> {
+) -> ApiResult<(StatusCode, [(&'static str, String); 1])> {
     let Path((collection, id)) = path?;
     identifier(&collection)?;
     identifier(&id)?;
     let Query(query) = query?;
     positive(query.expected_revision)?;
-    blocking(&service, move |s| {
-        s.delete(&context, &collection, &id, query.expected_revision)
+    let result = blocking(&service, move |s| {
+        s.delete(
+            &context,
+            &collection,
+            &id,
+            DeleteOptions {
+                expected_revision: query.expected_revision,
+                idempotency_key: key.0.as_deref(),
+            },
+        )
     })
     .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok((
+        StatusCode::NO_CONTENT,
+        [("mutation-id", result.mutation_id)],
+    ))
 }
 async fn search(
     State(service): State<Arc<Service>>,
@@ -448,10 +495,11 @@ async fn search(
 async fn report(
     State(service): State<Arc<Service>>,
     Extension(context): Extension<RequestContext>,
+    Extension(key): Extension<IdempotencyKey>,
     path: Result<Path<String>, PathRejection>,
     query: Result<Query<EmptyQuery>, QueryRejection>,
     body: Result<Json<ReportRequest>, JsonRejection>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
+) -> ApiResult<(StatusCode, [(&'static str, String); 1], Json<Value>)> {
     query?;
     let Path(collection) = path?;
     identifier(&collection)?;
@@ -462,19 +510,24 @@ async fn report(
         identifier(id)?;
     }
     let response_collection = collection.clone();
-    let id = blocking(&service, move |s| {
+    let result = blocking(&service, move |s| {
         s.report(
             &context,
             &collection,
             &body.record_id,
             &body.text,
-            Some(body.revision),
-            body.search_id.as_deref(),
+            ReportOptions {
+                revision: Some(body.revision),
+                search_id: body.search_id.as_deref(),
+                idempotency_key: key.0.as_deref(),
+            },
         )
     })
     .await?;
+    let id = result.value;
     Ok((
         StatusCode::CREATED,
+        [("mutation-id", result.mutation_id)],
         Json(json!({"collection_id": response_collection, "id": id})),
     ))
 }

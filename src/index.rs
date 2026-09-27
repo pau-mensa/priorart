@@ -1,16 +1,8 @@
 //! The retrieval index: vector store, lexical index, and corpus identity.
 //!
-//! Documents are the latest live revision of every non-deleted record, one per
-//! record. Internal IDs are dense and mirrored in the store's
-//! `index_documents` table. A record write and the matching vector-store
-//! publish are separate steps, and lateweave publishes a mutation as several
-//! file renames, so neither is atomic. On open the mirror, the live records,
-//! and the vector store are compared, and any disagreement rebuilds the index
-//! from the records; that is how every crash between the steps recovers. A
-//! failed index step in a running process rebuilds the same way.
-//!
-//! Zero documents means no `vectors/` directory: lateweave stores cannot be
-//! empty, so absence is the empty state.
+//! Each mutation builds a private generation. Complete vectors and a manifest are
+//! synced before a single CURRENT pointer is atomically replaced. The previous
+//! generation remains available for recovery, but never serves stale revisions.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -77,6 +69,9 @@ impl CollectionIndexManager {
         self.lru.retain(|id| id != collection_id);
         self.lru.push_back(collection_id.to_owned());
         let index = self.loaded.get_mut(collection_id).expect("loaded above");
+        if store.has_pending_mutations(collection_id)? {
+            index.stale = true;
+        }
         index.ensure_current(store)?;
         Ok(index)
     }
@@ -88,6 +83,12 @@ impl CollectionIndexManager {
     pub fn loaded(&self, collection_id: &str) -> Option<&Index> {
         self.loaded.get(collection_id)
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Activation {
+    current: String,
+    previous: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -127,6 +128,9 @@ pub type Result<T, E = IndexError> = std::result::Result<T, E>;
 pub struct Index {
     collection_id: String,
     corpus_version: String,
+    directory: PathBuf,
+    active: Option<String>,
+    previous: Option<String>,
     manifest_path: PathBuf,
     vectors_path: PathBuf,
     encoder: Option<Arc<dyn Encoder>>,
@@ -153,11 +157,30 @@ impl Index {
         store.get_collection(collection_id)?;
         let directory = collection_index_path(data_dir, collection_id);
         std::fs::create_dir_all(&directory)?;
+        std::fs::File::open(directory.parent().expect("indexes directory"))?.sync_all()?;
+        std::fs::File::open(data_dir)?.sync_all()?;
+        let activation = std::fs::read(directory.join("CURRENT"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Activation>(&bytes).ok())
+            .filter(|p| {
+                valid_generation(&p.current)
+                    && p.previous
+                        .as_ref()
+                        .is_none_or(|name| valid_generation(name))
+            });
+        let active = activation.as_ref().map(|p| p.current.clone());
+        let generation_dir = active.as_ref().map_or_else(
+            || directory.join("uninitialized"),
+            |name| directory.join(name),
+        );
         let mut index = Self {
             collection_id: collection_id.to_owned(),
             corpus_version: uuid::Uuid::new_v4().to_string(),
-            manifest_path: directory.join("manifest.json"),
-            vectors_path: directory.join(VECTORS_DIRECTORY),
+            directory: directory.clone(),
+            active,
+            previous: activation.and_then(|p| p.previous),
+            manifest_path: generation_dir.join("manifest.json"),
+            vectors_path: generation_dir.join(VECTORS_DIRECTORY),
             encoder,
             vectors: None,
             record_ids: Vec::new(),
@@ -241,6 +264,7 @@ impl Index {
         self.index_positions();
         self.vectors = vectors.map(Arc::new);
         self.refresh();
+        store.complete_mutations(&self.collection_id)?;
         Ok(())
     }
 
@@ -279,6 +303,7 @@ impl Index {
     /// Re-encodes every live record and replaces the vector store and mirror.
     pub fn rebuild(&mut self, store: &Store) -> Result<()> {
         self.stale = true;
+        self.prepare_generation(false)?;
         let documents = store.live_documents(&self.collection_id)?;
         self.drop_vectors()?;
         self.record_ids = documents
@@ -313,7 +338,7 @@ impl Index {
                 .collect::<Vec<_>>(),
             self.encoder_name(),
         )?;
-        self.publish()?;
+        self.publish(store)?;
         self.stale = false;
         Ok(())
     }
@@ -373,6 +398,7 @@ impl Index {
         text: &str,
         encoded: EncodedDocument,
     ) -> Result<()> {
+        self.prepare_generation(true)?;
         let removed = self.positions.get(record_id).copied();
         if let Some(position) = removed {
             self.remove_position(position)?;
@@ -405,7 +431,7 @@ impl Index {
             Some((record_id, revision)),
             self.encoder_name(),
         )?;
-        self.publish()?;
+        self.publish(store)?;
         Ok(())
     }
 
@@ -413,6 +439,7 @@ impl Index {
         let Some(position) = self.positions.get(record_id).copied() else {
             return Ok(());
         };
+        self.prepare_generation(true)?;
         self.remove_position(position)?;
         store.update_index_documents(
             &self.collection_id,
@@ -420,7 +447,7 @@ impl Index {
             None,
             self.encoder_name(),
         )?;
-        self.publish()?;
+        self.publish(store)?;
         Ok(())
     }
 
@@ -453,6 +480,44 @@ impl Index {
         Ok(())
     }
 
+    /// Never mutate files belonging to an activated generation.
+    fn prepare_generation(&mut self, copy_vectors: bool) -> Result<()> {
+        if self.active.is_some() {
+            self.cleanup_generations()?;
+        }
+        let staged = self
+            .directory
+            .join(uuid::Uuid::new_v4().simple().to_string());
+        std::fs::create_dir(&staged)?;
+        let vectors = staged.join(VECTORS_DIRECTORY);
+        if copy_vectors && self.vectors_path.exists() {
+            copy_tree(&self.vectors_path, &vectors)?;
+        }
+        self.vectors = if copy_vectors && self.vectors.is_some() {
+            Some(Arc::new(VectorStore::open(&vectors)?))
+        } else {
+            None
+        };
+        self.vectors_path = vectors;
+        self.manifest_path = staged.join("manifest.json");
+        Ok(())
+    }
+
+    fn cleanup_generations(&self) -> Result<()> {
+        for entry in std::fs::read_dir(&self.directory)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if valid_generation(&name)
+                && Some(&name) != self.active.as_ref()
+                && Some(&name) != self.previous.as_ref()
+                && entry.file_type()?.is_dir()
+            {
+                std::fs::remove_dir_all(entry.path())?;
+            }
+        }
+        Ok(())
+    }
+
     fn encoder_name(&self) -> Option<&str> {
         self.encoder
             .as_ref()
@@ -468,7 +533,7 @@ impl Index {
             .collect();
     }
 
-    fn publish(&mut self) -> Result<()> {
+    fn publish(&mut self, store: &Store) -> Result<()> {
         self.generation += 1;
         let snapshot = Snapshot {
             collection_id: self.collection_id.clone(),
@@ -484,10 +549,32 @@ impl Index {
                 .zip(self.revisions.iter().copied())
                 .collect(),
         };
-        let temporary = self.manifest_path.with_extension("tmp");
-        std::fs::write(&temporary, serde_json::to_vec(&snapshot)?)?;
-        std::fs::rename(temporary, &self.manifest_path)?;
+        std::fs::write(&self.manifest_path, serde_json::to_vec(&snapshot)?)?;
+        let staged = self.manifest_path.parent().expect("generation directory");
+        sync_tree(staged)?;
+        let name = staged
+            .file_name()
+            .expect("generation ID")
+            .to_string_lossy()
+            .into_owned();
+        let temporary = self.directory.join("CURRENT.tmp");
+        std::fs::write(
+            &temporary,
+            serde_json::to_vec(&Activation {
+                current: name.clone(),
+                previous: self.active.clone(),
+            })?,
+        )?;
+        std::fs::File::open(&temporary)?.sync_all()?;
+        // Persist the generation's directory entry before making it current.
+        std::fs::File::open(&self.directory)?.sync_all()?;
+        crate::fault::check("before_index_activation")?;
+        std::fs::rename(&temporary, self.directory.join("CURRENT"))?;
+        std::fs::File::open(&self.directory)?.sync_all()?;
+        self.previous = self.active.replace(name);
+        crate::fault::check("after_index_activation")?;
         self.refresh();
+        store.complete_mutations(&self.collection_id)?;
         Ok(())
     }
 
@@ -603,4 +690,36 @@ fn create_vectors(
         encoder.representation().clone(),
         None,
     )?)
+}
+
+fn valid_generation(name: &str) -> bool {
+    name.len() == 32 && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn copy_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(destination)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let target = destination.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else if entry.file_type()?.is_file() {
+            std::fs::copy(entry.path(), target)?;
+        } else {
+            return Err(std::io::Error::other("unexpected index artifact"));
+        }
+    }
+    Ok(())
+}
+
+fn sync_tree(directory: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            sync_tree(&entry.path())?;
+        } else {
+            std::fs::File::open(entry.path())?.sync_all()?;
+        }
+    }
+    std::fs::File::open(directory)?.sync_all()
 }

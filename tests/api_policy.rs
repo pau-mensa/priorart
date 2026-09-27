@@ -702,3 +702,291 @@ async fn expiry_revocation_and_backend_failures_have_safe_responses() {
     );
     assert_eq!(api.get("/healthz", None).await.1, json!({"status": "ok"}));
 }
+
+async fn keyed(
+    api: &Api,
+    method: Method,
+    path: &str,
+    credential: &str,
+    key: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value, String) {
+    let mut request = api
+        .client
+        .request(method, format!("{}{path}", api.url))
+        .bearer_auth(credential)
+        .header("Idempotency-Key", key);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status();
+    let mutation = response
+        .headers()
+        .get("mutation-id")
+        .map(|v| v.to_str().unwrap().to_owned())
+        .unwrap_or_default();
+    (
+        status,
+        response.json().await.unwrap_or(Value::Null),
+        mutation,
+    )
+}
+
+#[tokio::test]
+async fn concurrent_retries_return_one_mutation_and_conflicting_payloads_fail() {
+    let api = Api::start().await;
+    let records = api.records(&api.a);
+    let body = json!({"text": "private mutation sentinel", "metadata": {"tag": "hidden"}});
+    let (left, right) = tokio::join!(
+        keyed(
+            &api,
+            Method::POST,
+            &records,
+            &api.alice_key,
+            "create-once",
+            Some(body.clone())
+        ),
+        keyed(
+            &api,
+            Method::POST,
+            &records,
+            &api.alice_key,
+            "create-once",
+            Some(body.clone())
+        )
+    );
+    assert_eq!(left, right);
+    assert_eq!(left.0, StatusCode::CREATED);
+    assert_eq!(left.2.len(), 32);
+    assert_eq!(left.1["revision"], 1);
+    let id = left.1["id"].as_str().unwrap();
+    let conflict = keyed(
+        &api,
+        Method::POST,
+        &records,
+        &api.alice_key,
+        "create-once",
+        Some(json!({"text": "different private sentinel"})),
+    )
+    .await;
+    assert_eq!(conflict.0, StatusCode::CONFLICT);
+    assert_eq!(conflict.1["error"]["code"], "idempotency_conflict");
+    assert!(!conflict.1.to_string().contains("private"));
+    let update = json!({"id": id, "text": "corrected", "expected_revision": 1});
+    let updated = keyed(
+        &api,
+        Method::POST,
+        &records,
+        &api.alice_key,
+        "update-once",
+        Some(update.clone()),
+    )
+    .await;
+    assert_eq!(updated.0, StatusCode::CREATED);
+    assert_eq!(updated.1["revision"], 2);
+    assert_eq!(
+        keyed(
+            &api,
+            Method::POST,
+            &records,
+            &api.alice_key,
+            "update-once",
+            Some(update)
+        )
+        .await,
+        updated
+    );
+    let reports = format!("/v1/collections/{}/reports", api.a);
+    let report = json!({"record_id": id, "revision": 2, "text": "private feedback sentinel"});
+    let reported = keyed(
+        &api,
+        Method::POST,
+        &reports,
+        &api.alice_key,
+        "create-once",
+        Some(report.clone()),
+    )
+    .await;
+    assert_eq!(reported.0, StatusCode::CREATED);
+    assert_ne!(reported.2, left.2); // operation scope
+    assert_eq!(
+        keyed(
+            &api,
+            Method::POST,
+            &reports,
+            &api.alice_key,
+            "create-once",
+            Some(report)
+        )
+        .await,
+        reported
+    );
+    assert_eq!(
+        api.get(&format!("{records}/{id}/reports"), Some(&api.alice_key))
+            .await
+            .1["reports"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let path = format!("{records}/{id}?expected_revision=2");
+    let deleted = keyed(
+        &api,
+        Method::DELETE,
+        &path,
+        &api.alice_key,
+        "create-once",
+        None,
+    )
+    .await;
+    assert_eq!(deleted.0, StatusCode::NO_CONTENT);
+    assert_eq!(
+        keyed(
+            &api,
+            Method::DELETE,
+            &path,
+            &api.alice_key,
+            "create-once",
+            None
+        )
+        .await,
+        deleted
+    );
+    assert_eq!(
+        keyed(
+            &api,
+            Method::POST,
+            &records,
+            &api.alice_key,
+            "create-once",
+            Some(body)
+        )
+        .await
+        .0,
+        StatusCode::GONE
+    );
+    let connection = rusqlite::Connection::open(api.dir.path().join(DATABASE_FILE)).unwrap();
+    let journal: String = connection.query_row("SELECT group_concat(idempotency_digest || payload_digest || result || state) FROM mutations", [], |r| r.get(0)).unwrap();
+    for secret in [
+        "private mutation sentinel",
+        "private feedback sentinel",
+        "create-once",
+        &api.alice_key,
+    ] {
+        assert!(!journal.contains(secret));
+    }
+    let pending: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM mutations WHERE state = 'committed'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending, 0);
+}
+
+#[tokio::test]
+async fn idempotency_is_principal_and_collection_scoped_and_rechecks_authority() {
+    let api = Api::start().await;
+    let writer = api.delegate(vec![Grant::new(&api.a, Op::Contribute)]);
+    let records = api.records(&api.a);
+    let body = json!({"text": "private contribution"});
+    let created = keyed(
+        &api,
+        Method::POST,
+        &records,
+        &writer,
+        "same-key",
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::CREATED);
+    assert_eq!(
+        keyed(
+            &api,
+            Method::POST,
+            &records,
+            &writer,
+            "same-key",
+            Some(body.clone())
+        )
+        .await,
+        created
+    ); // no update grant needed for create replay
+    let alice = keyed(
+        &api,
+        Method::POST,
+        &records,
+        &api.alice_key,
+        "same-key",
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(alice.0, StatusCode::CREATED);
+    assert_ne!(alice.1["id"], created.1["id"]);
+    let bob = keyed(
+        &api,
+        Method::POST,
+        &api.records(&api.b),
+        &api.bob_key,
+        "same-key",
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(bob.0, StatusCode::CREATED);
+    assert_ne!(bob.2, created.2);
+    let public = keyed(
+        &api,
+        Method::POST,
+        &api.records(&api.public),
+        &api.alice_key,
+        "same-key",
+        Some(json!({"text": "public copy", "publish": true})),
+    )
+    .await;
+    assert_eq!(public.0, StatusCode::CREATED);
+    assert_ne!(public.2, alice.2); // same principal and operation, different collection
+    let context = api.store.authenticate(&writer).unwrap();
+    api.store
+        .revoke_local_credential(&context.credential().unwrap().id)
+        .unwrap();
+    assert_eq!(
+        keyed(
+            &api,
+            Method::POST,
+            &records,
+            &writer,
+            "same-key",
+            Some(body)
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let response = api
+        .client
+        .post(format!("{}{records}", api.url))
+        .bearer_auth(&api.alice_key)
+        .header("Idempotency-Key", "one")
+        .header("Idempotency-Key", "two")
+        .json(&json!({"text": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        keyed(
+            &api,
+            Method::POST,
+            &records,
+            &api.alice_key,
+            "not a valid key",
+            Some(json!({"text": "x"}))
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+}

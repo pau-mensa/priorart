@@ -85,9 +85,32 @@ Returns `201 {"collection_id":"…","id":"…","revision":1}`.
   262144). Metadata must be an object, at most 65536 serialized UTF-8 bytes,
   depth 8, and 1024 value nodes including its root.
 
-A successful write is searchable before the response. Database/index changes are
-not yet one journaled mutation; a failure after the record commit can leave a
-committed write. Retry idempotency and durable coordination belong to step 8.
+A successful write is searchable before its collection lock is released. A failure
+after the record commit can still mean the write committed; retry using the same
+idempotency key as described below.
+
+## Mutation retries
+
+Put, delete, and report accept one optional `Idempotency-Key` header (1–128 ASCII
+letters/digits or `._:-`). Use a fresh key per intended mutation and retain it across
+retries. Keys are scoped to the authenticated principal, collection, and operation.
+Reusing a scoped key with different input returns `409 idempotency_conflict`.
+Input fingerprints include the submitted ID, text, metadata, publication intent,
+revision precondition, and receipt reference as applicable. JSON object key order
+is irrelevant; omitted optional fields and explicit null normalize alike.
+
+Every successful mutation returns `Mutation-Id: <opaque ID>`, including `204`
+deletes. With a matching key, a retry returns the original result and mutation ID,
+even if the original response was lost. Authentication and current original-operation
+authority are still required. Create retries need contribute/authorship, not an
+update grant; revoked credentials fail. A put/report replay on a deleted target is
+rejected. Replaying an older successful update never replaces a later revision.
+
+The mutation receipt is committed atomically with the content. A retry recovers
+pending index work before succeeding. Without a key the mutation still has a
+journal ID, but submitting it again is a new operation. Receipts currently have no
+expiry. The local MCP workflow does not yet expose retry keys; configurable MCP
+idempotency remains step 13.
 
 ## Read and delete
 
@@ -175,10 +198,12 @@ SQL errors, encoder details, and paths:
 | 404 | `not_found` | unknown or forbidden resource, or absent route |
 | 405 | `method_not_allowed` | unsupported method |
 | 409 | `revision_conflict` | revision mismatch or explicit create collision |
+| 409 | `idempotency_conflict` | scoped key reused with different input |
 | 410 | `record_deleted` | authorized read/write of a tombstoned record |
 | 413 | `payload_too_large` | HTTP body exceeds `6 * max_text_bytes + 65536` bytes |
 | 422 | `validation_error` | malformed JSON/query, wrong types, missing/unknown fields |
 | 428 | `revision_required` | authorized existing mutation lacks a precondition |
+| 429 | `resource_limit` | all cached collection execution slots are pinned |
 | 503 | `unavailable` | backend/recovery failure or unsupported transport configuration |
 
 `GET /healthz` returns only `{"status":"ok"}`. These response rules do not promise

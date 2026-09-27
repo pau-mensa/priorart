@@ -3,13 +3,15 @@
 //! Every content operation requires an explicit request context and collection.
 //! Revision preconditions are checked again inside the storage transaction.
 
-use std::collections::{BTreeMap, HashSet};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::{Arc, LazyLock, Mutex};
 
+use crate::store::mutations::{Intent, Mutation};
 use lateweave::SearchRequest;
 use regex::Regex;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::analyzer::tokens;
 use crate::auth::{AuthError, Operation, RequestContext};
@@ -36,6 +38,10 @@ pub fn is_record_id(id: &str) -> bool {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
+    #[error("all collection execution slots are busy")]
+    Busy,
+    #[error("collection state requires a restart after a panic")]
+    Poisoned,
     #[error(transparent)]
     Policy(#[from] PolicyError),
     /// The request is well-formed but violates a protocol rule.
@@ -101,66 +107,131 @@ struct State {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct WriteOptions {
+pub struct WriteOptions<'a> {
+    pub idempotency_key: Option<&'a str>,
     pub publish: bool,
     /// None creates a new ID; 0 explicitly requires absence; positive values compare revisions.
     pub expected_revision: Option<i64>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeleteOptions<'a> {
+    pub expected_revision: Option<i64>,
+    pub idempotency_key: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReportOptions<'a> {
+    pub revision: Option<i64>,
+    pub search_id: Option<&'a str>,
+    pub idempotency_key: Option<&'a str>,
+}
+
 pub struct Service {
     settings: Settings,
     encoder_name: Option<String>,
-    state: Mutex<State>,
+    states: Mutex<States>,
+    encoder: Option<Arc<dyn Encoder>>,
+    // Declared last so collection state is dropped before releasing ownership.
+    _owner: crate::ownership::DirectoryOwner,
+}
+
+#[derive(Default)]
+struct States {
+    loaded: HashMap<String, Arc<Mutex<State>>>,
+    lru: VecDeque<String>,
 }
 
 impl Service {
     pub fn open(settings: Settings) -> Result<Self, OpenError> {
         settings.validate()?;
+        let owner = crate::ownership::DirectoryOwner::acquire(&settings.data_dir)?;
         let encoder = load_encoder(&settings)?;
-        Self::new(settings, encoder)
+        Self::owned(settings, encoder, owner)
     }
 
     pub fn new(settings: Settings, encoder: Option<Arc<dyn Encoder>>) -> Result<Self, OpenError> {
         settings.validate()?;
-        std::fs::create_dir_all(&settings.data_dir)?;
-        let store = Store::open(settings.data_dir.join(DATABASE_FILE))?;
+        let owner = crate::ownership::DirectoryOwner::acquire(&settings.data_dir)?;
+        Self::owned(settings, encoder, owner)
+    }
+
+    fn owned(
+        settings: Settings,
+        encoder: Option<Arc<dyn Encoder>>,
+        owner: crate::ownership::DirectoryOwner,
+    ) -> Result<Self, OpenError> {
+        Store::open(settings.data_dir.join(DATABASE_FILE))?;
         let encoder_name = encoder
             .as_ref()
-            .map(|encoder| encoder.representation().encoder().to_owned());
-        let indexes = CollectionIndexManager::new(
-            &settings.data_dir,
-            encoder,
-            settings.max_loaded_indexes.try_into().map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "max_loaded_indexes must be positive",
-                )
-            })?,
-        );
+            .map(|e| e.representation().encoder().to_owned());
         Ok(Self {
             settings,
             encoder_name,
-            state: Mutex::new(State { store, indexes }),
+            encoder,
+            states: Mutex::default(),
+            _owner: owner,
         })
+    }
+
+    fn connect(&self) -> Result<Store, StoreError> {
+        Store::connect(&self.settings.data_dir.join(DATABASE_FILE))
     }
 
     /// Mint a context; each operation revalidates it against current storage.
     pub fn authenticate(&self, bearer: &str) -> Result<RequestContext, AuthError> {
-        self.state().store.authenticate(bearer)
+        self.connect()?.authenticate(bearer)
     }
 
     pub fn validate_context(&self, context: &RequestContext) -> Result<(), AuthError> {
-        self.state().store.validate_context(context)
+        self.connect()?.validate_context(context)
     }
 
     pub fn settings(&self) -> &Settings {
         &self.settings
     }
 
-    fn state(&self) -> MutexGuard<'_, State> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// Authorization precedes admission. Each cached collection owns its connection
+    /// and mutex. Pinned entries cannot be evicted or replaced while a request uses them.
+    fn state(
+        &self,
+        context: &RequestContext,
+        collection: &str,
+        operation: Operation,
+    ) -> Result<Arc<Mutex<State>>> {
+        let store = self.connect()?;
+        match policy::collection(&store, context, collection, operation) {
+            Err(PolicyError::Unavailable) if operation == Operation::Contribute => {
+                policy::collection(&store, context, collection, Operation::Update)?;
+            }
+            result => {
+                result?;
+            }
+        }
+        let mut states = self.states.lock().map_err(|_| ServiceError::Poisoned)?;
+        if !states.loaded.contains_key(collection) {
+            if states.loaded.len() == self.settings.max_loaded_indexes {
+                let idle = states
+                    .lru
+                    .iter()
+                    .position(|id| Arc::strong_count(&states.loaded[id]) == 1)
+                    .ok_or(ServiceError::Busy)?;
+                let id = states.lru.remove(idle).expect("existing LRU entry");
+                states.loaded.remove(&id);
+            }
+            let indexes = CollectionIndexManager::new(
+                &self.settings.data_dir,
+                self.encoder.clone(),
+                std::num::NonZeroUsize::new(1).unwrap(),
+            );
+            states.loaded.insert(
+                collection.into(),
+                Arc::new(Mutex::new(State { store, indexes })),
+            );
+        }
+        states.lru.retain(|id| id != collection);
+        states.lru.push_back(collection.into());
+        Ok(states.loaded[collection].clone())
     }
 
     pub fn put(
@@ -170,10 +241,46 @@ impl Service {
         text: &str,
         metadata: Option<&Metadata>,
         record_id: Option<&str>,
-        options: WriteOptions,
-    ) -> Result<(String, i64)> {
-        let mut state = self.state();
+        options: WriteOptions<'_>,
+    ) -> Result<Mutation<(String, i64)>> {
+        let handle = self.state(context, collection_id, Operation::Contribute)?;
+        let mut state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
         let State { store, indexes } = &mut *state;
+        let intent = intent(
+            context,
+            collection_id,
+            "put",
+            options.idempotency_key,
+            json!([
+                record_id,
+                text,
+                metadata,
+                options.publish,
+                options.expected_revision
+            ]),
+            if record_id
+                .map(|id| store.record_author(collection_id, id))
+                .transpose()?
+                .flatten()
+                .is_some()
+            {
+                "update"
+            } else {
+                "contribute"
+            },
+        )?;
+        if let Some((result, authority)) = store.replay::<(String, i64)>(&intent)? {
+            let operation = if authority == "contribute" {
+                Operation::Contribute
+            } else {
+                Operation::Update
+            };
+            policy::mutation(store, context, collection_id, &result.value.0, operation)?;
+            store.get(collection_id, &result.value.0, None)?;
+            indexes.get(store, collection_id)?;
+            policy::validate(store, context)?;
+            return Ok(result);
+        }
         authorize_put(store, context, collection_id, record_id, options)?;
         if options.expected_revision.is_some_and(|r| r < 0)
             || (record_id.is_none() && options.expected_revision.is_some_and(|r| r > 0))
@@ -201,20 +308,19 @@ impl Service {
         let encoded = index.encode(text);
         authorize_put(store, context, collection_id, record_id, options)?;
         let encoded = encoded?;
-        let created = store.put(
-            collection_id,
+        let created = store.commit_put(
+            &intent,
             text,
             metadata,
             record_id,
-            context
-                .principal_id()
-                .expect("mutation policy requires a principal"),
             options.expected_revision,
         )?;
-        let result = index.upsert(store, &created.record_id, created.revision, text, encoded);
+        crate::fault::check("after_record_commit").map_err(IndexError::from)?;
+        let result = index.upsert(store, &created.value.0, created.value.1, text, encoded);
         policy::validate(store, context)?;
         result?;
-        Ok((created.record_id, created.revision))
+        crate::fault::check("after_mutation_complete").map_err(IndexError::from)?;
+        Ok(created)
     }
 
     pub fn get(
@@ -224,7 +330,8 @@ impl Service {
         record_id: &str,
         revision: Option<i64>,
     ) -> Result<Revision> {
-        let state = self.state();
+        let handle = self.state(context, collection_id, Operation::Read)?;
+        let state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
         policy::collection(&state.store, context, collection_id, Operation::Read)?;
         let result = state.store.get(collection_id, record_id, revision);
         policy::collection(&state.store, context, collection_id, Operation::Read)?;
@@ -236,25 +343,40 @@ impl Service {
         context: &RequestContext,
         collection_id: &str,
         record_id: &str,
-        expected_revision: Option<i64>,
-    ) -> Result<()> {
-        let mut state = self.state();
+        options: DeleteOptions<'_>,
+    ) -> Result<Mutation<()>> {
+        let handle = self.state(context, collection_id, Operation::Delete)?;
+        let mut state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
         let State { store, indexes } = &mut *state;
         policy::mutation(store, context, collection_id, record_id, Operation::Delete)?;
-        if expected_revision.is_some_and(|r| r <= 0) {
+        let intent = intent(
+            context,
+            collection_id,
+            "delete",
+            options.idempotency_key,
+            json!([record_id, options.expected_revision]),
+            "delete",
+        )?;
+        if let Some((result, _)) = store.replay::<()>(&intent)? {
+            indexes.get(store, collection_id)?;
+            policy::validate(store, context)?;
+            return Ok(result);
+        }
+        if options.expected_revision.is_some_and(|r| r <= 0) {
             return invalid("invalid revision precondition");
         }
-        store.check_delete_revision(collection_id, record_id, expected_revision)?;
+        store.check_delete_revision(collection_id, record_id, options.expected_revision)?;
         let index = indexes.get(store, collection_id);
         policy::mutation(store, context, collection_id, record_id, Operation::Delete)?;
         let index = index?;
-        if store.delete(collection_id, record_id, expected_revision)? {
-            let result = index.remove(store, record_id);
-            policy::validate(store, context)?;
-            result?;
-        }
+        let committed = store.commit_delete(&intent, record_id, options.expected_revision)?;
+        crate::fault::check("after_record_commit").map_err(IndexError::from)?;
+        let result = index.remove(store, record_id);
         policy::validate(store, context)?;
-        Ok(())
+        result?;
+        store.complete_mutations(collection_id)?;
+        crate::fault::check("after_mutation_complete").map_err(IndexError::from)?;
+        Ok(committed)
     }
 
     pub fn search(
@@ -265,7 +387,8 @@ impl Service {
         filters: Option<&Metadata>,
         limit: i64,
     ) -> Result<SearchOutcome> {
-        let mut state = self.state();
+        let handle = self.state(context, collection_id, Operation::Read)?;
+        let mut state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
         let State { store, indexes } = &mut *state;
         policy::collection(store, context, collection_id, Operation::Read)?;
         if text.trim().is_empty() {
@@ -397,10 +520,10 @@ impl Service {
         collection_id: &str,
         record_id: &str,
         text: &str,
-        revision: Option<i64>,
-        search_id: Option<&str>,
-    ) -> Result<String> {
-        let state = self.state();
+        options: ReportOptions<'_>,
+    ) -> Result<Mutation<String>> {
+        let handle = self.state(context, collection_id, Operation::Report)?;
+        let state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
         let store = &state.store;
         policy::collection(store, context, collection_id, Operation::Report)?;
         policy::collection(store, context, collection_id, Operation::Read)?;
@@ -413,8 +536,21 @@ impl Service {
         let principal = context
             .principal_id()
             .expect("report policy requires a principal");
-        let target = store.get(collection_id, record_id, revision)?;
-        if let Some(search_id) = search_id {
+        let intent = intent(
+            context,
+            collection_id,
+            "report",
+            options.idempotency_key,
+            json!([record_id, text, options.revision, options.search_id]),
+            "report",
+        )?;
+        if let Some((result, _)) = store.replay::<String>(&intent)? {
+            store.get(collection_id, record_id, options.revision)?;
+            policy::validate(store, context)?;
+            return Ok(result);
+        }
+        let target = store.get(collection_id, record_id, options.revision)?;
+        if let Some(search_id) = options.search_id {
             if !store.search_owned_by(collection_id, search_id, principal)? {
                 return Err(StoreError::SearchNotFound {
                     collection_id: collection_id.to_owned(),
@@ -425,13 +561,12 @@ impl Service {
         }
         policy::collection(store, context, collection_id, Operation::Report)?;
         policy::collection(store, context, collection_id, Operation::Read)?;
-        let id = store.add_report(
-            collection_id,
+        let id = store.commit_report(
+            &intent,
             record_id,
             Some(target.revision),
-            search_id,
+            options.search_id,
             text,
-            principal,
         )?;
         policy::validate(store, context)?;
         Ok(id)
@@ -443,7 +578,8 @@ impl Service {
         collection_id: &str,
         record_id: &str,
     ) -> Result<Vec<Report>> {
-        let state = self.state();
+        let handle = self.state(context, collection_id, Operation::FeedbackRead)?;
+        let state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
         let store = &state.store;
         policy::collection(store, context, collection_id, Operation::FeedbackRead)?;
         policy::collection(store, context, collection_id, Operation::Read)?;
@@ -463,9 +599,9 @@ impl Service {
         context: &RequestContext,
         id: &str,
     ) -> Result<crate::store::Collection> {
-        let state = self.state();
-        let collection = inspect_collection(&state.store, context, id)?;
-        policy::validate(&state.store, context)?;
+        let store = self.connect()?;
+        let collection = inspect_collection(&store, context, id)?;
+        policy::validate(&store, context)?;
         Ok(collection)
     }
 
@@ -475,24 +611,24 @@ impl Service {
         after: &str,
         limit: i64,
     ) -> Result<Vec<crate::store::Collection>> {
-        let state = self.state();
-        policy::validate(&state.store, context)?;
+        let store = self.connect()?;
+        policy::validate(&store, context)?;
         if !(1..=100).contains(&limit) || (!after.is_empty() && !is_record_id(after)) {
             return invalid("invalid collection pagination");
         }
-        let result = state
-            .store
+        let result = store
             .visible_collections(context, after, limit)?
             .iter()
-            .map(|id| inspect_collection(&state.store, context, id))
+            .map(|id| inspect_collection(&store, context, id))
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        policy::validate(&state.store, context)?;
+        policy::validate(&store, context)?;
         Ok(result)
     }
 
     /// Scoped diagnostics require admin, including before index loading/recovery.
     pub fn health(&self, context: &RequestContext, collection_id: &str) -> Result<Health> {
-        let mut state = self.state();
+        let handle = self.state(context, collection_id, Operation::Admin)?;
+        let mut state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
         let State { store, indexes } = &mut *state;
         policy::collection(store, context, collection_id, Operation::Admin)?;
         let index = indexes.get(store, collection_id);
@@ -512,7 +648,7 @@ fn authorize_put(
     context: &RequestContext,
     collection_id: &str,
     record_id: Option<&str>,
-    options: WriteOptions,
+    options: WriteOptions<'_>,
 ) -> Result<()> {
     // Check some write authority before examining record existence/authorship.
     let collection = match policy::collection(store, context, collection_id, Operation::Contribute)
@@ -575,3 +711,37 @@ fn inspect_collection(
         result => result,
     }
 }
+
+fn intent<'a>(
+    context: &'a RequestContext,
+    collection: &'a str,
+    operation: &'a str,
+    key: Option<&'a str>,
+    payload: Value,
+    authority: &'a str,
+) -> Result<Intent<'a>> {
+    if key.is_some_and(|key| {
+        key.is_empty()
+            || key.len() > 128
+            || !key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b))
+    }) {
+        return invalid("invalid idempotency key");
+    }
+    let payload = Sha256::digest(serde_json::to_vec(&payload).expect("JSON value is serializable"))
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Ok(Intent {
+        collection,
+        principal: context.principal_id().ok_or(PolicyError::Unavailable)?,
+        operation,
+        key,
+        payload,
+        authority,
+    })
+}
+
+#[cfg(test)]
+mod recovery_tests;

@@ -179,7 +179,15 @@ fn unrelated_accounts_cannot_read_mutate_report_or_inspect_forbidden_scope() {
                 expected
             );
             assert_eq!(
-                unavailable(f.service.delete(&context, collection, record, Some(1))),
+                unavailable(f.service.delete(
+                    &context,
+                    collection,
+                    record,
+                    priorart::service::DeleteOptions {
+                        expected_revision: Some(1),
+                        idempotency_key: None
+                    }
+                )),
                 expected
             );
             assert_eq!(
@@ -188,8 +196,11 @@ fn unrelated_accounts_cannot_read_mutate_report_or_inspect_forbidden_scope() {
                     collection,
                     record,
                     "report",
-                    Some(1),
-                    None
+                    priorart::service::ReportOptions {
+                        revision: Some(1),
+                        search_id: None,
+                        idempotency_key: None
+                    }
                 )),
                 expected
             );
@@ -233,6 +244,7 @@ fn read_scope_includes_old_revisions_but_not_mutations_feedback_or_diagnostics()
             None,
             Some("same"),
             WriteOptions {
+                idempotency_key: None,
                 publish: false,
                 expected_revision: Some(1),
             },
@@ -261,11 +273,26 @@ fn read_scope_includes_old_revisions_but_not_mutations_feedback_or_diagnostics()
         f.service
             .put(&reader, &f.a, "new", None, None, WriteOptions::default()),
     );
-    unavailable(f.service.delete(&reader, &f.a, "same", Some(1)));
-    unavailable(
-        f.service
-            .report(&reader, &f.a, "same", "report", None, None),
-    );
+    unavailable(f.service.delete(
+        &reader,
+        &f.a,
+        "same",
+        priorart::service::DeleteOptions {
+            expected_revision: Some(1),
+            idempotency_key: None,
+        },
+    ));
+    unavailable(f.service.report(
+        &reader,
+        &f.a,
+        "same",
+        "report",
+        priorart::service::ReportOptions {
+            revision: None,
+            search_id: None,
+            idempotency_key: None,
+        },
+    ));
     unavailable(f.service.reports(&reader, &f.a, "same"));
     unavailable(f.service.health(&reader, &f.a));
     unavailable(f.service.get(&reader, &f.b, "same", None));
@@ -301,15 +328,31 @@ fn anonymous_public_reads_never_log_and_mutations_require_credentials() {
             None,
             None,
             WriteOptions {
+                idempotency_key: None,
                 publish: true,
                 expected_revision: None,
             },
         ));
-        unavailable(f.service.delete(context, &f.public, "same", Some(1)));
-        unavailable(
-            f.service
-                .report(context, &f.public, "same", "report", Some(1), None),
-        );
+        unavailable(f.service.delete(
+            context,
+            &f.public,
+            "same",
+            priorart::service::DeleteOptions {
+                expected_revision: Some(1),
+                idempotency_key: None,
+            },
+        ));
+        unavailable(f.service.report(
+            context,
+            &f.public,
+            "same",
+            "report",
+            priorart::service::ReportOptions {
+                revision: Some(1),
+                search_id: None,
+                idempotency_key: None,
+            },
+        ));
         unavailable(f.service.reports(context, &f.public, "same"));
         unavailable(f.service.health(context, &f.public));
     }
@@ -340,6 +383,7 @@ fn public_authorship_publication_and_moderation_are_explicit() {
             None,
             Some("bob-record"),
             WriteOptions {
+                idempotency_key: None,
                 publish: true,
                 expected_revision: None,
             },
@@ -361,6 +405,7 @@ fn public_authorship_publication_and_moderation_are_explicit() {
             None,
             Some("bob-record"),
             WriteOptions {
+                idempotency_key: None,
                 publish: true,
                 expected_revision: Some(1),
             },
@@ -373,11 +418,20 @@ fn public_authorship_publication_and_moderation_are_explicit() {
         None,
         Some("same"),
         WriteOptions {
+            idempotency_key: None,
             publish: true,
             expected_revision: None,
         },
     ));
-    unavailable(f.service.delete(&author, &f.public, "same", Some(1)));
+    unavailable(f.service.delete(
+        &author,
+        &f.public,
+        "same",
+        priorart::service::DeleteOptions {
+            expected_revision: Some(1),
+            idempotency_key: None,
+        },
+    ));
     let owner_limited = f.delegated(&f.alice, &f.public, &[Op::Update, Op::Delete, Op::Admin]);
     let owner_limited = f.context(&owner_limited);
     unavailable(f.service.put(
@@ -387,14 +441,20 @@ fn public_authorship_publication_and_moderation_are_explicit() {
         None,
         Some("bob-record"),
         WriteOptions {
+            idempotency_key: None,
             publish: true,
             expected_revision: None,
         },
     ));
-    unavailable(
-        f.service
-            .delete(&owner_limited, &f.public, "bob-record", Some(1)),
-    );
+    unavailable(f.service.delete(
+        &owner_limited,
+        &f.public,
+        "bob-record",
+        priorart::service::DeleteOptions {
+            expected_revision: Some(1),
+            idempotency_key: None,
+        },
+    ));
     f.service
         .put(
             &f.alice(),
@@ -403,6 +463,7 @@ fn public_authorship_publication_and_moderation_are_explicit() {
             None,
             Some("bob-record"),
             WriteOptions {
+                idempotency_key: None,
                 publish: true,
                 expected_revision: Some(2),
             },
@@ -417,11 +478,27 @@ fn public_authorship_publication_and_moderation_are_explicit() {
         Some(f.bob.as_str())
     );
     f.service
-        .delete(&f.alice(), &f.public, "bob-record", Some(3))
+        .delete(
+            &f.alice(),
+            &f.public,
+            "bob-record",
+            priorart::service::DeleteOptions {
+                expected_revision: Some(3),
+                idempotency_key: None,
+            },
+        )
         .unwrap();
     let author = f.context(&contributor);
     f.service
-        .delete(&author, &f.public, "bob-record", Some(3))
+        .delete(
+            &author,
+            &f.public,
+            "bob-record",
+            priorart::service::DeleteOptions {
+                expected_revision: Some(3),
+                idempotency_key: None,
+            },
+        )
         .unwrap(); // tombstone retains ownership
     assert!(f
         .service
@@ -432,6 +509,7 @@ fn public_authorship_publication_and_moderation_are_explicit() {
             None,
             Some("bob-record"),
             WriteOptions {
+                idempotency_key: None,
                 publish: true,
                 expected_revision: None
             }
@@ -463,7 +541,15 @@ fn contribute_does_not_grant_update_even_to_the_original_author() {
         WriteOptions::default(),
     ));
     unavailable(f.service.get(&writer, &f.a, "bob", None));
-    unavailable(f.service.delete(&writer, &f.a, "bob", Some(1)));
+    unavailable(f.service.delete(
+        &writer,
+        &f.a,
+        "bob",
+        priorart::service::DeleteOptions {
+            expected_revision: Some(1),
+            idempotency_key: None,
+        },
+    ));
 }
 
 #[test]
@@ -484,8 +570,11 @@ fn reports_and_attached_receipts_belong_to_the_requesting_principal() {
             &f.public,
             "same",
             "Alice private feedback",
-            Some(1),
-            Some(&receipt),
+            priorart::service::ReportOptions {
+                revision: Some(1),
+                search_id: Some(&receipt),
+                idempotency_key: None,
+            },
         )
         .unwrap();
     f.service
@@ -494,8 +583,11 @@ fn reports_and_attached_receipts_belong_to_the_requesting_principal() {
             &f.public,
             "same",
             "Bob private feedback",
-            Some(1),
-            None,
+            priorart::service::ReportOptions {
+                revision: Some(1),
+                search_id: None,
+                idempotency_key: None,
+            },
         )
         .unwrap();
     let alice_reports = f.service.reports(&alice, &f.public, "same").unwrap();
@@ -507,7 +599,17 @@ fn reports_and_attached_receipts_belong_to_the_requesting_principal() {
     for id in [&receipt, "unknown-receipt"] {
         let error = f
             .service
-            .report(&bob, &f.public, "same", "attack", Some(1), Some(id))
+            .report(
+                &bob,
+                &f.public,
+                "same",
+                "attack",
+                priorart::service::ReportOptions {
+                    revision: Some(1),
+                    search_id: Some(id),
+                    idempotency_key: None,
+                },
+            )
             .unwrap_err();
         assert!(matches!(
             error,
@@ -519,7 +621,15 @@ fn reports_and_attached_receipts_belong_to_the_requesting_principal() {
             .reports(&RequestContext::anonymous(), &f.public, "same"),
     );
     f.service
-        .delete(&alice, &f.public, "same", Some(1))
+        .delete(
+            &alice,
+            &f.public,
+            "same",
+            priorart::service::DeleteOptions {
+                expected_revision: Some(1),
+                idempotency_key: None,
+            },
+        )
         .unwrap();
     assert!(f.service.reports(&bob, &f.public, "same").is_err());
 }
@@ -669,6 +779,7 @@ fn revocation_during_encoding_blocks_search_results_and_record_commits() {
                 None,
                 Some("same"),
                 WriteOptions {
+                    idempotency_key: None,
                     publish: false,
                     expected_revision: Some(1),
                 },
@@ -700,15 +811,31 @@ fn expired_credentials_fail_even_for_public_data() {
         None,
         None,
         WriteOptions {
+            idempotency_key: None,
             publish: true,
             expected_revision: None,
         },
     ));
-    unauthenticated(f.service.delete(&context, &f.public, "same", Some(1)));
-    unauthenticated(
-        f.service
-            .report(&context, &f.public, "same", "feedback", None, None),
-    );
+    unauthenticated(f.service.delete(
+        &context,
+        &f.public,
+        "same",
+        priorart::service::DeleteOptions {
+            expected_revision: Some(1),
+            idempotency_key: None,
+        },
+    ));
+    unauthenticated(f.service.report(
+        &context,
+        &f.public,
+        "same",
+        "feedback",
+        priorart::service::ReportOptions {
+            revision: None,
+            search_id: None,
+            idempotency_key: None,
+        },
+    ));
     unauthenticated(f.service.reports(&context, &f.public, "same"));
     unauthenticated(f.service.health(&context, &f.public));
 }
@@ -730,7 +857,15 @@ fn revocation_during_index_recovery_blocks_diagnostics_and_deletes() {
         if diagnostics {
             unauthenticated(f.service.health(&context, &f.a));
         } else {
-            unauthenticated(f.service.delete(&context, &f.a, "same", Some(1)));
+            unauthenticated(f.service.delete(
+                &context,
+                &f.a,
+                "same",
+                priorart::service::DeleteOptions {
+                    expected_revision: Some(1),
+                    idempotency_key: None,
+                },
+            ));
         }
         assert!(f.store.get(&f.a, "same", None).is_ok());
     }

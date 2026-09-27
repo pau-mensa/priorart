@@ -121,7 +121,7 @@ session must go through the one server.
 | `PRIORART_ENCODER_REVISION` | `main` | Hub revision, recorded in the vector store's representation |
 | `PRIORART_ENCODER_THREADS` | auto | ONNX Runtime intra-op threads |
 | `PRIORART_GATHER_LIMIT` | `500` | exhaustive MaxSim up to this many eligible records, BM25 candidates beyond |
-| `PRIORART_MAX_LOADED_INDEXES` | `8` | maximum resident collection indexes (LRU eviction; count, not a byte limit) |
+| `PRIORART_MAX_LOADED_INDEXES` | `8` | cached/active collection states and indexes; idle LRU eviction, busy admission returns 429 |
 | `PRIORART_MAX_TEXT_BYTES` | `262144` | maximum size of one record |
 | `PRIORART_HOST` / `PRIORART_PORT` | `127.0.0.1` / `8000` | loopback bind address |
 
@@ -151,12 +151,12 @@ For database upgrades and recovery behavior, see [storage versions](docs/storage
   unencrypted.
 - One indexed view per record, truncated by the encoder at 2048 tokens for
   LateOn-Code. Chunking is planned as an internal derived view.
-- Writes index synchronously under one lock; a put returns when it is
-  searchable. Fine for thousands of records, not for a firehose.
-- A record write and its vector-store update are not atomic together, and the
-  vector store publishes each mutation as several file renames. Startup
-  compares the database, index mirror, and vector store and rebuilds the index
-  from SQLite on any disagreement.
+- One server owns each data directory. Writes index synchronously under a
+  per-collection lock; different collections can run concurrently within capacity.
+- Record mutations use a durable journal and atomic index-generation activation.
+  HTTP retry keys avoid duplicate mutations after lost responses or recovery.
+  Staging currently copies vector files, adding disk I/O proportional to index size.
+  Previous generations are retained; complete derived-data purging is later work.
 - Authenticated/local searches still log query text; anonymous public searches
   persist nothing. There is no retention policy yet.
 - Reports are stored and returned, not scored. Voting is not correctness.

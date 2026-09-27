@@ -84,24 +84,30 @@ Each validation observes a SQLite snapshot. A revocation observed by the final
 pre-mutation check denies the write; one observed by the final result check denies
 the response. Revocation after that check cannot recall an already admitted mutation
 or delivered result. The final validation and record commit are not one cross-process
-transaction; durable mutation coordination and process ownership remain step 8.
+transaction. Process ownership prevents competing service content writers, while
+local credential administration can still change grants concurrently.
 If revocation happens during indexing after a record has committed, the record can
-remain committed even though the request returns an authentication error. Idempotent
-retry handling is likewise deferred to step 8.
+remain committed even though the request returns an authentication error. Journaled
+idempotent retries recover that write only after successful reauthentication and
+authorization; a key does not grant access to its saved result.
 
-Requests within one `Service` remain serialized under its mutex. External credential
+Requests serialize under a per-collection mutex and owned SQLite connection;
+different collections can run concurrently within the bounded collection cache.
+A server holds exclusive data-directory ownership for its lifetime. External credential
 administration can revoke while encoding/retrieval runs, and regression tests exercise
 that boundary. Direct concurrent content writes through the trusted `Store` API remain
 unsupported; they bypass both policy and in-memory index coordination.
 
 ## Revision preconditions
 
-`Service::put` takes `WriteOptions { publish, expected_revision }`. A new record
+`Service::put` takes `WriteOptions { publish, expected_revision, idempotency_key }`. A new record
 allows no precondition or `Some(0)` (explicit absence). Existing updates require
 `Some(current_revision)`; no precondition returns `RevisionRequired`, and stale
 preconditions or explicit create collisions return `RevisionConflict`. An explicit
 create requires contribute, while an update requires update and authorship/moderation.
 `Service::delete` requires the current revision, including on repeat tombstone deletes.
 Checks follow policy, precede index work, and run again inside the SQLite mutation
-transaction. They prevent lost record updates; they do not coordinate independent
-processes' indexes or provide retry idempotency.
+transaction. `DeleteOptions` and `ReportOptions` carry their preconditions/targets
+and optional retry key. Each service mutation returns `Mutation<T>` containing a
+durable mutation ID and its operation result. Replays revalidate current original
+operation authority and use the same collection synchronization as new writes.

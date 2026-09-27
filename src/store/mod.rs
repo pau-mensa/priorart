@@ -6,6 +6,7 @@
 
 mod credentials;
 pub mod migrations;
+pub mod mutations;
 #[cfg(test)]
 mod tests;
 
@@ -31,6 +32,10 @@ pub type Metadata = Map<String, Value>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    #[error("idempotency key was already used with different input")]
+    IdempotencyConflict,
+    #[error("invalid mutation journal data")]
+    Journal,
     #[error("a revision precondition is required")]
     RevisionRequired,
     #[error("the revision precondition did not match")]
@@ -230,9 +235,23 @@ impl Store {
         }
         let connection = Connection::open(&path)?;
         connection.pragma_update(None, "foreign_keys", true)?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
         migrations::migrate(&connection)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         Ok(Self { path, connection })
+    }
+
+    /// A request-owned connection to an already initialized database. No migrations.
+    pub(crate) fn connect(path: &Path) -> Result<Self> {
+        let connection =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        Ok(Self {
+            path: path.to_owned(),
+            connection,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -362,59 +381,18 @@ impl Store {
         author_principal_id: &str,
         expected_revision: Option<i64>,
     ) -> Result<RecordRef> {
-        let now = now();
-        let record_id = record_id.map_or_else(new_id, str::to_owned);
         let transaction = self.write()?;
-        check_revision(
+        let result = put_in(
             &transaction,
             collection_id,
-            &record_id,
+            text,
+            metadata,
+            record_id,
+            author_principal_id,
             expected_revision,
-            true,
-        )?;
-        let revision = match record_state(&transaction, collection_id, &record_id)? {
-            RecordState::Missing => {
-                transaction.execute(
-                    "INSERT INTO records (collection_id, id, author_principal_id, created_at) \
-                     VALUES (?1, ?2, ?3, ?4)",
-                    (collection_id, &record_id, author_principal_id, &now),
-                )?;
-                1
-            }
-            RecordState::Deleted => {
-                return Err(StoreError::RecordDeleted {
-                    collection_id: collection_id.to_owned(),
-                    record_id,
-                })
-            }
-            RecordState::Live => {
-                let latest: i64 = transaction.query_row(
-                    "SELECT MAX(revision) FROM revisions WHERE collection_id = ?1 AND record_id = ?2",
-                    (collection_id, &record_id),
-                    |row| row.get(0),
-                )?;
-                latest + 1
-            }
-        };
-        transaction.execute(
-            "INSERT INTO revisions (collection_id, record_id, revision, text, metadata, \
-             text_sha256, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            (
-                collection_id,
-                &record_id,
-                revision,
-                text,
-                metadata.map(encode),
-                digest(text),
-                &now,
-            ),
         )?;
         transaction.commit()?;
-        Ok(RecordRef {
-            collection_id: collection_id.to_owned(),
-            record_id,
-            revision,
-        })
+        Ok(result)
     }
 
     /// The latest revision, or `revision` when given.
@@ -481,38 +459,9 @@ impl Store {
         expected_revision: Option<i64>,
     ) -> Result<bool> {
         let transaction = self.write()?;
-        match record_state(&transaction, collection_id, record_id)? {
-            RecordState::Missing => return Err(record_not_found(collection_id, record_id, None)),
-            RecordState::Deleted => {
-                check_revision(
-                    &transaction,
-                    collection_id,
-                    record_id,
-                    expected_revision,
-                    false,
-                )?;
-                return Ok(false);
-            }
-            RecordState::Live => {}
-        }
-        check_revision(
-            &transaction,
-            collection_id,
-            record_id,
-            expected_revision,
-            false,
-        )?;
-        transaction.execute(
-            "UPDATE revisions SET text = NULL, metadata = NULL \
-             WHERE collection_id = ?1 AND record_id = ?2",
-            (collection_id, record_id),
-        )?;
-        transaction.execute(
-            "UPDATE records SET deleted_at = ?1 WHERE collection_id = ?2 AND id = ?3",
-            (now(), collection_id, record_id),
-        )?;
+        let result = delete_in(&transaction, collection_id, record_id, expected_revision)?;
         transaction.commit()?;
-        Ok(true)
+        Ok(result)
     }
 
     /// The latest revision of every live record, ordered by record ID.
@@ -560,48 +509,18 @@ impl Store {
         text: &str,
         reporter_principal_id: &str,
     ) -> Result<String> {
-        let id = new_id();
         let transaction = self.write()?;
-        if record_state(&transaction, collection_id, record_id)? == RecordState::Missing {
-            return Err(record_not_found(collection_id, record_id, None));
-        }
-        if let Some(revision) = revision {
-            let exists = transaction
-                .query_row(
-                    "SELECT 1 FROM revisions \
-                     WHERE collection_id = ?1 AND record_id = ?2 AND revision = ?3",
-                    (collection_id, record_id, revision),
-                    |_| Ok(()),
-                )
-                .optional()?;
-            if exists.is_none() {
-                return Err(record_not_found(collection_id, record_id, Some(revision)));
-            }
-        }
-        if let Some(search_id) = search_id {
-            if !search_exists(&transaction, collection_id, search_id)? {
-                return Err(StoreError::SearchNotFound {
-                    collection_id: collection_id.to_owned(),
-                    search_id: search_id.to_owned(),
-                });
-            }
-        }
-        transaction.execute(
-            "INSERT INTO reports (collection_id, id, reporter_principal_id, record_id, revision, \
-             search_id, text, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            (
-                collection_id,
-                &id,
-                reporter_principal_id,
-                record_id,
-                revision,
-                search_id,
-                text,
-                now(),
-            ),
+        let result = add_report_in(
+            &transaction,
+            collection_id,
+            record_id,
+            revision,
+            search_id,
+            text,
+            reporter_principal_id,
         )?;
         transaction.commit()?;
-        Ok(id)
+        Ok(result)
     }
 
     /// Reports on a record in creation order; deleted records keep theirs.
@@ -890,4 +809,156 @@ fn check_revision(
         (Some(_), None) => Err(StoreError::RevisionRequired),
         _ => Err(StoreError::RevisionConflict),
     }
+}
+
+fn put_in(
+    transaction: &Transaction<'_>,
+    collection_id: &str,
+    text: &str,
+    metadata: Option<&Metadata>,
+    record_id: Option<&str>,
+    author_principal_id: &str,
+    expected_revision: Option<i64>,
+) -> Result<RecordRef> {
+    let now = now();
+    let record_id = record_id.map_or_else(new_id, str::to_owned);
+    check_revision(
+        transaction,
+        collection_id,
+        &record_id,
+        expected_revision,
+        true,
+    )?;
+    let revision = match record_state(transaction, collection_id, &record_id)? {
+        RecordState::Missing => {
+            transaction.execute(
+                "INSERT INTO records (collection_id, id, author_principal_id, created_at) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                (collection_id, &record_id, author_principal_id, &now),
+            )?;
+            1
+        }
+        RecordState::Deleted => {
+            return Err(StoreError::RecordDeleted {
+                collection_id: collection_id.to_owned(),
+                record_id,
+            })
+        }
+        RecordState::Live => {
+            let latest: i64 = transaction.query_row(
+                "SELECT MAX(revision) FROM revisions WHERE collection_id = ?1 AND record_id = ?2",
+                (collection_id, &record_id),
+                |row| row.get(0),
+            )?;
+            latest + 1
+        }
+    };
+    transaction.execute(
+        "INSERT INTO revisions (collection_id, record_id, revision, text, metadata, \
+             text_sha256, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        (
+            collection_id,
+            &record_id,
+            revision,
+            text,
+            metadata.map(encode),
+            digest(text),
+            &now,
+        ),
+    )?;
+    Ok(RecordRef {
+        collection_id: collection_id.to_owned(),
+        record_id,
+        revision,
+    })
+}
+
+fn delete_in(
+    transaction: &Transaction<'_>,
+    collection_id: &str,
+    record_id: &str,
+    expected_revision: Option<i64>,
+) -> Result<bool> {
+    match record_state(transaction, collection_id, record_id)? {
+        RecordState::Missing => return Err(record_not_found(collection_id, record_id, None)),
+        RecordState::Deleted => {
+            check_revision(
+                transaction,
+                collection_id,
+                record_id,
+                expected_revision,
+                false,
+            )?;
+            return Ok(false);
+        }
+        RecordState::Live => {}
+    }
+    check_revision(
+        transaction,
+        collection_id,
+        record_id,
+        expected_revision,
+        false,
+    )?;
+    transaction.execute(
+        "UPDATE revisions SET text = NULL, metadata = NULL \
+             WHERE collection_id = ?1 AND record_id = ?2",
+        (collection_id, record_id),
+    )?;
+    transaction.execute(
+        "UPDATE records SET deleted_at = ?1 WHERE collection_id = ?2 AND id = ?3",
+        (now(), collection_id, record_id),
+    )?;
+    Ok(true)
+}
+
+fn add_report_in(
+    transaction: &Transaction<'_>,
+    collection_id: &str,
+    record_id: &str,
+    revision: Option<i64>,
+    search_id: Option<&str>,
+    text: &str,
+    reporter_principal_id: &str,
+) -> Result<String> {
+    let id = new_id();
+    if record_state(transaction, collection_id, record_id)? == RecordState::Missing {
+        return Err(record_not_found(collection_id, record_id, None));
+    }
+    if let Some(revision) = revision {
+        let exists = transaction
+            .query_row(
+                "SELECT 1 FROM revisions \
+                     WHERE collection_id = ?1 AND record_id = ?2 AND revision = ?3",
+                (collection_id, record_id, revision),
+                |_| Ok(()),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(record_not_found(collection_id, record_id, Some(revision)));
+        }
+    }
+    if let Some(search_id) = search_id {
+        if !search_exists(transaction, collection_id, search_id)? {
+            return Err(StoreError::SearchNotFound {
+                collection_id: collection_id.to_owned(),
+                search_id: search_id.to_owned(),
+            });
+        }
+    }
+    transaction.execute(
+        "INSERT INTO reports (collection_id, id, reporter_principal_id, record_id, revision, \
+             search_id, text, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        (
+            collection_id,
+            &id,
+            reporter_principal_id,
+            record_id,
+            revision,
+            search_id,
+            text,
+            now(),
+        ),
+    )?;
+    Ok(id)
 }

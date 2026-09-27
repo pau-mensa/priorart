@@ -2,9 +2,11 @@
 
 A data directory holds `priorart.sqlite` (with its WAL files) and an `indexes/`
 directory. Each collection's storage directory is the lowercase SHA-256 hex digest
-of its ID, computed by the server; IDs are never interpreted as paths. It contains
-`manifest.json` and, when an encoder is configured and at least one record is live,
-a `vectors/` store. On startup,
+of its ID, computed by the server; IDs are never interpreted as paths. Its `CURRENT`
+file atomically selects a UUID-named generation containing `manifest.json` and,
+when nonempty and encoded, a `vectors/` store. It also identifies the previous
+generation retained for recovery. `writer.lock` holds exclusive server ownership.
+On startup,
 priorart reads the schema version from the `schema_version` table, applies pending
 migrations, and only then opens the index. A schema version is the tag of the
 release that introduced that schema, so an unsupported version names the release
@@ -15,8 +17,9 @@ are independent of the HTTP protocol version.
 |---|---|
 | Empty database | Create the current schema transactionally |
 | No `schema_version`, any existing schema | Reject; priorart only initializes empty databases |
-| `v0.2.0` | Transactionally add credential/grant tables and advance to `v0.3.0` |
-| `v0.3.0` | Open without rerunning migrations |
+| `v0.2.0` | Add credentials/grants and the mutation journal transactionally |
+| `v0.3.0` | Add the mutation journal and advance to `v0.4.0` |
+| `v0.4.0` | Open without rerunning migrations |
 | A tag this build does not know | Reject, naming that release as the one to use |
 | Nonzero `PRAGMA user_version` | Reject as a Python implementation directory; use `v0.1.0` |
 
@@ -27,6 +30,7 @@ the Python implementation (release `v0.1.0`, which versioned its schema with
 `PRAGMA user_version`) are not adopted.
 
 Schema `v0.3.0` adds credential verifiers, scoped grants, and authentication versions.
+Schema `v0.4.0` adds durable, scoped mutation receipts without rewriting content.
 See [local credential administration](credentials.md) for lifecycle and context semantics.
 
 HTTP v1 accepts header credentials and explicit collection scopes under
@@ -59,53 +63,92 @@ within a collection only. The trusted index API accepts an explicit existing
 collection; it does not provide authorization. Service policy authorizes before
 index loading or recovery. HTTP selects explicit collections; the bundled MCP client selects `local`.
 
-The service uses a collection-index manager with lazy loading and LRU eviction.
-`PRIORART_MAX_LOADED_INDEXES` defaults to 8 and must be positive. Eviction releases
-the manager's in-memory lexical/vector state without deleting persisted artifacts;
-reopening validates only the selected collection. This bounds resident index count,
-not bytes or record count. Index handles are mutable borrows of the manager and
-must not be used concurrently with store mutations. The service still serializes
-requests with its existing mutex. Per-collection locking, connection ownership,
-and enforced single-writer process ownership remain later work.
+## Ownership and concurrency
 
-## Index recovery
+`Service` acquires an exclusive OS advisory lock on `writer.lock` before opening
+SQLite or loading the encoder, and holds it for its lifetime. A second server,
+including one using a symlink alias of the same directory, fails immediately.
+Process exit releases the lock; never delete or replace its inode while a server
+runs. Use a local filesystem with reliable advisory locks, atomic rename, and
+file/directory sync semantics. This is not a distributed/network-filesystem lock.
 
-The index mirror (`index_documents`) records which record revision each dense
-internal vector ID holds, and `index_state` records the encoder that wrote it.
-A write commits the record in SQLite first, then updates the vector store, then
-the mirror, then publishes that collection's manifest. These steps are not atomic together, and lateweave publishes each
-vector-store mutation as several file renames (each array, the offsets, and
-`storage.json`), so a crash can leave a half-published store.
+Each admitted collection owns a mutex, SQLite connection, and lazily loaded index.
+The connection never participates in another collection's request/transaction.
+Authentication and discovery use short-lived separate connections. All operations
+within a collection serialize, including record reads, so search results cannot
+mix an index revision with a concurrent update or delete. Different collections
+can encode and search concurrently. SQLite still serializes its short write
+transactions; no write transaction is held while encoding.
 
-Each manifest persists collection identity, an index incarnation UUID, its mutation
-generation, the full encoder `Representation`, the current single-record/lexical
-recipe version, the ordered record/revision mapping, and the vector-store generation.
-A consistent reopen preserves the manifest and generation without re-encoding.
-Rebuilds and writes advance that collection's generation. A missing or incompatible
-manifest starts a new incarnation. Tokenizer artifact fingerprints and full chunking
-recipe versions are deferred to the retrieval-recipe step; current encoder identity
-is only as precise as the configured representation (pin model revisions).
+`PRIORART_MAX_LOADED_INDEXES` (default 8) bounds cached collection states and acts
+as a process-wide bound on concurrently active collections. Idle states use LRU
+eviction; pinned states cannot be evicted or duplicated. If admitting a different
+collection would exceed capacity and every state is pinned, it gets `429
+resource_limit`. The bound counts collections, not bytes, token matrices, or queued
+requests. Each encoder call can itself use `PRIORART_ENCODER_THREADS` CPU threads.
 
-priorart coordinates database and index recovery on every load: the manifest must
-match the collection, recipe, representation, ordered mirror and vector generation;
-the mirror must list exactly the live records' latest revisions with contiguous IDs,
-and, with an encoder, the vector store must open, be INT8, hold the mirrored
-document count, carry the configured representation, and have been written by
-the same encoder the mirror records. Any disagreement, including an unreadable
-store, rebuilds only that collection's index from SQLite. Vectors left behind by an earlier
-encoder run are never trusted after a lexical-only run has written the mirror.
-A running server applies the same rule when an index step fails after its record
-commits: it rebuilds from SQLite at once, and if that rebuild fails too, every
-later write and search retries it before touching the index. Documents are
-encoded before the record is written, so an encoder failure stores nothing.
-The manifest is published through a temporary file and rename, but this is not
-atomic activation of an entire index generation or a power-loss durability promise.
-Journaled mutations with atomic generation activation are planned to replace
-this rebuild-on-mismatch model.
+Local credential administration can still revoke credentials during retrieval.
+The low-level `Store` and `Index` APIs are trusted building blocks, not independent
+server writers: direct concurrent content/index writes bypass ownership and policy
+and are unsupported. Stop the server before schema upgrades or direct maintenance.
 
-The former top-level `vectors/` directory is never read or adopted. If present, it
-is left untouched; the selected collection's derived index is rebuilt from its
-SQLite records under `indexes/`. Remove obsolete artifacts separately after review.
+## Journal and idempotency
+
+Every service put/delete/report has a durable mutation ID. The same immediate
+SQLite transaction applies revision preconditions, commits the content change,
+and inserts the mutation receipt. SQLite connections explicitly use `synchronous=FULL`.
+Receipts contain scope, operation, required authority, creation time, digests of
+optional idempotency keys and payloads, and the minimal result (IDs/revision).
+They do not duplicate record/report text, metadata, credentials, or raw keys.
+
+Record mutations begin in `committed` state; reports are immediately `applied`
+because they have no derived retrieval state. Record mutations become `applied`
+only after a complete index generation is activated or validated against the
+current live records. Recovery reconciles all committed mutations in that
+collection to its latest state. It does not replay an old record payload over a
+newer update or deletion. Applied receipts remain available for idempotent retries.
+Receipt retention/purging is deferred to step 10.
+
+A matching idempotency retry reauthenticates, checks current original-operation
+permission and target availability, recovers the index if needed, and returns the
+original result and mutation ID. The scope is principal, collection, and operation;
+a different payload under the same scoped key fails. See [HTTP retries](protocol.md#mutation-retries).
+
+## Atomic generations and recovery
+
+A write encodes its new document before committing content. It then copies the
+active vector files to a private UUID generation and applies its index change
+there. Rebuilds construct a fresh generation from live SQLite revisions. The
+activated generation is never modified by normal writes. The full manifest and
+all staged files/directories are synced before atomic replacement of `CURRENT`;
+the containing directory is synced before marking journal entries applied.
+
+The previous activated generation is retained. Abandoned staging generations and
+older generations are reclaimed on subsequent builds, preserving the active and
+previous generations. Unrecognized old layouts are never served or adopted; an
+absent/invalid current pointer causes a rebuild from SQLite. Existing unrelated
+files are left alone. Retained generations can contain deleted derived data;
+this is not complete erasure, which remains step 10.
+
+The manifest binds collection, index incarnation, generation, encoder representation,
+recipe, ordered record/revision mapping, and vector-store generation. Loading checks
+these against the SQL index mirror and latest live revisions. Incompatible or
+incomplete state rebuilds only the selected authorized collection. The previous
+generation is never used to serve stale or deleted revisions just because the new
+one failed. If recovery cannot finish, searches and mutations fail safely and retry
+recovery on the next request. A consistent reopen does not re-encode content.
+
+A process may exit after committing a record but before index activation or the
+response. The durable journal and current records determine recovery; retrying with
+the same idempotency key does not append another revision. A successful put means
+the revision was searchable before releasing its collection lock. A later update
+or delete may supersede it, including before a retry returns its original receipt.
+
+Copying vector files adds disk I/O proportional to the existing index per mutation,
+although unchanged records are not re-encoded. Filesystem syncs establish the
+publication order; actual power-loss durability still depends on the filesystem
+and storage hardware honoring them. Tokenizer fingerprints and chunking recipe
+versions remain later retrieval work.
 
 ## Operating an upgrade
 
@@ -130,7 +173,7 @@ release that will ship it; its position determines the upgrade order. Never modi
 a released migration. The
 runner acquires the write lock before reading the version and stamps each
 migration inside the same transaction, which serializes startup migration
-decisions; it does not make concurrent server processes safe.
+decisions. Server ownership is separately enforced by the directory lock.
 
 Migrations receive the open transaction and must not issue `BEGIN`, `COMMIT`, or
 `ROLLBACK`, nor write files outside SQLite. Add tests for data preservation,
