@@ -115,11 +115,15 @@ impl Index {
                 .all(|(position, entry)| entry.internal_id == position as u64)
             && live.iter().all(|(record_id, (revision, _))| {
                 mirrored.contains(&(record_id.as_str(), *revision))
-            })
-            && self.vectors_match(store, mirror.len())?;
-        if !consistent {
+            });
+        let vectors = if consistent {
+            self.matching_vectors(store, mirror.len())?
+        } else {
+            None
+        };
+        let Some(vectors) = vectors else {
             return self.rebuild(store);
-        }
+        };
         let texts: Vec<String> = mirror
             .iter()
             .map(|entry| {
@@ -132,35 +136,39 @@ impl Index {
         self.revisions = mirror.iter().map(|entry| entry.revision).collect();
         self.record_ids = mirror.into_iter().map(|entry| entry.record_id).collect();
         self.index_positions();
-        self.vectors = match &self.encoder {
-            Some(_) if !self.record_ids.is_empty() => {
-                Some(Arc::new(VectorStore::open(&self.vectors_path)?))
-            }
-            _ => None,
-        };
+        self.vectors = vectors.map(Arc::new);
         self.refresh();
         Ok(())
     }
 
-    fn vectors_match(&self, store: &Store, expected: usize) -> Result<bool> {
+    /// The vector store for a consistent mirror of `expected` documents, if
+    /// there should be one, or `None` when the stored vectors disagree.
+    fn matching_vectors(
+        &self,
+        store: &Store,
+        expected: usize,
+    ) -> Result<Option<Option<VectorStore>>> {
         let Some(encoder) = &self.encoder else {
-            return Ok(true);
+            return Ok(Some(None));
         };
         if expected == 0 {
-            return Ok(!self.vectors_path.exists());
+            return Ok((!self.vectors_path.exists()).then_some(None));
         }
         // The mirror names the encoder that last wrote it; a lexical-only run
         // records none, so vectors left from before it are never trusted.
         if store.index_encoder(&self.collection_id)?.as_deref()
             != Some(encoder.representation().encoder())
         {
-            return Ok(false);
+            return Ok(None);
         }
-        Ok(VectorStore::open(&self.vectors_path).is_ok_and(|vectors| {
-            vectors.format() == StoreFormat::Int8
-                && vectors.document_count() == expected as u64
-                && vectors.representation() == encoder.representation()
-        }))
+        Ok(VectorStore::open(&self.vectors_path)
+            .ok()
+            .and_then(|vectors| {
+                (vectors.format() == StoreFormat::Int8
+                    && vectors.document_count() == expected as u64
+                    && vectors.representation() == encoder.representation())
+                .then_some(Some(vectors))
+            }))
     }
 
     /// Re-encodes every live record and replaces the vector store and mirror.
