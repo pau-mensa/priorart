@@ -310,15 +310,8 @@ impl Store {
         let now = now();
         let record_id = record_id.map_or_else(new_id, str::to_owned);
         let transaction = self.write()?;
-        let deleted_at: Option<Option<String>> = transaction
-            .query_row(
-                "SELECT deleted_at FROM records WHERE collection_id = ?1 AND id = ?2",
-                (collection_id, &record_id),
-                |row| row.get(0),
-            )
-            .optional()?;
-        let revision = match deleted_at {
-            None => {
+        let revision = match record_state(&transaction, collection_id, &record_id)? {
+            RecordState::Missing => {
                 transaction.execute(
                     "INSERT INTO records (collection_id, id, author_principal_id, created_at) \
                      VALUES (?1, ?2, ?3, ?4)",
@@ -326,13 +319,13 @@ impl Store {
                 )?;
                 1
             }
-            Some(Some(_)) => {
+            RecordState::Deleted => {
                 return Err(StoreError::RecordDeleted {
                     collection_id: collection_id.to_owned(),
                     record_id,
                 })
             }
-            Some(None) => {
+            RecordState::Live => {
                 let latest: i64 = transaction.query_row(
                     "SELECT MAX(revision) FROM revisions WHERE collection_id = ?1 AND record_id = ?2",
                     (collection_id, &record_id),
@@ -362,29 +355,6 @@ impl Store {
         })
     }
 
-    fn record_state(&self, collection_id: &str, record_id: &str) -> Result<()> {
-        let deleted_at: Option<Option<String>> = self
-            .connection
-            .query_row(
-                "SELECT deleted_at FROM records WHERE collection_id = ?1 AND id = ?2",
-                (collection_id, record_id),
-                |row| row.get(0),
-            )
-            .optional()?;
-        match deleted_at {
-            None => Err(StoreError::RecordNotFound {
-                collection_id: collection_id.to_owned(),
-                record_id: record_id.to_owned(),
-                revision: None,
-            }),
-            Some(Some(_)) => Err(StoreError::RecordDeleted {
-                collection_id: collection_id.to_owned(),
-                record_id: record_id.to_owned(),
-            }),
-            Some(None) => Ok(()),
-        }
-    }
-
     /// The latest revision, or `revision` when given.
     pub fn get(
         &self,
@@ -392,7 +362,16 @@ impl Store {
         record_id: &str,
         revision: Option<i64>,
     ) -> Result<Revision> {
-        self.record_state(collection_id, record_id)?;
+        match record_state(&self.connection, collection_id, record_id)? {
+            RecordState::Missing => return Err(record_not_found(collection_id, record_id, None)),
+            RecordState::Deleted => {
+                return Err(StoreError::RecordDeleted {
+                    collection_id: collection_id.to_owned(),
+                    record_id: record_id.to_owned(),
+                })
+            }
+            RecordState::Live => {}
+        }
         let sql = format!(
             "SELECT {REVISION_COLUMNS} WHERE r.collection_id = ?1 AND r.record_id = ?2 \
              AND (?3 IS NULL OR r.revision = ?3) ORDER BY r.revision DESC LIMIT 1"
@@ -400,34 +379,17 @@ impl Store {
         self.connection
             .query_row(&sql, (collection_id, record_id, revision), revision_row)
             .optional()?
-            .ok_or_else(|| StoreError::RecordNotFound {
-                collection_id: collection_id.to_owned(),
-                record_id: record_id.to_owned(),
-                revision,
-            })
+            .ok_or_else(|| record_not_found(collection_id, record_id, revision))
     }
 
     /// Nulls every revision's text and metadata and tombstones the record.
     /// Returns `false` when it was already deleted.
     pub fn delete(&self, collection_id: &str, record_id: &str) -> Result<bool> {
         let transaction = self.write()?;
-        let deleted_at: Option<Option<String>> = transaction
-            .query_row(
-                "SELECT deleted_at FROM records WHERE collection_id = ?1 AND id = ?2",
-                (collection_id, record_id),
-                |row| row.get(0),
-            )
-            .optional()?;
-        match deleted_at {
-            None => {
-                return Err(StoreError::RecordNotFound {
-                    collection_id: collection_id.to_owned(),
-                    record_id: record_id.to_owned(),
-                    revision: None,
-                })
-            }
-            Some(Some(_)) => return Ok(false),
-            Some(None) => {}
+        match record_state(&transaction, collection_id, record_id)? {
+            RecordState::Missing => return Err(record_not_found(collection_id, record_id, None)),
+            RecordState::Deleted => return Ok(false),
+            RecordState::Live => {}
         }
         transaction.execute(
             "UPDATE revisions SET text = NULL, metadata = NULL \
@@ -489,36 +451,24 @@ impl Store {
     ) -> Result<String> {
         let id = new_id();
         let transaction = self.write()?;
-        let not_found = |revision| StoreError::RecordNotFound {
-            collection_id: collection_id.to_owned(),
-            record_id: record_id.to_owned(),
-            revision,
-        };
-        let exists = |sql: &str, parameters: &[&dyn rusqlite::ToSql]| {
-            transaction
-                .query_row(sql, parameters, |_| Ok(()))
-                .optional()
-                .map(|row| row.is_some())
-        };
-        if !exists(
-            "SELECT 1 FROM records WHERE collection_id = ?1 AND id = ?2",
-            &[&collection_id, &record_id],
-        )? {
-            return Err(not_found(None));
+        if record_state(&transaction, collection_id, record_id)? == RecordState::Missing {
+            return Err(record_not_found(collection_id, record_id, None));
         }
         if let Some(revision) = revision {
-            if !exists(
-                "SELECT 1 FROM revisions WHERE collection_id = ?1 AND record_id = ?2 AND revision = ?3",
-                &[&collection_id, &record_id, &revision],
-            )? {
-                return Err(not_found(Some(revision)));
+            let exists = transaction
+                .query_row(
+                    "SELECT 1 FROM revisions \
+                     WHERE collection_id = ?1 AND record_id = ?2 AND revision = ?3",
+                    (collection_id, record_id, revision),
+                    |_| Ok(()),
+                )
+                .optional()?;
+            if exists.is_none() {
+                return Err(record_not_found(collection_id, record_id, Some(revision)));
             }
         }
         if let Some(search_id) = search_id {
-            if !exists(
-                "SELECT 1 FROM searches WHERE collection_id = ?1 AND id = ?2",
-                &[&collection_id, &search_id],
-            )? {
+            if !search_exists(&transaction, collection_id, search_id)? {
                 return Err(StoreError::SearchNotFound {
                     collection_id: collection_id.to_owned(),
                     search_id: search_id.to_owned(),
@@ -545,20 +495,8 @@ impl Store {
 
     /// Reports on a record in creation order; deleted records keep theirs.
     pub fn reports_for(&self, collection_id: &str, record_id: &str) -> Result<Vec<Report>> {
-        let exists = self
-            .connection
-            .query_row(
-                "SELECT 1 FROM records WHERE collection_id = ?1 AND id = ?2",
-                (collection_id, record_id),
-                |_| Ok(()),
-            )
-            .optional()?;
-        if exists.is_none() {
-            return Err(StoreError::RecordNotFound {
-                collection_id: collection_id.to_owned(),
-                record_id: record_id.to_owned(),
-                revision: None,
-            });
+        if record_state(&self.connection, collection_id, record_id)? == RecordState::Missing {
+            return Err(record_not_found(collection_id, record_id, None));
         }
         let mut statement = self.connection.prepare(
             "SELECT collection_id, id, record_id, revision, search_id, text, created_at, \
@@ -623,15 +561,7 @@ impl Store {
     }
 
     pub fn has_search(&self, collection_id: &str, search_id: &str) -> Result<bool> {
-        Ok(self
-            .connection
-            .query_row(
-                "SELECT 1 FROM searches WHERE collection_id = ?1 AND id = ?2",
-                (collection_id, search_id),
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some())
+        search_exists(&self.connection, collection_id, search_id)
     }
 
     // Index mirror.
@@ -733,6 +663,52 @@ impl Store {
         set_index_encoder(&transaction, collection_id, encoder)?;
         transaction.commit()?;
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecordState {
+    Missing,
+    Deleted,
+    Live,
+}
+
+/// Takes a `Connection` so it also runs inside a write transaction.
+fn record_state(
+    connection: &Connection,
+    collection_id: &str,
+    record_id: &str,
+) -> Result<RecordState> {
+    let deleted_at: Option<Option<String>> = connection
+        .query_row(
+            "SELECT deleted_at FROM records WHERE collection_id = ?1 AND id = ?2",
+            (collection_id, record_id),
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(match deleted_at {
+        None => RecordState::Missing,
+        Some(Some(_)) => RecordState::Deleted,
+        Some(None) => RecordState::Live,
+    })
+}
+
+fn search_exists(connection: &Connection, collection_id: &str, search_id: &str) -> Result<bool> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM searches WHERE collection_id = ?1 AND id = ?2",
+            (collection_id, search_id),
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn record_not_found(collection_id: &str, record_id: &str, revision: Option<i64>) -> StoreError {
+    StoreError::RecordNotFound {
+        collection_id: collection_id.to_owned(),
+        record_id: record_id.to_owned(),
+        revision,
     }
 }
 
