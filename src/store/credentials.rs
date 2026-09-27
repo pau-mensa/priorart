@@ -77,17 +77,37 @@ impl Store {
         Ok(())
     }
 
-    /// Agent keys share the issuer's principal. Cross-principal grant management
-    /// and account/billing delegation are deliberately outside this step.
+    /// Issue another agent key for the same principal.
     pub fn delegate_credential(
         &self,
         issuer: &RequestContext,
         grants: &[Grant],
         expires_at: Option<i64>,
     ) -> Result<IssuedCredential> {
+        let principal = issuer.principal_id().ok_or(AuthError::Unauthenticated)?;
+        self.delegate_credential_to(issuer, principal, grants, expires_at)
+    }
+
+    /// Delegate bounded authority to an existing principal, retaining the issuer
+    /// chain so loss of its authority also invalidates the recipient's key.
+    pub fn delegate_credential_to(
+        &self,
+        issuer: &RequestContext,
+        principal: &str,
+        grants: &[Grant],
+        expires_at: Option<i64>,
+    ) -> Result<IssuedCredential> {
         let transaction = self.write()?;
         let timestamp = now();
         let (parent, depth) = validate_context(&transaction, issuer, timestamp)?;
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM principals WHERE id = ?1)",
+            [principal],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(AuthError::Forbidden);
+        }
         let grants = validate_grants(grants)?;
         if grants.is_empty() || depth >= MAX_CREDENTIAL_DEPTH {
             return Err(AuthError::Forbidden);
@@ -95,7 +115,7 @@ impl Store {
         require_subset(&parent, &grants, expires_at)?;
         let issued = insert(
             &transaction,
-            &parent.principal_id,
+            principal,
             Some(&parent.id),
             grants,
             expires_at,
@@ -128,7 +148,6 @@ impl Store {
         let credential = info(&transaction, id)?;
         if credential.revoked_at.is_none() {
             revoke_tree(&transaction, id, now())?;
-            bump_principal(&transaction, &credential.principal_id)?;
         }
         transaction.commit()?;
         Ok(())
@@ -178,16 +197,9 @@ impl Store {
             "UPDATE credentials SET grant_version = grant_version + 1 WHERE id = ?1",
             [id],
         )?;
-        // The parent remains usable but delegated authority cannot reappear if
-        // its grants are subsequently expanded again.
-        transaction.execute(
-            "WITH RECURSIVE descendants(id) AS (
-                SELECT id FROM credentials WHERE parent_id = ?1
-                UNION ALL SELECT c.id FROM credentials c JOIN descendants d ON c.parent_id = d.id
-             ) UPDATE credentials SET revoked_at = ?2, grant_version = grant_version + 1
-             WHERE id IN (SELECT id FROM descendants) AND revoked_at IS NULL",
-            (id, timestamp),
-        )?;
+        // Revoking descendants prevents authority from reappearing if the
+        // parent's grants are subsequently expanded again.
+        revoke_descendants(&transaction, id, timestamp, false)?;
         bump_principal(&transaction, &old.principal_id)?;
         transaction.commit()?;
         Ok(())
@@ -287,9 +299,6 @@ fn active(connection: &Connection, id: &str, timestamp: i64) -> Result<(Credenti
             }
             Some(parent_id) => {
                 let parent = info(connection, parent_id)?;
-                if parent.principal_id != current.principal_id {
-                    return Err(AuthError::Unauthenticated);
-                }
                 require_subset(&parent, &current.grants, current.expires_at)
                     .map_err(|_| AuthError::Unauthenticated)?;
                 current = parent;
@@ -308,6 +317,7 @@ fn context(connection: &Connection, credential: CredentialInfo) -> Result<Reques
     Ok(RequestContext {
         credential: Some(credential),
         principal_version: version,
+        local: false,
     })
 }
 
@@ -389,14 +399,35 @@ fn bump_principal(connection: &Connection, principal: &str) -> Result<()> {
 }
 
 fn revoke_tree(connection: &Connection, id: &str, timestamp: i64) -> Result<()> {
-    connection.execute(
+    revoke_descendants(connection, id, timestamp, true)
+}
+
+fn revoke_descendants(
+    connection: &Connection,
+    id: &str,
+    timestamp: i64,
+    include_root: bool,
+) -> Result<()> {
+    let mut statement = connection.prepare(
         "WITH RECURSIVE descendants(id) AS (
             SELECT id FROM credentials WHERE id = ?1
             UNION ALL SELECT c.id FROM credentials c JOIN descendants d ON c.parent_id = d.id
-         ) UPDATE credentials SET revoked_at = ?2, grant_version = grant_version + 1
-         WHERE id IN (SELECT id FROM descendants) AND revoked_at IS NULL",
-        (id, timestamp),
+         ) SELECT c.id, c.principal_id FROM credentials c JOIN descendants d ON c.id = d.id
+         WHERE c.revoked_at IS NULL AND (?2 OR c.id != ?1)",
     )?;
+    let revoked = statement
+        .query_map((id, include_root), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut principals = BTreeSet::new();
+    for (id, principal) in revoked {
+        connection.execute("UPDATE credentials SET revoked_at = ?2, grant_version = grant_version + 1 WHERE id = ?1", (id, timestamp))?;
+        principals.insert(principal);
+    }
+    for principal in principals {
+        bump_principal(connection, &principal)?;
+    }
     Ok(())
 }
 

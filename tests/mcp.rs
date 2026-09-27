@@ -1,3 +1,5 @@
+use priorart::auth::RequestContext;
+use priorart::store::LOCAL_COLLECTION_ID;
 mod common;
 
 use priorart::mcp::{PriorartMcp, INSTRUCTIONS};
@@ -17,16 +19,22 @@ async fn session() -> Session {
     let service = common::service(&directory);
     service
         .put(
+            &RequestContext::local(),
+            LOCAL_COLLECTION_ID,
             "CUDA illegal address in bf16 attention; fixed by padding head dim.",
             None,
             Some("cuda"),
+            false,
         )
         .unwrap();
     service
         .put(
+            &RequestContext::local(),
+            LOCAL_COLLECTION_ID,
             "NCCL worker never reached the barrier: stray exit() in loader.",
             None,
             Some("nccl"),
+            false,
         )
         .unwrap();
     let url = common::spawn(service).await;

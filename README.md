@@ -128,8 +128,9 @@ session must go through the one server.
 `priorart admin issue --grant local:read` bootstraps an opaque agent credential
 for the local principal and prints its secret once. Local commands also list,
 rotate, revoke, and replace grants. See [credential administration](docs/credentials.md).
-HTTP/MCP authentication and content authorization are still future work; creating
-a key does not secure the current local endpoints.
+The Rust service enforces [collection and object policy](docs/policy.md) on explicit
+request contexts. HTTP/MCP authentication remains future work; creating a key does
+not secure the current local endpoints.
 
 ## Limitations of this version
 
@@ -148,8 +149,8 @@ For database upgrades and recovery behavior, see [storage versions](docs/storage
   vector store publishes each mutation as several file renames. Startup
   compares the database, index mirror, and vector store and rebuilds the index
   from SQLite on any disagreement.
-- Every search is logged with its query text to support feedback analysis.
-  There is no retention policy yet.
+- Authenticated/local searches still log query text; anonymous public searches
+  through the Rust service persist nothing. There is no retention policy yet.
 - Reports are stored and returned, not scored. Voting is not correctness.
 
 ## Contributing

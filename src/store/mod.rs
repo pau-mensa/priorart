@@ -1,8 +1,8 @@
 //! Collection-scoped SQLite persistence.
 //!
 //! Every content operation takes an explicit collection. This is a persistence
-//! boundary, not authorization: trusted local callers supply principal IDs
-//! until service policy exists.
+//! boundary, not authorization: trusted callers supply principal IDs. Untrusted
+//! requests must go through the policy-enforcing Service.
 
 mod credentials;
 pub mod migrations;
@@ -383,6 +383,34 @@ impl Store {
             .ok_or_else(|| record_not_found(collection_id, record_id, revision))
     }
 
+    /// Authorship survives tombstoning. Trusted policy lookup; no content is read.
+    pub fn record_author(
+        &self,
+        collection_id: &str,
+        record_id: &str,
+    ) -> Result<Option<Option<String>>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT author_principal_id FROM records WHERE collection_id = ?1 AND id = ?2",
+                (collection_id, record_id),
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn search_owned_by(
+        &self,
+        collection_id: &str,
+        search_id: &str,
+        principal: &str,
+    ) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM searches WHERE collection_id = ?1 AND id = ?2 AND requester_principal_id = ?3)",
+            (collection_id, search_id, principal), |row| row.get(0),
+        )?)
+    }
+
     /// Nulls every revision's text and metadata and tombstones the record.
     /// Returns `false` when it was already deleted.
     pub fn delete(&self, collection_id: &str, record_id: &str) -> Result<bool> {
@@ -505,6 +533,36 @@ impl Store {
              ORDER BY created_at, id",
         )?;
         let rows = statement.query_map((collection_id, record_id), |row| {
+            Ok(Report {
+                collection_id: row.get(0)?,
+                id: row.get(1)?,
+                record_id: row.get(2)?,
+                revision: row.get(3)?,
+                search_id: row.get(4)?,
+                text: row.get(5)?,
+                created_at: row.get(6)?,
+                reporter_principal_id: row.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Only this requester's reports; other reporters' text is never loaded.
+    pub fn reports_for_principal(
+        &self,
+        collection_id: &str,
+        record_id: &str,
+        principal: &str,
+    ) -> Result<Vec<Report>> {
+        if record_state(&self.connection, collection_id, record_id)? == RecordState::Missing {
+            return Err(record_not_found(collection_id, record_id, None));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT collection_id, id, record_id, revision, search_id, text, created_at, \
+             reporter_principal_id FROM reports WHERE collection_id = ?1 AND record_id = ?2 \
+             AND reporter_principal_id = ?3 ORDER BY created_at, id",
+        )?;
+        let rows = statement.query_map((collection_id, record_id, principal), |row| {
             Ok(Report {
                 collection_id: row.get(0)?,
                 id: row.get(1)?,

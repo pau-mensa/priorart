@@ -1,3 +1,5 @@
+use priorart::auth::RequestContext;
+use priorart::store::LOCAL_COLLECTION_ID;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -153,7 +155,9 @@ fn serve(host: Option<String>, port: Option<u16>) -> Result<(), AnyError> {
         "priorart {VERSION}: data at {}, encoder {}, {} documents",
         settings.data_dir.display(),
         settings.encoder,
-        service.health().document_count
+        service
+            .health(&RequestContext::local(), LOCAL_COLLECTION_ID)?
+            .document_count
     );
     runtime()?.block_on(async move {
         let address: SocketAddr = tokio::net::lookup_host((settings.host.as_str(), settings.port))

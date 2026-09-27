@@ -1,5 +1,8 @@
 //! HTTP transport for the protocol. See `docs/protocol.md`.
 
+use crate::auth::{AuthError, RequestContext};
+use crate::policy::PolicyError;
+use crate::store::LOCAL_COLLECTION_ID;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -43,6 +46,12 @@ impl From<ServiceError> for ApiError {
     fn from(error: ServiceError) -> Self {
         let message = error.to_string();
         match error {
+            ServiceError::Policy(PolicyError::Unavailable) => {
+                Self::new(StatusCode::NOT_FOUND, "resource_unavailable", message)
+            }
+            ServiceError::Policy(PolicyError::Authentication(AuthError::Unauthenticated)) => {
+                Self::new(StatusCode::UNAUTHORIZED, "unauthenticated", message)
+            }
             ServiceError::InvalidInput(_) => {
                 Self::new(StatusCode::BAD_REQUEST, "invalid_input", message)
             }
@@ -159,7 +168,7 @@ struct HitResponse {
 
 #[derive(Serialize)]
 struct SearchResponse {
-    search_id: String,
+    search_id: Option<String>,
     hits: Vec<HitResponse>,
     timings: BTreeMap<String, f64>,
     gatherer: String,
@@ -214,9 +223,11 @@ pub fn router(service: Arc<Service>) -> Router {
 }
 
 async fn healthz(State(service): State<Arc<Service>>) -> ApiResult<Json<Health>> {
-    blocking(&service, |service| Ok(service.health()))
-        .await
-        .map(Json)
+    blocking(&service, |service| {
+        service.health(&RequestContext::local(), LOCAL_COLLECTION_ID)
+    })
+    .await
+    .map(Json)
 }
 
 async fn put_record(
@@ -225,7 +236,14 @@ async fn put_record(
 ) -> ApiResult<(StatusCode, Json<PutResponse>)> {
     let Json(body) = body?;
     let (id, revision) = blocking(&service, move |service| {
-        service.put(&body.text, body.metadata.as_ref(), body.id.as_deref())
+        service.put(
+            &RequestContext::local(),
+            LOCAL_COLLECTION_ID,
+            &body.text,
+            body.metadata.as_ref(),
+            body.id.as_deref(),
+            false,
+        )
     })
     .await?;
     Ok((StatusCode::CREATED, Json(PutResponse { id, revision })))
@@ -237,7 +255,15 @@ async fn get_record(
     query: Result<Query<RevisionQuery>, QueryRejection>,
 ) -> ApiResult<Json<RecordResponse>> {
     let Query(query) = query?;
-    let revision = blocking(&service, move |service| service.get(&id, query.revision)).await?;
+    let revision = blocking(&service, move |service| {
+        service.get(
+            &RequestContext::local(),
+            LOCAL_COLLECTION_ID,
+            &id,
+            query.revision,
+        )
+    })
+    .await?;
     Ok(Json(RecordResponse {
         id: revision.record_id,
         revision: revision.revision,
@@ -251,7 +277,10 @@ async fn delete_record(
     State(service): State<Arc<Service>>,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    blocking(&service, move |service| service.delete(&id)).await?;
+    blocking(&service, move |service| {
+        service.delete(&RequestContext::local(), LOCAL_COLLECTION_ID, &id)
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -261,7 +290,13 @@ async fn search(
 ) -> ApiResult<Json<SearchResponse>> {
     let Json(body) = body?;
     let outcome = blocking(&service, move |service| {
-        service.search(&body.text, body.filters.as_ref(), body.limit)
+        service.search(
+            &RequestContext::local(),
+            LOCAL_COLLECTION_ID,
+            &body.text,
+            body.filters.as_ref(),
+            body.limit,
+        )
     })
     .await?;
     Ok(Json(SearchResponse {
@@ -290,6 +325,8 @@ async fn report(
     let Json(body) = body?;
     let id = blocking(&service, move |service| {
         service.report(
+            &RequestContext::local(),
+            LOCAL_COLLECTION_ID,
             &body.record_id,
             &body.text,
             body.revision,
@@ -304,7 +341,10 @@ async fn list_reports(
     State(service): State<Arc<Service>>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<ReportsResponse>> {
-    let reports = blocking(&service, move |service| service.reports(&id)).await?;
+    let reports = blocking(&service, move |service| {
+        service.reports(&RequestContext::local(), LOCAL_COLLECTION_ID, &id)
+    })
+    .await?;
     Ok(Json(ReportsResponse {
         reports: reports
             .into_iter()

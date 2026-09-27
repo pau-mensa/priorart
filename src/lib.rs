@@ -9,6 +9,7 @@ pub mod excerpt;
 pub mod gather;
 pub mod index;
 pub mod mcp;
+pub mod policy;
 pub mod service;
 pub mod store;
 

@@ -156,19 +156,34 @@ impl fmt::Debug for IssuedCredential {
 pub struct RequestContext {
     pub(crate) credential: Option<CredentialInfo>,
     pub(crate) principal_version: i64,
+    pub(crate) local: bool,
 }
 
 impl RequestContext {
-    pub(crate) fn local() -> Self {
+    /// Explicit trusted local mode. Policy confines this identity to `local`.
+    pub const fn local() -> Self {
         Self {
             credential: None,
             principal_version: 0,
+            local: true,
         }
     }
-    pub fn principal_id(&self) -> &str {
+    /// Anonymous callers can read public collections only.
+    pub const fn anonymous() -> Self {
+        Self {
+            credential: None,
+            principal_version: 0,
+            local: false,
+        }
+    }
+    pub fn principal_id(&self) -> Option<&str> {
         self.credential
             .as_ref()
-            .map_or(LOCAL_PRINCIPAL_ID, |c| c.principal_id.as_str())
+            .map(|c| c.principal_id.as_str())
+            .or_else(|| self.local.then_some(LOCAL_PRINCIPAL_ID))
+    }
+    pub(crate) fn is_local(&self) -> bool {
+        self.local
     }
     pub fn credential(&self) -> Option<&CredentialInfo> {
         self.credential.as_ref()

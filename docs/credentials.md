@@ -1,9 +1,9 @@
 # Local credential administration
 
-Credential lifecycle is implemented, but HTTP/MCP content operations still use the
-local principal and local collection without authentication. Issuing a key does
-not protect those interfaces. Collection policy and transport authentication are
-subsequent development steps; hosted restricted operation remains unavailable.
+Credential lifecycle and [service policy](policy.md) are implemented. HTTP/MCP
+content operations still use the explicit local principal and local collection
+without transport authentication. Issuing a key does not protect those interfaces;
+transport authentication is a subsequent step. Hosted operation remains unavailable.
 
 ## Bootstrap and administration
 
@@ -29,7 +29,7 @@ Use `--principal PRINCIPAL_ID` to select another existing owner principal and
 non-expiring key. Issuance accepts only collections owned by the selected principal;
 unknown collections and another principal's collections fail with the same error.
 There are no wildcard or implicit grants. `read` covers record reads and search in
-the planned content policy. The CLI requires at least one explicit grant at issuance.
+the service policy. The CLI requires at least one explicit grant at issuance.
 
 ```sh
 priorart admin list
@@ -57,11 +57,13 @@ refills, or account-level collection creation.
 ## Delegation and contexts
 
 The Rust `Store::delegate_credential` API requires an authenticated, revalidated
-`RequestContext`. Agent keys retain the issuer's principal. A delegated grant must
+`RequestContext`. Agent keys retain the issuer's principal by default;
+`Store::delegate_credential_to` selects another existing principal. A delegated grant must
 be present on the issuer along with `delegate` on that same collection. The child
 cannot outlive its parent; a finite parent expiry forbids an unbounded child expiry.
 Credentials have at most 64 grants and at most eight levels including the root.
-Cross-principal sharing and remote grant-management endpoints are not implemented.
+Issuer-chain checks apply across principals. Remote grant-management endpoints are
+not implemented.
 
 Authentication and revalidation read one SQLite snapshot and check every ancestor's
 current grants, expiry, revocation, and root ownership. Credential mutations run
@@ -74,11 +76,10 @@ remain valid and can authenticate again. There is no authentication cache.
 `Service::authenticate` mints a secret-free context with private fields and no
 serialization/deserialization support. `Service::validate_context` rejects a stale
 snapshot. `has_grant` inspects only the snapshot; it is not an authorization check.
-The upcoming policy layer must validate within each protected operation and again
-before returning sensitive results after lengthy work. The current revocation
-boundary is the start of an authentication/revalidation transaction; this step does
-not implement content-operation in-flight revocation. Existing local operations use
-an internal local context that cannot be passed as an authenticated credential.
+The service policy validates within every content operation and again after lengthy
+work. See [service revocation boundaries](policy.md#revocation-indexes-and-concurrency)
+for the final-check/commit boundary. The explicit local context is confined to
+`local` and cannot be passed as an authenticated credential to delegation APIs.
 
 ## Secret storage and schema
 

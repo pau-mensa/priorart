@@ -1,3 +1,4 @@
+use priorart::auth::RequestContext;
 mod common;
 
 use std::sync::Arc;
@@ -12,6 +13,9 @@ use priorart::store::{
 };
 use serde_json::json;
 use tempfile::TempDir;
+
+const CALLER: RequestContext = RequestContext::local();
+const LOCAL: &str = LOCAL_COLLECTION_ID;
 
 const DOCS: [(&str, &str); 3] = [
     (
@@ -48,7 +52,9 @@ fn seeded() -> (TempDir, Service) {
     let service = Service::new(settings(&directory), fake()).unwrap();
     for (record, text) in DOCS {
         let tags = metadata(json!({"kind": "fix", "topic": record}));
-        service.put(text, Some(&tags), Some(record)).unwrap();
+        service
+            .put(&CALLER, LOCAL, text, Some(&tags), Some(record), false)
+            .unwrap();
     }
     (directory, service)
 }
@@ -61,9 +67,9 @@ fn invalid<T: std::fmt::Debug>(result: Result<T, ServiceError>) -> bool {
 fn put_and_search() {
     let (_directory, service) = seeded();
     let outcome = service
-        .search("worker never reached barrier", None, 10)
+        .search(&CALLER, LOCAL, "worker never reached barrier", None, 10)
         .unwrap();
-    assert!(!outcome.search_id.is_empty());
+    assert!(!outcome.search_id.as_ref().unwrap().is_empty());
     let hit = &outcome.hits[0];
     assert_eq!((hit.id.as_str(), hit.revision), ("nccl", 1));
     assert_eq!(hit.collection_id, LOCAL_COLLECTION_ID);
@@ -87,25 +93,30 @@ fn an_update_supersedes() {
     let (_directory, service) = seeded();
     let (_, revision) = service
         .put(
+            &CALLER,
+            LOCAL,
             "completely different: rust borrow checker lifetime",
             None,
             Some("nccl"),
+            false,
         )
         .unwrap();
     assert_eq!(revision, 2);
-    let outcome = service.search("borrow checker lifetime", None, 10).unwrap();
+    let outcome = service
+        .search(&CALLER, LOCAL, "borrow checker lifetime", None, 10)
+        .unwrap();
     assert_eq!(
         (outcome.hits[0].id.as_str(), outcome.hits[0].revision),
         ("nccl", 2)
     );
     assert!(service
-        .get("nccl", None)
+        .get(&CALLER, LOCAL, "nccl", None)
         .unwrap()
         .text
         .unwrap()
         .starts_with("completely"));
     assert!(service
-        .get("nccl", Some(1))
+        .get(&CALLER, LOCAL, "nccl", Some(1))
         .unwrap()
         .text
         .unwrap()
@@ -115,18 +126,18 @@ fn an_update_supersedes() {
 #[test]
 fn delete_hides() {
     let (_directory, service) = seeded();
-    service.delete("nccl").unwrap();
+    service.delete(&CALLER, LOCAL, "nccl").unwrap();
     let outcome = service
-        .search("worker never reached barrier", None, 10)
+        .search(&CALLER, LOCAL, "worker never reached barrier", None, 10)
         .unwrap();
     assert!(outcome.hits.iter().all(|hit| hit.id != "nccl"));
     assert!(matches!(
-        service.get("nccl", None),
+        service.get(&CALLER, LOCAL, "nccl", None),
         Err(ServiceError::Store(StoreError::RecordDeleted { .. }))
     ));
-    service.delete("nccl").unwrap();
+    service.delete(&CALLER, LOCAL, "nccl").unwrap();
     assert!(matches!(
-        service.delete("missing"),
+        service.delete(&CALLER, LOCAL, "missing"),
         Err(ServiceError::Store(StoreError::RecordNotFound { .. }))
     ));
 }
@@ -135,7 +146,9 @@ fn delete_hides() {
 fn filters_restrict() {
     let (_directory, service) = seeded();
     let pytest = metadata(json!({"topic": "pytest"}));
-    let outcome = service.search("error fixed", Some(&pytest), 10).unwrap();
+    let outcome = service
+        .search(&CALLER, LOCAL, "error fixed", Some(&pytest), 10)
+        .unwrap();
     assert_eq!(
         outcome
             .hits
@@ -146,7 +159,7 @@ fn filters_restrict() {
     );
     let nothing = metadata(json!({"topic": "nothing"}));
     assert!(service
-        .search("error", Some(&nothing), 10)
+        .search(&CALLER, LOCAL, "error", Some(&nothing), 10)
         .unwrap()
         .hits
         .is_empty());
@@ -164,10 +177,12 @@ fn the_gather_limit_switches_to_bm25() {
     )
     .unwrap();
     for (record, text) in DOCS {
-        service.put(text, None, Some(record)).unwrap();
+        service
+            .put(&CALLER, LOCAL, text, None, Some(record), false)
+            .unwrap();
     }
     let outcome = service
-        .search("worker never reached barrier", None, 1)
+        .search(&CALLER, LOCAL, "worker never reached barrier", None, 1)
         .unwrap();
     assert_eq!(outcome.gatherer, "bm25");
     assert_eq!(
@@ -179,7 +194,7 @@ fn the_gather_limit_switches_to_bm25() {
         ["nccl"]
     );
     assert!(!service
-        .search("worker never reached barrier", None, 3)
+        .search(&CALLER, LOCAL, "worker never reached barrier", None, 3)
         .unwrap()
         .hits
         .is_empty());
@@ -189,82 +204,139 @@ fn the_gather_limit_switches_to_bm25() {
 fn lexical_only_mode() {
     let directory = tempfile::tempdir().unwrap();
     let service = Service::new(settings(&directory), None).unwrap();
-    service.put(DOCS[0].1, None, Some("cuda")).unwrap();
-    service.put(DOCS[2].1, None, Some("nccl")).unwrap();
-    let outcome = service.search("barrier", None, 10).unwrap();
+    service
+        .put(&CALLER, LOCAL, DOCS[0].1, None, Some("cuda"), false)
+        .unwrap();
+    service
+        .put(&CALLER, LOCAL, DOCS[2].1, None, Some("nccl"), false)
+        .unwrap();
+    let outcome = service.search(&CALLER, LOCAL, "barrier", None, 10).unwrap();
     assert_eq!(outcome.hits[0].id, "nccl");
     assert_eq!(outcome.hits[0].score_semantics, "bm25-lucene");
     assert_eq!(outcome.gatherer, "bm25");
-    assert_eq!(service.health().encoder, None);
+    assert_eq!(service.health(&CALLER, LOCAL).unwrap().encoder, None);
 }
 
 #[test]
 fn an_empty_corpus_still_logs_the_search() {
     let directory = tempfile::tempdir().unwrap();
     let service = Service::new(settings(&directory), fake()).unwrap();
-    let outcome = service.search("anything", None, 10).unwrap();
+    let outcome = service
+        .search(&CALLER, LOCAL, "anything", None, 10)
+        .unwrap();
     assert!(outcome.hits.is_empty());
     assert!(outcome.timings.is_empty());
     assert_eq!(outcome.gatherer, "none");
-    assert!(!outcome.search_id.is_empty());
+    assert!(!outcome.search_id.as_ref().unwrap().is_empty());
 }
 
 #[test]
 fn reports() {
     let (_directory, service) = seeded();
-    let outcome = service.search("cuda illegal address", None, 10).unwrap();
+    let outcome = service
+        .search(&CALLER, LOCAL, "cuda illegal address", None, 10)
+        .unwrap();
     let report = service
         .report(
+            &CALLER,
+            LOCAL,
             "cuda",
             "applied the padding fix, tests pass",
             Some(1),
-            Some(&outcome.search_id),
+            outcome.search_id.as_deref(),
         )
         .unwrap();
-    let reports = service.reports("cuda").unwrap();
+    let reports = service.reports(&CALLER, LOCAL, "cuda").unwrap();
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].id, report);
     assert_eq!(
         reports[0].search_id.as_deref(),
-        Some(outcome.search_id.as_str())
+        outcome.search_id.as_deref()
     );
     assert!(matches!(
-        service.report("cuda", "x", None, Some("bogus")),
+        service.report(&CALLER, LOCAL, "cuda", "x", None, Some("bogus")),
         Err(ServiceError::Store(StoreError::SearchNotFound { .. }))
     ));
     assert!(matches!(
-        service.report("missing", "x", None, None),
+        service.report(&CALLER, LOCAL, "missing", "x", None, None),
         Err(ServiceError::Store(StoreError::RecordNotFound { .. }))
     ));
-    assert!(invalid(service.report("cuda", "   ", None, None)));
+    assert!(invalid(
+        service.report(&CALLER, LOCAL, "cuda", "   ", None, None)
+    ));
 }
 
 #[test]
 fn validation() {
     let (_directory, service) = seeded();
-    assert!(invalid(service.put("   ", None, None)));
-    assert!(invalid(service.put(&"x".repeat(300_000), None, None)));
-    assert!(invalid(service.put("ok", None, Some("bad id with spaces"))));
-    assert!(invalid(service.put("ok", None, Some(&"x".repeat(129)))));
-    assert!(invalid(service.put("ok", None, Some("."))));
-    assert!(invalid(service.put("ok", None, Some(".."))));
-    service.put("ok", None, Some("...")).unwrap();
-    assert!(invalid(service.search("   ", None, 10)));
-    assert!(invalid(service.search("ok", None, 0)));
-    assert!(invalid(service.search("ok", None, 101)));
+    assert!(invalid(
+        service.put(&CALLER, LOCAL, "   ", None, None, false)
+    ));
+    assert!(invalid(service.put(
+        &CALLER,
+        LOCAL,
+        &"x".repeat(300_000),
+        None,
+        None,
+        false
+    )));
+    assert!(invalid(service.put(
+        &CALLER,
+        LOCAL,
+        "ok",
+        None,
+        Some("bad id with spaces"),
+        false
+    )));
+    assert!(invalid(service.put(
+        &CALLER,
+        LOCAL,
+        "ok",
+        None,
+        Some(&"x".repeat(129)),
+        false
+    )));
+    assert!(invalid(service.put(
+        &CALLER,
+        LOCAL,
+        "ok",
+        None,
+        Some("."),
+        false
+    )));
+    assert!(invalid(service.put(
+        &CALLER,
+        LOCAL,
+        "ok",
+        None,
+        Some(".."),
+        false
+    )));
+    service
+        .put(&CALLER, LOCAL, "ok", None, Some("..."), false)
+        .unwrap();
+    assert!(invalid(service.search(&CALLER, LOCAL, "   ", None, 10)));
+    assert!(invalid(service.search(&CALLER, LOCAL, "ok", None, 0)));
+    assert!(invalid(service.search(&CALLER, LOCAL, "ok", None, 101)));
     for bad in [
         json!({"nested": {"a": 1}}),
         json!({"list": [1]}),
         json!({"null": null}),
     ] {
-        assert!(invalid(service.search("ok", Some(&metadata(bad)), 10)));
+        assert!(invalid(service.search(
+            &CALLER,
+            LOCAL,
+            "ok",
+            Some(&metadata(bad)),
+            10
+        )));
     }
 }
 
 #[test]
 fn health() {
     let (_directory, service) = seeded();
-    let health = service.health();
+    let health = service.health(&CALLER, LOCAL).unwrap();
     assert_eq!(health.status, "ok");
     assert_eq!(health.document_count, 3);
     assert_eq!(health.encoder.as_deref(), Some("fake"));
@@ -275,11 +347,17 @@ fn health() {
 fn reopening_keeps_data() {
     let directory = tempfile::tempdir().unwrap();
     let service = Service::new(settings(&directory), fake()).unwrap();
-    service.put(DOCS[2].1, None, Some("nccl")).unwrap();
+    service
+        .put(&CALLER, LOCAL, DOCS[2].1, None, Some("nccl"), false)
+        .unwrap();
     drop(service);
     let reopened = Service::new(settings(&directory), fake()).unwrap();
     assert_eq!(
-        reopened.search("barrier", None, 10).unwrap().hits[0].id,
+        reopened
+            .search(&CALLER, LOCAL, "barrier", None, 10)
+            .unwrap()
+            .hits[0]
+            .id,
         "nccl"
     );
 }
@@ -305,20 +383,33 @@ fn the_local_service_never_reads_other_collections() {
 
     let service = Service::new(settings(&directory), None).unwrap();
     service
-        .put("local searchable sentinel", None, Some("local-record"))
+        .put(
+            &CALLER,
+            LOCAL,
+            "local searchable sentinel",
+            None,
+            Some("local-record"),
+            false,
+        )
         .unwrap();
-    assert_eq!(service.health().document_count, 1);
-    let hits = service.search("sentinel", None, 10).unwrap().hits;
+    assert_eq!(service.health(&CALLER, LOCAL).unwrap().document_count, 1);
+    let hits = service
+        .search(&CALLER, LOCAL, "sentinel", None, 10)
+        .unwrap()
+        .hits;
     assert_eq!(
         hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),
         ["local-record"]
     );
     assert_eq!(
-        service.get("local-record", None).unwrap().collection_id,
+        service
+            .get(&CALLER, LOCAL, "local-record", None)
+            .unwrap()
+            .collection_id,
         LOCAL_COLLECTION_ID
     );
     assert!(matches!(
-        service.get("hidden", None),
+        service.get(&CALLER, LOCAL, "hidden", None),
         Err(ServiceError::Store(StoreError::RecordNotFound { .. }))
     ));
     drop(service);
@@ -334,20 +425,34 @@ fn an_encoder_failure_writes_nothing() {
     let directory = tempfile::tempdir().unwrap();
     let encoder = Arc::new(FakeEncoder::new());
     let service = Service::new(settings(&directory), Some(encoder.clone())).unwrap();
-    service.put(DOCS[0].1, None, Some("cuda")).unwrap();
+    service
+        .put(&CALLER, LOCAL, DOCS[0].1, None, Some("cuda"), false)
+        .unwrap();
     encoder.set_failing(true);
     assert!(matches!(
-        service.put("replacement text", None, Some("cuda")),
+        service.put(
+            &CALLER,
+            LOCAL,
+            "replacement text",
+            None,
+            Some("cuda"),
+            false
+        ),
         Err(ServiceError::Index(_))
     ));
-    assert!(service.put(DOCS[1].1, None, Some("pytest")).is_err());
+    assert!(service
+        .put(&CALLER, LOCAL, DOCS[1].1, None, Some("pytest"), false)
+        .is_err());
     encoder.set_failing(false);
-    assert_eq!(service.get("cuda", None).unwrap().revision, 1);
+    assert_eq!(
+        service.get(&CALLER, LOCAL, "cuda", None).unwrap().revision,
+        1
+    );
     assert!(matches!(
-        service.get("pytest", None),
+        service.get(&CALLER, LOCAL, "pytest", None),
         Err(ServiceError::Store(StoreError::RecordNotFound { .. }))
     ));
-    assert_eq!(service.health().document_count, 1);
+    assert_eq!(service.health(&CALLER, LOCAL).unwrap().document_count, 1);
 }
 
 #[cfg(unix)]
@@ -361,15 +466,15 @@ fn a_failed_index_step_is_rebuilt_before_the_next_search() {
     let set_mode =
         |mode| std::fs::set_permissions(&vectors, std::fs::Permissions::from_mode(mode)).unwrap();
     set_mode(0o555);
-    let deleted = service.delete("nccl");
-    let search = service.search("worker never reached barrier", None, 10);
+    let deleted = service.delete(&CALLER, LOCAL, "nccl");
+    let search = service.search(&CALLER, LOCAL, "worker never reached barrier", None, 10);
     set_mode(0o755);
     assert!(matches!(deleted, Err(ServiceError::Index(_))));
     assert!(matches!(search, Err(ServiceError::Index(_))));
     let outcome = service
-        .search("worker never reached barrier", None, 10)
+        .search(&CALLER, LOCAL, "worker never reached barrier", None, 10)
         .unwrap();
     assert!(!outcome.hits.is_empty());
     assert!(outcome.hits.iter().all(|hit| hit.id != "nccl"));
-    assert_eq!(service.health().document_count, 2);
+    assert_eq!(service.health(&CALLER, LOCAL).unwrap().document_count, 2);
 }

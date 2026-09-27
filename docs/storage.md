@@ -29,8 +29,9 @@ the Python implementation (release `v0.1.0`, which versioned its schema with
 Schema `v0.3.0` adds credential verifiers, scoped grants, and authentication versions.
 See [local credential administration](credentials.md) for lifecycle and context semantics.
 
-This is an unauthenticated local server with plaintext storage. A restricted
-visibility label is groundwork for later access policy, not a confidentiality
+HTTP/MCP still serve a trusted local interface without transport authentication.
+The Rust service enforces [context and collection policy](policy.md), but hosted
+operation remains unavailable. A visibility label alone is not a confidentiality
 guarantee. Encryption at rest is outside the current implementation scope. HTTP
 and MCP are bound to the local collection; neither exposes collection
 provisioning or selection. Keep the server behind a trusted local boundary.
@@ -54,7 +55,8 @@ Composite primary and foreign keys scope revisions, reports, search hits, and in
 mirror entries to their collection and exact target revision. Report revisions are
 nullable. Index state is keyed by collection and key; internal vector IDs are unique
 within a collection only. The trusted index API accepts an explicit existing
-collection; it does not provide authorization. HTTP/MCP still select only `local`.
+collection; it does not provide authorization. Service policy authorizes before
+index loading or recovery. HTTP/MCP still select only `local`.
 
 The service uses a collection-index manager with lazy loading and LRU eviction.
 `PRIORART_MAX_LOADED_INDEXES` defaults to 8 and must be positive. Eviction releases

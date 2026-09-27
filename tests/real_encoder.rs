@@ -1,7 +1,9 @@
+#![cfg(feature = "onnx")]
 //! Smoke tests against the official LateOn-Code ONNX artifact, ignored by
 //! default: `cargo test --release --test real_encoder -- --ignored`.
 //! The first run downloads about 150 MB.
-#![cfg(feature = "onnx")]
+use priorart::auth::RequestContext;
+use priorart::store::LOCAL_COLLECTION_ID;
 
 use std::sync::{Arc, OnceLock};
 
@@ -64,20 +66,28 @@ fn end_to_end() {
     let service = Service::new(settings, Some(encoder as Arc<dyn Encoder>)).unwrap();
     service
         .put(
+            &RequestContext::local(),
+            LOCAL_COLLECTION_ID,
             "torch.compile recompiles every step because a Python int changes; mark it dynamic.",
             None,
             Some("compile"),
+            false,
         )
         .unwrap();
     service
         .put(
+            &RequestContext::local(),
+            LOCAL_COLLECTION_ID,
             "NCCL watchdog timeout: rank 3 exited early from a stray sys.exit in the data loader.",
             None,
             Some("nccl"),
+            false,
         )
         .unwrap();
     let outcome = service
         .search(
+            &RequestContext::local(),
+            LOCAL_COLLECTION_ID,
             "distributed training hangs at the end of the first epoch",
             None,
             10,

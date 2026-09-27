@@ -1,6 +1,8 @@
+use priorart::auth::RequestContext;
 use priorart::auth::{AuthError, Grant, Operation, MAX_CREDENTIAL_DEPTH, MAX_GRANTS};
 use priorart::config::Settings;
 use priorart::service::{Service, DATABASE_FILE};
+use priorart::store::LOCAL_COLLECTION_ID;
 use priorart::store::{
     Store, Visibility, LOCAL_COLLECTION_ID as LOCAL, LOCAL_PRINCIPAL_ID as PRINCIPAL,
 };
@@ -43,7 +45,7 @@ fn secrets_are_random_returned_once_and_never_persisted_or_debugged() {
         assert!(!value.contains(&secret));
     }
     let context = store.authenticate(&secret).unwrap();
-    assert_eq!(context.principal_id(), PRINCIPAL);
+    assert_eq!(context.principal_id(), Some(PRINCIPAL));
     assert!(context.has_grant(LOCAL, Operation::Read));
     assert!(!context.has_grant(LOCAL, Operation::Admin));
     assert!(!context.has_grant("other", Operation::Read));
@@ -221,7 +223,7 @@ fn delegation_cannot_expand_scope_permissions_or_expiry() {
         .unwrap()
         .into_secret();
     let context = store.authenticate(&child).unwrap();
-    assert_eq!(context.principal_id(), PRINCIPAL);
+    assert_eq!(context.principal_id(), Some(PRINCIPAL));
     assert!(context.has_grant(LOCAL, Operation::Read));
     assert!(store
         .delegate_credential(&context, &grants(&[Operation::Read]), Some(end))
@@ -389,10 +391,24 @@ fn service_context_revalidation_observes_local_administration() {
     assert!(service.authenticate(&secret).is_err());
     assert!(service.validate_context(&context).is_err());
     // Existing operations are still explicitly local, pending step 06 policy.
-    service.put("local", None, Some("record")).unwrap();
+    service
+        .put(
+            &RequestContext::local(),
+            LOCAL_COLLECTION_ID,
+            "local",
+            None,
+            Some("record"),
+            false,
+        )
+        .unwrap();
     assert_eq!(
         service
-            .get("record", None)
+            .get(
+                &RequestContext::local(),
+                LOCAL_COLLECTION_ID,
+                "record",
+                None
+            )
             .unwrap()
             .author_principal_id
             .as_deref(),
@@ -439,7 +455,7 @@ fn delegation_requires_authority_on_each_collection_and_principals_are_independe
     let other_id = other.info.id.clone();
     let other_key = other.into_secret();
     let other_context = store.authenticate(&other_key).unwrap();
-    assert_eq!(other_context.principal_id(), other_principal);
+    assert_eq!(other_context.principal_id(), Some(other_principal.as_str()));
     assert!(!other_context.has_grant(LOCAL, Operation::Read));
     let child = store
         .delegate_credential(&issuer, &grants(&[Operation::Read]), None)
@@ -475,4 +491,47 @@ fn concurrent_rotation_has_exactly_one_successful_replacement() {
     assert!(store.authenticate(&secret).is_err());
     assert!(store.authenticate(&replacement.into_secret()).is_ok());
     assert_eq!(store.local_credentials(PRINCIPAL).unwrap().len(), 2);
+}
+
+#[test]
+fn delegation_to_other_principals_preserves_authority_and_cascades_revocation() {
+    let (_directory, store) = setup();
+    let bob = store.create_principal().unwrap();
+    let carol = store.create_principal().unwrap();
+    let (root_id, root) = issue(&store, &[Operation::Read, Operation::Delegate]);
+    let root_context = store.authenticate(&root).unwrap();
+    assert!(store
+        .delegate_credential_to(&root_context, &bob, &grants(&[Operation::Admin]), None)
+        .is_err());
+    assert!(store
+        .delegate_credential_to(&root_context, "unknown", &grants(&[Operation::Read]), None)
+        .is_err());
+    let child = store
+        .delegate_credential_to(
+            &root_context,
+            &bob,
+            &grants(&[Operation::Read, Operation::Delegate]),
+            None,
+        )
+        .unwrap()
+        .into_secret();
+    let child_context = store.authenticate(&child).unwrap();
+    assert_eq!(child_context.principal_id(), Some(bob.as_str()));
+    let grandchild = store
+        .delegate_credential_to(&child_context, &carol, &grants(&[Operation::Read]), None)
+        .unwrap()
+        .into_secret();
+    let independent = store
+        .issue_local_credential(&carol, &[], None)
+        .unwrap()
+        .into_secret();
+    let independent_context = store.authenticate(&independent).unwrap();
+    let grandchild_context = store.authenticate(&grandchild).unwrap();
+    assert_eq!(grandchild_context.principal_id(), Some(carol.as_str()));
+    store.revoke_local_credential(&root_id).unwrap();
+    assert!(store.authenticate(&child).is_err());
+    assert!(store.authenticate(&grandchild).is_err());
+    assert!(store.validate_context(&grandchild_context).is_err());
+    let refreshed = store.authenticate(&independent).unwrap();
+    assert!(refreshed.principal_version() > independent_context.principal_version());
 }
