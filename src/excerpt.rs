@@ -1,13 +1,14 @@
 //! Query-aware excerpts chosen by lexical overlap; no model involved.
 
 use std::collections::HashSet;
+use std::ops::Range;
 
-use crate::analyzer::tokens;
+use crate::analyzer::token_spans;
 
 pub const DEFAULT_WIDTH: usize = 400;
 
-/// The `width`-character window with the most query terms, trimmed to word
-/// boundaries and marked with ellipses where text was cut.
+/// The `width`-character window with the most query terms wholly inside it,
+/// trimmed to word boundaries and marked with ellipses where text was cut.
 pub fn excerpt(text: &str, query_tokens: &[String], width: usize) -> String {
     let text = text.trim();
     let chars: Vec<char> = text.chars().collect();
@@ -15,18 +16,22 @@ pub fn excerpt(text: &str, query_tokens: &[String], width: usize) -> String {
         return text.to_owned();
     }
     let wanted: HashSet<&str> = query_tokens.iter().map(String::as_str).collect();
+    // Terms never overlap, so both ends ascend and a window's hits are a run.
+    let hits: Vec<Range<usize>> = token_spans(text)
+        .into_iter()
+        .filter(|(term, _)| wanted.contains(term.as_str()))
+        .map(|(_, range)| range)
+        .collect();
     let step = (width / 4).max(1);
     let last = chars.len() - width;
     let (mut best_start, mut best_hits) = (0, None);
     for start in (0..last + step).step_by(step) {
         let start = start.min(last);
-        let window: String = chars[start..start + width].iter().collect();
-        let hits = tokens(&window)
-            .iter()
-            .filter(|term| wanted.contains(term.as_str()))
-            .count();
-        if best_hits.is_none_or(|best| hits > best) {
-            (best_start, best_hits) = (start, Some(hits));
+        let first = hits.partition_point(|hit| hit.start < start);
+        let past = hits.partition_point(|hit| hit.end <= start + width);
+        let count = past.saturating_sub(first);
+        if best_hits.is_none_or(|best| count > best) {
+            (best_start, best_hits) = (start, Some(count));
         }
         if start == last {
             break;
