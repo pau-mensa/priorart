@@ -6,7 +6,8 @@
 //! publish are separate steps, and lateweave publishes a mutation as several
 //! file renames, so neither is atomic. On open the mirror, the live records,
 //! and the vector store are compared, and any disagreement rebuilds the index
-//! from the records; that is how every crash between the steps recovers.
+//! from the records; that is how every crash between the steps recovers. A
+//! failed index step in a running process rebuilds the same way.
 //!
 //! Zero documents means no `vectors/` directory: lateweave stores cannot be
 //! empty, so absence is the empty state.
@@ -57,7 +58,11 @@ pub struct Index {
     generation: u64,
     manifest: Option<CorpusManifest>,
     lexical: Option<Arc<LexicalGatherer>>,
+    stale: bool,
 }
+
+/// A document's vectors, computed before its record is written.
+pub struct EncodedDocument(Option<Vec<TokenMatrix>>);
 
 impl Index {
     pub fn open(
@@ -81,6 +86,7 @@ impl Index {
             generation: 0,
             manifest: None,
             lexical: None,
+            stale: false,
         };
         index.load(store)?;
         Ok(index)
@@ -181,24 +187,69 @@ impl Index {
         }
         self.write_mirror(store)?;
         self.refresh();
+        self.stale = false;
         Ok(())
     }
 
+    /// Encodes a document before its record is written, so an encoder failure
+    /// leaves nothing to reconcile.
+    pub fn encode(&self, text: &str) -> Result<EncodedDocument> {
+        Ok(EncodedDocument(match &self.encoder {
+            Some(encoder) => Some(encoder.encode_documents(&[text])?),
+            None => None,
+        }))
+    }
+
+    /// Indexes a written revision. The record is already durable, so a failed
+    /// index step rebuilds from the store rather than leave the two diverged.
     pub fn upsert(
         &mut self,
         store: &Store,
         record_id: &str,
         revision: i64,
         text: &str,
+        encoded: EncodedDocument,
     ) -> Result<()> {
-        let encoded = match &self.encoder {
-            Some(encoder) => Some(encoder.encode_documents(&[text])?),
-            None => None,
+        self.ensure_current(store)?;
+        let result = self.apply_upsert(store, record_id, revision, text, encoded);
+        self.reconcile(store, result)
+    }
+
+    pub fn remove(&mut self, store: &Store, record_id: &str) -> Result<()> {
+        self.ensure_current(store)?;
+        let result = self.apply_remove(store, record_id);
+        self.reconcile(store, result)
+    }
+
+    /// Rebuilds first if an earlier index step failed and its rebuild did too.
+    pub fn ensure_current(&mut self, store: &Store) -> Result<()> {
+        if self.stale {
+            self.rebuild(store)?;
+        }
+        Ok(())
+    }
+
+    fn reconcile(&mut self, store: &Store, result: Result<()>) -> Result<()> {
+        let Err(error) = result else {
+            return Ok(());
         };
+        eprintln!("priorart: index update failed ({error}); rebuilding from the store");
+        self.stale = true;
+        self.rebuild(store)
+    }
+
+    fn apply_upsert(
+        &mut self,
+        store: &Store,
+        record_id: &str,
+        revision: i64,
+        text: &str,
+        encoded: EncodedDocument,
+    ) -> Result<()> {
         if let Some(position) = self.position(record_id) {
             self.remove_position(position)?;
         }
-        if let (Some(encoder), Some(encoded)) = (self.encoder.clone(), encoded) {
+        if let (Some(encoder), Some(encoded)) = (self.encoder.clone(), encoded.0) {
             match &self.vectors {
                 Some(vectors) => {
                     let (values, lengths) = pack(&encoded);
@@ -223,7 +274,7 @@ impl Index {
         Ok(())
     }
 
-    pub fn remove(&mut self, store: &Store, record_id: &str) -> Result<()> {
+    fn apply_remove(&mut self, store: &Store, record_id: &str) -> Result<()> {
         let Some(position) = self.position(record_id) else {
             return Ok(());
         };

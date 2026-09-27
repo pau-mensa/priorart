@@ -30,7 +30,10 @@ fn put(store: &Store, index: &mut Index, record: &str, text: &str) -> i64 {
     let created = store
         .put(LOCAL, text, None, Some(record), LOCAL_PRINCIPAL_ID)
         .unwrap();
-    index.upsert(store, record, created.revision, text).unwrap();
+    let encoded = index.encode(text).unwrap();
+    index
+        .upsert(store, record, created.revision, text, encoded)
+        .unwrap();
     created.revision
 }
 

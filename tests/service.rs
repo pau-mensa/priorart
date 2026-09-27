@@ -325,3 +325,47 @@ fn the_local_service_never_reads_other_collections() {
     index.rebuild(&store).unwrap();
     assert_eq!(index.record_ids(), ["local-record"]);
 }
+
+#[test]
+fn an_encoder_failure_writes_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let encoder = Arc::new(FakeEncoder::new());
+    let service = Service::new(settings(&directory), Some(encoder.clone())).unwrap();
+    service.put(DOCS[0].1, None, Some("cuda")).unwrap();
+    encoder.set_failing(true);
+    assert!(matches!(
+        service.put("replacement text", None, Some("cuda")),
+        Err(ServiceError::Index(_))
+    ));
+    assert!(service.put(DOCS[1].1, None, Some("pytest")).is_err());
+    encoder.set_failing(false);
+    assert_eq!(service.get("cuda", None).unwrap().revision, 1);
+    assert!(matches!(
+        service.get("pytest", None),
+        Err(ServiceError::Store(StoreError::RecordNotFound { .. }))
+    ));
+    assert_eq!(service.health().document_count, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_index_step_is_rebuilt_before_the_next_search() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (directory, service) = seeded();
+    let vectors = directory.path().join(priorart::index::VECTORS_DIRECTORY);
+    let set_mode =
+        |mode| std::fs::set_permissions(&vectors, std::fs::Permissions::from_mode(mode)).unwrap();
+    set_mode(0o555);
+    let deleted = service.delete("nccl");
+    let search = service.search("worker never reached barrier", None, 10);
+    set_mode(0o755);
+    assert!(matches!(deleted, Err(ServiceError::Index(_))));
+    assert!(matches!(search, Err(ServiceError::Index(_))));
+    let outcome = service
+        .search("worker never reached barrier", None, 10)
+        .unwrap();
+    assert!(!outcome.hits.is_empty());
+    assert!(outcome.hits.iter().all(|hit| hit.id != "nccl"));
+    assert_eq!(service.health().document_count, 2);
+}

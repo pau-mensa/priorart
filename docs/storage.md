@@ -64,6 +64,10 @@ document count, carry the configured representation, and have been written by
 the same encoder the mirror records. Any disagreement, including an unreadable
 store, rebuilds the whole index from SQLite. Vectors left behind by an earlier
 encoder run are never trusted after a lexical-only run has written the mirror.
+A running server applies the same rule when an index step fails after its record
+commits: it rebuilds from SQLite at once, and if that rebuild fails too, every
+later write and search retries it before touching the index. Documents are
+encoded before the record is written, so an encoder failure stores nothing.
 Journaled mutations with atomic generation activation are planned to replace
 this rebuild-on-mismatch model.
 

@@ -146,6 +146,7 @@ impl Service {
         }
         let mut state = self.state();
         let State { store, index } = &mut *state;
+        let encoded = index.encode(text)?;
         let created = store.put(
             LOCAL_COLLECTION_ID,
             text,
@@ -153,7 +154,7 @@ impl Service {
             record_id,
             LOCAL_PRINCIPAL_ID,
         )?;
-        index.upsert(store, &created.record_id, created.revision, text)?;
+        index.upsert(store, &created.record_id, created.revision, text, encoded)?;
         Ok((created.record_id, created.revision))
     }
 
@@ -197,6 +198,7 @@ impl Service {
 
         let mut state = self.state();
         let State { store, index } = &mut *state;
+        index.ensure_current(store)?;
         let subset = match filters {
             Some(filters) => {
                 let matching: HashSet<String> =

@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use lateweave::{Representation, TokenMatrix};
 use priorart::analyzer::tokens;
@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 pub struct FakeEncoder {
     representation: Representation,
     calls: AtomicUsize,
+    failing: AtomicBool,
 }
 
 impl FakeEncoder {
@@ -22,7 +23,13 @@ impl FakeEncoder {
         Self {
             representation: Representation::new(name, "test", dimension, true).unwrap(),
             calls: AtomicUsize::new(0),
+            failing: AtomicBool::new(false),
         }
+    }
+
+    /// Makes document encoding fail until reset.
+    pub fn set_failing(&self, failing: bool) {
+        self.failing.store(failing, Ordering::SeqCst);
     }
 
     pub fn calls(&self) -> usize {
@@ -72,6 +79,9 @@ impl Encoder for FakeEncoder {
     }
 
     fn encode_documents(&self, texts: &[&str]) -> Result<Vec<TokenMatrix>, EncoderError> {
+        if self.failing.load(Ordering::SeqCst) {
+            return Err(EncoderError::Failed("injected".to_owned()));
+        }
         Ok(self.encode(texts))
     }
 }
