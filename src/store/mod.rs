@@ -4,6 +4,7 @@
 //! boundary, not authorization: trusted local callers supply principal IDs
 //! until service policy exists.
 
+mod credentials;
 pub mod migrations;
 #[cfg(test)]
 mod tests;

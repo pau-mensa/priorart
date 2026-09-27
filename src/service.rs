@@ -12,14 +12,12 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::analyzer::tokens;
+use crate::auth::{AuthError, RequestContext};
 use crate::config::Settings;
 use crate::encoder::{load_encoder, Encoder, EncoderError};
 use crate::excerpt::{excerpt, DEFAULT_WIDTH};
 use crate::index::{CollectionIndexManager, IndexError};
-use crate::store::{
-    Metadata, Report, Revision, SearchHit, Store, StoreError, LOCAL_COLLECTION_ID,
-    LOCAL_PRINCIPAL_ID,
-};
+use crate::store::{Metadata, Report, Revision, SearchHit, Store, StoreError, LOCAL_COLLECTION_ID};
 
 pub const MAX_LIMIT: i64 = 100;
 pub const DATABASE_FILE: &str = "priorart.sqlite";
@@ -99,6 +97,7 @@ struct State {
 
 pub struct Service {
     settings: Settings,
+    local_context: RequestContext,
     encoder_name: Option<String>,
     state: Mutex<State>,
 }
@@ -128,9 +127,20 @@ impl Service {
         indexes.get(&store, LOCAL_COLLECTION_ID)?;
         Ok(Self {
             settings,
+            local_context: RequestContext::local(),
             encoder_name,
             state: Mutex::new(State { store, indexes }),
         })
+    }
+
+    /// Authenticates for upcoming policy-aware operations. Existing content APIs
+    /// remain explicitly local-only until policy enforcement is implemented.
+    pub fn authenticate(&self, bearer: &str) -> Result<RequestContext, AuthError> {
+        self.state().store.authenticate(bearer)
+    }
+
+    pub fn validate_context(&self, context: &RequestContext) -> Result<(), AuthError> {
+        self.state().store.validate_context(context)
     }
 
     pub fn settings(&self) -> &Settings {
@@ -171,7 +181,7 @@ impl Service {
             text,
             metadata,
             record_id,
-            LOCAL_PRINCIPAL_ID,
+            self.local_context.principal_id(),
         )?;
         index.upsert(store, &created.record_id, created.revision, text, encoded)?;
         Ok((created.record_id, created.revision))
@@ -301,7 +311,7 @@ impl Service {
             filters,
             &logged,
             &encoded_timings,
-            LOCAL_PRINCIPAL_ID,
+            self.local_context.principal_id(),
         )?;
         Ok(SearchOutcome {
             search_id,
@@ -327,7 +337,7 @@ impl Service {
             revision,
             search_id,
             text,
-            LOCAL_PRINCIPAL_ID,
+            self.local_context.principal_id(),
         )?)
     }
 

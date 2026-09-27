@@ -2269,11 +2269,12 @@ dependencies = [
 
 [[package]]
 name = "priorart"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "caseless",
  "clap",
+ "getrandom 0.4.3",
  "hf-hub",
  "lateweave",
  "ort",
@@ -2285,6 +2286,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "subtle",
  "tempfile",
  "thiserror",
  "time",

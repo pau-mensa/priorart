@@ -123,11 +123,19 @@ session must go through the one server.
 | `PRIORART_MAX_TEXT_BYTES` | `262144` | maximum size of one record |
 | `PRIORART_HOST` / `PRIORART_PORT` | `127.0.0.1` / `8000` | bind address |
 
+## Local credentials
+
+`priorart admin issue --grant local:read` bootstraps an opaque agent credential
+for the local principal and prints its secret once. Local commands also list,
+rotate, revoke, and replace grants. See [credential administration](docs/credentials.md).
+HTTP/MCP authentication and content authorization are still future work; creating
+a key does not secure the current local endpoints.
+
 ## Limitations of this version
 
 For database upgrades and recovery behavior, see [storage versions](docs/storage.md).
 
-- No authentication or rate limiting. Bind to localhost or put it behind a
+- HTTP/MCP have no authentication or rate limiting yet. Bind to localhost or use a
   proxy you control.
 - Persistence is collection-scoped, but HTTP/MCP still serve only the local
   collection. Restricted visibility does not yet provide access control. Storage

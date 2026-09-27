@@ -260,3 +260,29 @@ async fn the_configured_text_limit_governs_request_size() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body.to_string().contains("the limit is 3000000"), "{body}");
 }
+
+#[tokio::test]
+async fn credential_administration_has_no_remote_endpoint() {
+    let api = Api::start().await;
+    for path in [
+        "/v1/credentials",
+        "/v1/admin/issue",
+        "/admin/issue",
+        "/v1/bootstrap",
+    ] {
+        let (status, _) = api
+            .post(
+                path,
+                json!({"principal": "local-principal", "grants": ["local:admin"]}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+    let store =
+        priorart::store::Store::open(api._directory.path().join(priorart::service::DATABASE_FILE))
+            .unwrap();
+    assert!(store
+        .local_credentials("local-principal")
+        .unwrap()
+        .is_empty());
+}

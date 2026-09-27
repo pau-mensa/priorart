@@ -15,7 +15,8 @@ are independent of the HTTP protocol version.
 |---|---|
 | Empty database | Create the current schema transactionally |
 | No `schema_version`, any existing schema | Reject; priorart only initializes empty databases |
-| `v0.2.0` | Open without rerunning migrations |
+| `v0.2.0` | Transactionally add credential/grant tables and advance to `v0.3.0` |
+| `v0.3.0` | Open without rerunning migrations |
 | A tag this build does not know | Reject, naming that release as the one to use |
 | Nonzero `PRAGMA user_version` | Reject as a Python implementation directory; use `v0.1.0` |
 
@@ -24,6 +25,9 @@ are independent of the HTTP protocol version.
 owned by that account with visibility `restricted`. Data directories written by
 the Python implementation (release `v0.1.0`, which versioned its schema with
 `PRAGMA user_version`) are not adopted.
+
+Schema `v0.3.0` adds credential verifiers, scoped grants, and authentication versions.
+See [local credential administration](credentials.md) for lifecycle and context semantics.
 
 This is an unauthenticated local server with plaintext storage. A restricted
 visibility label is groundwork for later access policy, not a confidentiality

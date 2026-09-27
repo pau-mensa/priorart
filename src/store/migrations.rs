@@ -21,10 +21,16 @@ pub(crate) struct Migration {
     pub apply: fn(&Transaction<'_>) -> Result<(), StoreError>,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: "v0.2.0",
-    apply: create_collection_schema,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: "v0.2.0",
+        apply: create_collection_schema,
+    },
+    Migration {
+        version: "v0.3.0",
+        apply: create_credential_schema,
+    },
+];
 
 pub const SCHEMA_VERSION: &str = MIGRATIONS[MIGRATIONS.len() - 1].version;
 
@@ -219,3 +225,114 @@ CREATE TABLE index_state (
     PRIMARY KEY (collection_id, key)
 );
 ";
+
+fn create_credential_schema(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    transaction.execute_batch(
+        "
+        CREATE TABLE principal_auth_state (
+            principal_id TEXT PRIMARY KEY REFERENCES principals(id),
+            version INTEGER NOT NULL CHECK (version > 0)
+        );
+        CREATE TABLE credentials (
+            id TEXT PRIMARY KEY,
+            principal_id TEXT NOT NULL REFERENCES principals(id),
+            parent_id TEXT REFERENCES credentials(id),
+            verifier BLOB NOT NULL CHECK (length(verifier) = 32),
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER,
+            revoked_at INTEGER,
+            grant_version INTEGER NOT NULL DEFAULT 1 CHECK (grant_version > 0),
+            CHECK (expires_at IS NULL OR expires_at > created_at),
+            CHECK (parent_id IS NULL OR parent_id != id)
+        );
+        CREATE INDEX credentials_principal ON credentials(principal_id);
+        CREATE INDEX credentials_parent ON credentials(parent_id);
+        CREATE TABLE credential_grants (
+            credential_id TEXT NOT NULL REFERENCES credentials(id),
+            collection_id TEXT NOT NULL REFERENCES collections(id),
+            operation TEXT NOT NULL CHECK (operation IN (
+                'read', 'contribute', 'update', 'delete', 'report', 'feedback_read',
+                'feedback_delete', 'report_publish', 'moderate', 'export', 'admin', 'delegate'
+            )),
+            PRIMARY KEY (credential_id, collection_id, operation)
+        );
+    ",
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+    use crate::auth::{Grant, Operation};
+    use crate::store::Store;
+
+    #[test]
+    fn credential_upgrade_preserves_records_and_retries_after_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("priorart.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        run(&connection, &MIGRATIONS[..1]).unwrap();
+        connection.execute_batch("
+            INSERT INTO records VALUES ('local', 'record', 'local-principal', 'before', NULL);
+            INSERT INTO revisions VALUES ('local', 'record', 1, 'preserved', NULL, 'digest', 'before');
+        ").unwrap();
+        // Inject a failure after the real migration DDL, before its stamp commits.
+        fn fail(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+            create_credential_schema(transaction)?;
+            transaction.execute_batch("SELECT missing_function()")?;
+            Ok(())
+        }
+        let broken = [
+            Migration {
+                version: "v0.2.0",
+                apply: create_collection_schema,
+            },
+            Migration {
+                version: "v0.3.0",
+                apply: fail,
+            },
+        ];
+        assert!(run(&connection, &broken).is_err());
+        assert_eq!(
+            stored_version(&connection).unwrap().as_deref(),
+            Some("v0.2.0")
+        );
+        let credentials_exist: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'credentials')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!credentials_exist);
+        drop(connection);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store
+                .get(LOCAL_COLLECTION_ID, "record", None)
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("preserved")
+        );
+        let credential = store
+            .issue_local_credential(
+                LOCAL_PRINCIPAL_ID,
+                &[Grant::new(LOCAL_COLLECTION_ID, Operation::Read)],
+                None,
+            )
+            .unwrap()
+            .into_secret();
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        assert!(reopened.authenticate(&credential).is_ok());
+        assert_eq!(
+            stored_version(&reopened.connection).unwrap().as_deref(),
+            Some(SCHEMA_VERSION)
+        );
+    }
+}

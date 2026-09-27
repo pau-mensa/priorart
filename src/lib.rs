@@ -2,6 +2,7 @@
 
 pub mod analyzer;
 pub mod api;
+pub mod auth;
 pub mod config;
 pub mod encoder;
 pub mod excerpt;
