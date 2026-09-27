@@ -37,7 +37,7 @@ fn put(store: &Store, index: &mut Index, record: &str, text: &str) -> i64 {
     created.revision
 }
 
-fn search(index: &mut Index, text: &str, gather_limit: usize, limit: usize) -> SearchResult {
+fn search(index: &Index, text: &str, gather_limit: usize, limit: usize) -> SearchResult {
     let pipeline = index
         .pipeline(index.document_count(), gather_limit)
         .unwrap();
@@ -140,14 +140,14 @@ fn search_finds_the_right_document() {
         "c",
         "NCCL timeout: one worker never reached the barrier",
     );
-    let result = search(&mut index, "worker never reached barrier", 500, 5);
+    let result = search(&index, "worker never reached barrier", 500, 5);
     assert_eq!(top(&index, &result), "c");
     assert_eq!(
         result.diagnostics.score_semantics,
         "int8-reconstructed-approximate-full-maxsim"
     );
     assert_eq!(result.diagnostics.gatherer, "ExhaustiveGatherer");
-    let result = search(&mut index, "worker never reached barrier", 2, 2);
+    let result = search(&index, "worker never reached barrier", 2, 2);
     assert_eq!(result.diagnostics.gatherer, "LexicalGatherer");
     assert_eq!(top(&index, &result), "c");
 }
@@ -158,7 +158,7 @@ fn lexical_only_search() {
     let mut index = open(&directory, &store, None);
     put(&store, &mut index, "a", "cuda illegal address");
     put(&store, &mut index, "b", "nccl barrier timeout");
-    let result = search(&mut index, "barrier", 500, 5);
+    let result = search(&index, "barrier", 500, 5);
     assert_eq!(top(&index, &result), "b");
     assert_eq!(result.diagnostics.score_semantics, "bm25-lucene");
 }
@@ -249,12 +249,40 @@ fn switching_encoders_on_and_off() {
     store.delete(LOCAL, "a").unwrap();
     lexical.remove(&store, "a").unwrap();
     put(&store, &mut lexical, "b", "beta beta gamma");
-    let mut reopened = open(&directory, &store, fake());
-    let result = search(&mut reopened, "beta", 500, 1);
+    let reopened = open(&directory, &store, fake());
+    let result = search(&reopened, "beta", 500, 1);
     assert_eq!(top(&reopened, &result), "b");
     assert_eq!(reopened.vectors().unwrap().document_count(), 1);
     let stored = reopened.vectors().unwrap().fetch(&[0], None).unwrap();
     assert_eq!(stored.lengths(), [3]);
+}
+
+#[test]
+fn lexical_scores_after_writes_match_a_reopened_index() {
+    let (directory, store) = setup();
+    let mut index = open(&directory, &store, None);
+    put(&store, &mut index, "a", "alpha beta");
+    put(&store, &mut index, "b", "beta gamma gamma");
+    put(&store, &mut index, "c", "gamma delta alpha");
+    put(&store, &mut index, "a", "delta delta beta");
+    store.delete(LOCAL, "b").unwrap();
+    index.remove(&store, "b").unwrap();
+    let reopened = open(&directory, &store, None);
+    let ranked = |index: &Index| {
+        let result = search(index, "alpha beta gamma delta", 500, 10);
+        result
+            .documents
+            .iter()
+            .map(|document| {
+                (
+                    index.record_ids()[document.document_id as usize].clone(),
+                    document.score,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ranked(&index), ranked(&reopened));
+    assert_eq!(ranked(&index).len(), 2);
 }
 
 #[test]

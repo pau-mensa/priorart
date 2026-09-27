@@ -6,7 +6,9 @@
 //! corpus exceeds the gather limit or when there is no encoder. Both consume
 //! only query text and honour the subset.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use lateweave::{Candidate, CandidateGenerator, CorpusManifest, Query, Requirements, Result};
 
@@ -62,47 +64,75 @@ impl CandidateGenerator for ExhaustiveGatherer {
 
 /// Lucene-variant BM25: `idf = ln(1 + (N - df + 0.5) / (df + 0.5))` times
 /// `tf / (tf + k1 * (1 - b + b * dl / avgdl))`, summed over query terms
-/// (repeated query terms count again).
-struct Bm25 {
+/// (repeated query terms count again). Maintained incrementally so a write
+/// tokenizes only the document it changes.
+#[derive(Clone, Default)]
+pub struct Bm25 {
     postings: HashMap<String, Vec<(u32, u32)>>,
     lengths: Vec<u32>,
-    average_length: f32,
+    total_length: u64,
 }
 
 impl Bm25 {
-    fn new<S: AsRef<str>>(texts: &[S]) -> Self {
-        let mut postings: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
-        let mut lengths = Vec::with_capacity(texts.len());
-        for (document, text) in texts.iter().enumerate() {
-            let terms = tokens(text.as_ref());
-            lengths.push(terms.len() as u32);
-            let mut counts: HashMap<String, u32> = HashMap::new();
-            for term in terms {
-                *counts.entry(term).or_default() += 1;
-            }
-            for (term, count) in counts {
-                postings
-                    .entry(term)
-                    .or_default()
-                    .push((document as u32, count));
-            }
+    pub fn new<S: AsRef<str>>(texts: &[S]) -> Self {
+        let mut index = Self::default();
+        for text in texts {
+            index.push(text.as_ref());
         }
-        let total: u64 = lengths.iter().map(|&length| u64::from(length)).sum();
-        let average_length = if lengths.is_empty() {
-            0.0
-        } else {
-            total as f32 / lengths.len() as f32
-        };
-        Self {
-            postings,
-            lengths,
-            average_length,
+        index
+    }
+
+    pub fn len(&self) -> usize {
+        self.lengths.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lengths.is_empty()
+    }
+
+    /// Appends a document under the next ID.
+    pub fn push(&mut self, text: &str) {
+        let document = self.lengths.len() as u32;
+        let terms = tokens(text);
+        self.lengths.push(terms.len() as u32);
+        self.total_length += terms.len() as u64;
+        let mut counts: HashMap<String, u32> = HashMap::new();
+        for term in terms {
+            *counts.entry(term).or_default() += 1;
         }
+        for (term, count) in counts {
+            self.postings
+                .entry(term)
+                .or_default()
+                .push((document, count));
+        }
+    }
+
+    /// Removes a document; later IDs shift down by one, matching the index.
+    pub fn remove(&mut self, document: usize) {
+        self.total_length -= u64::from(self.lengths.remove(document));
+        let document = document as u32;
+        self.postings.retain(|_, postings| {
+            postings.retain_mut(|(id, _)| match (*id).cmp(&document) {
+                Ordering::Less => true,
+                Ordering::Equal => false,
+                Ordering::Greater => {
+                    *id -= 1;
+                    true
+                }
+            });
+            !postings.is_empty()
+        });
     }
 
     /// Positive scores, best first, ties by ascending document ID.
     fn search(&self, terms: &[String], limit: usize, subset: Option<&[u64]>) -> Vec<(u64, f32)> {
         let count = self.lengths.len();
+        let average_length = if count == 0 {
+            0.0
+        } else {
+            self.total_length as f32 / count as f32
+        };
         let eligible = subset.map(|subset| {
             let mut mask = vec![false; count];
             for &document in subset {
@@ -127,7 +157,7 @@ impl Bm25 {
                 let tf = term_count as f32;
                 let normalization = LEXICAL_K1
                     * (1.0 - LEXICAL_B
-                        + LEXICAL_B * self.lengths[document as usize] as f32 / self.average_length);
+                        + LEXICAL_B * self.lengths[document as usize] as f32 / average_length);
                 scores[document as usize] += idf * tf / (tf + normalization);
             }
         }
@@ -147,12 +177,12 @@ impl Bm25 {
 pub struct LexicalGatherer {
     corpus: CorpusManifest,
     requires: Requirements,
-    index: Bm25,
+    index: Arc<Bm25>,
 }
 
 impl LexicalGatherer {
-    pub fn new<S: AsRef<str>>(corpus: CorpusManifest, texts: &[S]) -> Result<Self> {
-        if texts.len() as u64 != corpus.document_count() {
+    pub fn new(corpus: CorpusManifest, index: Arc<Bm25>) -> Result<Self> {
+        if index.len() as u64 != corpus.document_count() {
             return Err(lateweave::Error::InvalidInput(
                 "lexical texts do not match the corpus manifest".to_owned(),
             ));
@@ -160,7 +190,7 @@ impl LexicalGatherer {
         Ok(Self {
             corpus,
             requires: Requirements::new(),
-            index: Bm25::new(texts),
+            index,
         })
     }
 }
@@ -249,7 +279,7 @@ mod tests {
 
     #[test]
     fn lexical_ranks_matches_first_and_drops_zero_scores() {
-        let gatherer = LexicalGatherer::new(corpus(), &TEXTS).unwrap();
+        let gatherer = LexicalGatherer::new(corpus(), Arc::new(Bm25::new(&TEXTS))).unwrap();
         let found = gatherer
             .gather(&Query::new("worker barrier timeout"), 10, None)
             .unwrap();
@@ -263,7 +293,7 @@ mod tests {
 
     #[test]
     fn lexical_honours_the_subset() {
-        let gatherer = LexicalGatherer::new(corpus(), &TEXTS).unwrap();
+        let gatherer = LexicalGatherer::new(corpus(), Arc::new(Bm25::new(&TEXTS))).unwrap();
         let found = gatherer
             .gather(&Query::new("cuda attention barrier"), 10, Some(&[1, 2]))
             .unwrap();
@@ -288,7 +318,26 @@ mod tests {
     }
 
     #[test]
+    fn incremental_updates_match_a_fresh_build() {
+        let mut index = Bm25::new(&["a b", "gone a", "c c c d"]);
+        index.remove(1);
+        index.push("a e");
+        index.remove(0);
+        index.push("b b a");
+        let fresh = Bm25::new(&["c c c d", "a e", "b b a"]);
+        for query in [["a"], ["b"], ["c"], ["e"], ["gone"]] {
+            let terms: Vec<String> = query.iter().map(|term| term.to_string()).collect();
+            assert_eq!(
+                index.search(&terms, 10, None),
+                fresh.search(&terms, 10, None)
+            );
+        }
+        assert_eq!(index.len(), 3);
+        assert!(!index.postings.contains_key("gone"));
+    }
+
+    #[test]
     fn mismatched_texts_are_rejected() {
-        assert!(LexicalGatherer::new(corpus(), &TEXTS[..2]).is_err());
+        assert!(LexicalGatherer::new(corpus(), Arc::new(Bm25::new(&TEXTS[..2]))).is_err());
     }
 }

@@ -22,7 +22,7 @@ use lateweave::{
 };
 
 use crate::encoder::{pack, Encoder, EncoderError};
-use crate::gather::{ExhaustiveGatherer, LexicalGatherer};
+use crate::gather::{Bm25, ExhaustiveGatherer, LexicalGatherer};
 use crate::store::{Store, StoreError, LOCAL_COLLECTION_ID};
 
 pub const VECTORS_DIRECTORY: &str = "vectors";
@@ -54,10 +54,9 @@ pub struct Index {
     vectors: Option<Arc<VectorStore>>,
     record_ids: Vec<String>,
     revisions: Vec<i64>,
-    texts: Vec<String>,
     generation: u64,
     manifest: Option<CorpusManifest>,
-    lexical: Option<Arc<LexicalGatherer>>,
+    lexical: Arc<Bm25>,
     stale: bool,
 }
 
@@ -82,10 +81,9 @@ impl Index {
             vectors: None,
             record_ids: Vec::new(),
             revisions: Vec::new(),
-            texts: Vec::new(),
             generation: 0,
             manifest: None,
-            lexical: None,
+            lexical: Arc::default(),
             stale: false,
         };
         index.load(store)?;
@@ -120,7 +118,7 @@ impl Index {
         if !consistent {
             return self.rebuild(store);
         }
-        self.texts = mirror
+        let texts: Vec<String> = mirror
             .iter()
             .map(|entry| {
                 live.remove(&entry.record_id)
@@ -128,6 +126,7 @@ impl Index {
                     .unwrap_or_default()
             })
             .collect();
+        self.lexical = Arc::new(Bm25::new(&texts));
         self.revisions = mirror.iter().map(|entry| entry.revision).collect();
         self.record_ids = mirror.into_iter().map(|entry| entry.record_id).collect();
         self.vectors = match &self.encoder {
@@ -170,13 +169,14 @@ impl Index {
             .map(|document| document.record_id.clone())
             .collect();
         self.revisions = documents.iter().map(|document| document.revision).collect();
-        self.texts = documents
+        let texts: Vec<String> = documents
             .into_iter()
             .map(|document| document.text.unwrap_or_default())
             .collect();
+        self.lexical = Arc::new(Bm25::new(&texts));
         if let Some(encoder) = &self.encoder {
-            if !self.texts.is_empty() {
-                let texts: Vec<&str> = self.texts.iter().map(String::as_str).collect();
+            if !texts.is_empty() {
+                let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
                 let encoded = encoder.encode_documents(&texts)?;
                 self.vectors = Some(Arc::new(create_vectors(
                     &self.vectors_path,
@@ -268,7 +268,7 @@ impl Index {
         }
         self.record_ids.push(record_id.to_owned());
         self.revisions.push(revision);
-        self.texts.push(text.to_owned());
+        Arc::make_mut(&mut self.lexical).push(text);
         self.write_mirror(store)?;
         self.refresh();
         Ok(())
@@ -294,7 +294,7 @@ impl Index {
         }
         self.record_ids.remove(position);
         self.revisions.remove(position);
-        self.texts.remove(position);
+        Arc::make_mut(&mut self.lexical).remove(position);
         Ok(())
     }
 
@@ -323,7 +323,6 @@ impl Index {
 
     fn refresh(&mut self) {
         self.generation += 1;
-        self.lexical = None;
         self.manifest = (!self.record_ids.is_empty()).then(|| {
             CorpusManifest::new(
                 CORPUS_ID,
@@ -398,22 +397,17 @@ impl Index {
 
     /// Exhaustive MaxSim while `eligible` fits in `gather_limit`, BM25
     /// candidates beyond it or without an encoder.
-    pub fn pipeline(&mut self, eligible: usize, gather_limit: usize) -> Result<SearchPipeline> {
+    pub fn pipeline(&self, eligible: usize, gather_limit: usize) -> Result<SearchPipeline> {
         let manifest = self.manifest.clone().ok_or(IndexError::Empty)?;
-        let gatherer: Arc<dyn CandidateGenerator> = if self.encoder.is_none()
-            || eligible > gather_limit
-        {
-            match &self.lexical {
-                Some(lexical) => lexical.clone(),
-                None => {
-                    let lexical = Arc::new(LexicalGatherer::new(manifest.clone(), &self.texts)?);
-                    self.lexical = Some(lexical.clone());
-                    lexical
-                }
-            }
-        } else {
-            Arc::new(ExhaustiveGatherer::new(manifest.clone()))
-        };
+        let gatherer: Arc<dyn CandidateGenerator> =
+            if self.encoder.is_none() || eligible > gather_limit {
+                Arc::new(LexicalGatherer::new(
+                    manifest.clone(),
+                    self.lexical.clone(),
+                )?)
+            } else {
+                Arc::new(ExhaustiveGatherer::new(manifest.clone()))
+            };
         let reranker = match &self.vectors {
             Some(vectors) => Some(Arc::new(MaxSimReranker::new(
                 vectors.clone(),
