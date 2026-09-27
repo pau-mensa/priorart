@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::rejection::{JsonRejection, QueryRejection};
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -193,7 +193,15 @@ struct ReportsResponse {
     reports: Vec<ReportResponse>,
 }
 
+/// Room for a maximal text with worst-case JSON escaping (`\u0000` is six
+/// bytes per byte) plus metadata, so `PRIORART_MAX_TEXT_BYTES` is the limit
+/// that applies.
+fn body_limit(max_text_bytes: usize) -> usize {
+    max_text_bytes.saturating_mul(6).saturating_add(1 << 20)
+}
+
 pub fn router(service: Arc<Service>) -> Router {
+    let limit = body_limit(service.settings().max_text_bytes);
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/records", post(put_record))
@@ -201,6 +209,7 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/v1/records/{id}/reports", get(list_reports))
         .route("/v1/search", post(search))
         .route("/v1/reports", post(report))
+        .layer(DefaultBodyLimit::max(limit))
         .with_state(service)
 }
 

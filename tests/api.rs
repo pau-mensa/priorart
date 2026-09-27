@@ -12,8 +12,20 @@ struct Api {
 
 impl Api {
     async fn start() -> Self {
+        Self::with_max_text_bytes(priorart::config::Settings::default().max_text_bytes).await
+    }
+
+    async fn with_max_text_bytes(max_text_bytes: usize) -> Self {
         let directory = tempfile::tempdir().unwrap();
-        let url = common::spawn(common::service(&directory)).await;
+        let settings = priorart::config::Settings {
+            data_dir: directory.path().to_path_buf(),
+            max_text_bytes,
+            ..priorart::config::Settings::default()
+        };
+        let encoder: std::sync::Arc<dyn priorart::encoder::Encoder> =
+            std::sync::Arc::new(common::FakeEncoder::new());
+        let service = priorart::service::Service::new(settings, Some(encoder)).unwrap();
+        let url = common::spawn(std::sync::Arc::new(service)).await;
         Self {
             _directory: directory,
             url,
@@ -233,4 +245,18 @@ async fn healthz() {
         health,
         json!({"status": "ok", "document_count": 0, "encoder": "fake", "gather_limit": 500})
     );
+}
+
+#[tokio::test]
+async fn the_configured_text_limit_governs_request_size() {
+    let api = Api::with_max_text_bytes(3_000_000).await;
+    let (status, _) = api
+        .post("/v1/records", json!({"text": "word ".repeat(560_000)}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = api
+        .post("/v1/records", json!({"text": "x".repeat(3_000_001)}))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.to_string().contains("the limit is 3000000"), "{body}");
 }
