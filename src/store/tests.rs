@@ -1,7 +1,7 @@
 use serde_json::json;
 use tempfile::TempDir;
 
-use super::migrations::{run, Migration};
+use super::migrations::{run, stored_version, Migration};
 use super::*;
 
 const LOCAL: &str = LOCAL_COLLECTION_ID;
@@ -525,6 +525,10 @@ fn user_version(connection: &Connection) -> i64 {
         .unwrap()
 }
 
+fn schema_version(connection: &Connection) -> Option<String> {
+    stored_version(connection).unwrap()
+}
+
 fn dump(path: &Path) -> Vec<(String, String)> {
     let connection = Connection::open(path).unwrap();
     let mut statement = connection
@@ -536,6 +540,10 @@ fn dump(path: &Path) -> Vec<(String, String)> {
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
     rows.push(("user_version".into(), user_version(&connection).to_string()));
+    rows.push((
+        "schema_version".into(),
+        schema_version(&connection).unwrap_or_default(),
+    ));
     rows
 }
 
@@ -544,7 +552,11 @@ fn fresh_database_and_repeated_startup() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("priorart.sqlite");
     let store = Store::open(&path).unwrap();
-    assert_eq!(user_version(&store.connection), SCHEMA_VERSION);
+    assert_eq!(
+        schema_version(&store.connection).as_deref(),
+        Some(SCHEMA_VERSION)
+    );
+    assert_eq!(user_version(&store.connection), 0);
     let foreign_keys: i64 = store
         .connection
         .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
@@ -569,26 +581,40 @@ fn fresh_database_and_repeated_startup() {
     assert_eq!(dump(&path), before);
 }
 
+fn assert_rejected_unchanged(setup: &str, expected: &str) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("priorart.sqlite");
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(setup)
+        .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let error = Store::open(&path).err().unwrap();
+    assert!(matches!(
+        error,
+        StoreError::Schema(SchemaError::UnsupportedVersion(_))
+    ));
+    assert!(error.to_string().contains(expected), "{error}");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(!path.with_file_name("priorart.sqlite-wal").exists());
+}
+
 #[test]
-fn newer_and_negative_versions_are_rejected_without_modification() {
-    for version in [SCHEMA_VERSION + 1, -1] {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("priorart.sqlite");
-        Connection::open(&path)
-            .unwrap()
-            .pragma_update(None, "user_version", version)
-            .unwrap();
-        let before = std::fs::read(&path).unwrap();
-        let error = Store::open(&path).err().unwrap();
-        assert!(matches!(
-            error,
-            StoreError::Schema(SchemaError::UnsupportedVersion(_))
-        ));
-        if version > 0 {
-            assert!(error.to_string().contains("newer"));
-        }
-        assert_eq!(std::fs::read(&path).unwrap(), before);
-        assert!(!path.with_file_name("priorart.sqlite-wal").exists());
+fn unknown_schema_versions_are_rejected_without_modification() {
+    assert_rejected_unchanged(
+        "CREATE TABLE schema_version (version TEXT NOT NULL); \
+         INSERT INTO schema_version VALUES ('v9.0.0');",
+        "open it with priorart v9.0.0 or later",
+    );
+}
+
+#[test]
+fn python_databases_are_rejected_without_modification() {
+    for version in [1, 2] {
+        assert_rejected_unchanged(
+            &format!("CREATE TABLE records (id TEXT); PRAGMA user_version = {version};"),
+            "open it with priorart v0.1.0",
+        );
     }
 }
 
@@ -617,23 +643,52 @@ fn pending_migrations_commit_or_roll_back_as_one_batch() {
         )?;
         Ok(())
     }
+    fn add_row(transaction: &Transaction<'_>) -> Result<()> {
+        transaction.execute("INSERT INTO migration_probe VALUES ('rolled back')", [])?;
+        Ok(())
+    }
     fn fail(transaction: &Transaction<'_>) -> Result<()> {
         transaction.execute_batch("CREATE TABLE partial (value TEXT)")?;
         Err(SchemaError::Unrecognized("third migration failed".into()).into())
     }
+    fn reran(_: &Transaction<'_>) -> Result<()> {
+        panic!("reran")
+    }
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("priorart.sqlite");
     let connection = Connection::open(&path).unwrap();
-    let applied: [Migration; 2] = [|_| Ok(()), probe];
+    let applied = [
+        Migration {
+            version: "v1.0.0",
+            apply: |_| Ok(()),
+        },
+        Migration {
+            version: "v1.1.0",
+            apply: probe,
+        },
+    ];
     run(&connection, &applied).unwrap();
-    assert_eq!(user_version(&connection), 2);
+    assert_eq!(schema_version(&connection).as_deref(), Some("v1.1.0"));
     let before = dump(&path);
 
-    let add_row: Migration = |transaction| {
-        transaction.execute("INSERT INTO migration_probe VALUES ('rolled back')", [])?;
-        Ok(())
-    };
-    let failing: [Migration; 4] = [|_| panic!("reran"), |_| panic!("reran"), add_row, fail];
+    let failing = [
+        Migration {
+            version: "v1.0.0",
+            apply: reran,
+        },
+        Migration {
+            version: "v1.1.0",
+            apply: reran,
+        },
+        Migration {
+            version: "v1.2.0",
+            apply: add_row,
+        },
+        Migration {
+            version: "v1.3.0",
+            apply: fail,
+        },
+    ];
     let error = run(&connection, &failing).unwrap_err();
     assert!(error.to_string().contains("third migration failed"));
     assert_eq!(dump(&path), before);
@@ -645,5 +700,5 @@ fn pending_migrations_commit_or_roll_back_as_one_batch() {
         )
         .unwrap();
     assert_eq!(values, "preserved");
-    assert_eq!(user_version(&connection), 2);
+    assert_eq!(schema_version(&connection).as_deref(), Some("v1.1.0"));
 }

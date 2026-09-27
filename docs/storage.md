@@ -2,21 +2,25 @@
 
 A data directory holds `priorart.sqlite` (with its WAL files) and, when an encoder
 is configured and at least one record is live, the `vectors/` store. On startup,
-priorart checks `PRAGMA user_version`, applies pending migrations, and only then
-opens the index. Storage versions are independent of the HTTP protocol and package
-versions.
+priorart reads the schema version from the `schema_version` table, applies pending
+migrations, and only then opens the index. A schema version is the tag of the
+release that introduced that schema, so an unsupported version names the release
+that can open it. Schema versions change only when a release changes storage; they
+are independent of the HTTP protocol version.
 
-| Stored version | Startup behavior |
+| Stored state | Startup behavior |
 |---|---|
-| `0`, empty database | Create the current schema transactionally |
-| `0`, any existing schema | Reject; priorart only initializes empty databases |
-| `1` | Open without rerunning migrations |
-| Newer than supported, or negative | Reject with an upgrade-required error |
+| Empty database | Create the current schema transactionally |
+| No `schema_version`, any existing schema | Reject; priorart only initializes empty databases |
+| `v0.2.0` | Open without rerunning migrations |
+| A tag this build does not know | Reject, naming that release as the one to use |
+| Nonzero `PRAGMA user_version` | Reject as a Python implementation directory; use `v0.1.0` |
 
-Version 1 is the collection-scoped layout. It bootstraps principal
+`v0.2.0` is the collection-scoped layout. It bootstraps principal
 `local-principal`, account `local-account` owned by it, and collection `local`
 owned by that account with visibility `restricted`. Data directories written by
-the earlier Python implementation are not adopted; their version is rejected.
+the Python implementation (release `v0.1.0`, which versioned its schema with
+`PRAGMA user_version`) are not adopted.
 
 This is an unauthenticated local server with plaintext storage. A restricted
 visibility label is groundwork for later access policy, not a confidentiality
@@ -81,8 +85,9 @@ downgrade: use a compatible binary or restore a pre-upgrade backup.
 
 ## Adding migrations
 
-Append a function to `MIGRATIONS` in `src/store/migrations.rs`; its position
-determines the next storage version. Never modify a released migration. The
+Append a `Migration` to `MIGRATIONS` in `src/store/migrations.rs`, tagged with the
+release that will ship it; its position determines the upgrade order. Never modify
+a released migration. The
 runner acquires the write lock before reading the version and stamps each
 migration inside the same transaction, which serializes startup migration
 decisions; it does not make concurrent server processes safe.

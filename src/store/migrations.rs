@@ -3,7 +3,7 @@
 //! Append future migrations; never edit a released one. Migrations run inside
 //! the caller's write transaction and must not commit or touch external files.
 
-use rusqlite::{Connection, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use super::{StoreError, LOCAL_ACCOUNT_ID, LOCAL_COLLECTION_ID, LOCAL_PRINCIPAL_ID};
 
@@ -15,11 +15,22 @@ pub enum SchemaError {
     Unrecognized(String),
 }
 
-pub(crate) type Migration = fn(&Transaction<'_>) -> Result<(), StoreError>;
+/// A schema change, identified by the release tag that introduced it.
+pub(crate) struct Migration {
+    pub version: &'static str,
+    pub apply: fn(&Transaction<'_>) -> Result<(), StoreError>,
+}
 
-const MIGRATIONS: &[Migration] = &[create_collection_schema];
+const MIGRATIONS: &[Migration] = &[Migration {
+    version: "v0.2.0",
+    apply: create_collection_schema,
+}];
 
-pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
+pub const SCHEMA_VERSION: &str = MIGRATIONS[MIGRATIONS.len() - 1].version;
+
+/// The last release of the Python implementation, which versioned its schema
+/// with `PRAGMA user_version`.
+const PYTHON_RELEASE: &str = "v0.1.0";
 
 pub fn migrate(connection: &Connection) -> Result<(), StoreError> {
     run(connection, MIGRATIONS)
@@ -29,27 +40,56 @@ pub fn migrate(connection: &Connection) -> Result<(), StoreError> {
 pub(crate) fn run(connection: &Connection, migrations: &[Migration]) -> Result<(), StoreError> {
     let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
     // Read under the write lock so concurrent openers cannot migrate twice.
-    let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    let supported = migrations.len() as i64;
-    if version > supported {
+    let python_version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if python_version != 0 {
         return Err(SchemaError::UnsupportedVersion(format!(
-            "Database schema version {version} is newer than supported version {supported}; \
-             upgrade priorart before opening it."
+            "Database was written by the Python implementation of priorart (schema version \
+             {python_version}); open it with priorart {PYTHON_RELEASE} or point \
+             PRIORART_DATA_DIR elsewhere."
         ))
         .into());
     }
-    if version < 0 {
-        return Err(SchemaError::UnsupportedVersion(format!(
-            "Invalid database schema version {version}."
-        ))
-        .into());
-    }
-    for (index, migration) in migrations.iter().enumerate().skip(version as usize) {
-        migration(&transaction)?;
-        transaction.pragma_update(None, "user_version", index as i64 + 1)?;
+    let pending = match stored_version(&transaction)? {
+        None => 0,
+        Some(stored) => match migrations.iter().position(|m| m.version == stored) {
+            Some(position) => position + 1,
+            None => {
+                let latest = migrations.last().map_or("none", |m| m.version);
+                return Err(SchemaError::UnsupportedVersion(format!(
+                    "Database schema {stored} is not known to this build (latest {latest}); \
+                     open it with priorart {stored} or later."
+                ))
+                .into());
+            }
+        },
+    };
+    for migration in &migrations[pending..] {
+        (migration.apply)(&transaction)?;
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version TEXT NOT NULL); \
+             DELETE FROM schema_version;",
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_version VALUES (?1)",
+            [migration.version],
+        )?;
     }
     transaction.commit()?;
     Ok(())
+}
+
+pub(crate) fn stored_version(connection: &Connection) -> Result<Option<String>, StoreError> {
+    let exists: bool = connection.query_row(
+        "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(None);
+    }
+    Ok(connection
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .optional()?)
 }
 
 fn create_collection_schema(transaction: &Transaction<'_>) -> Result<(), StoreError> {
@@ -59,11 +99,12 @@ fn create_collection_schema(transaction: &Transaction<'_>) -> Result<(), StoreEr
         |row| row.get(0),
     )?;
     if existing > 0 {
-        return Err(SchemaError::Unrecognized(
-            "Unversioned database already contains a schema; priorart only initializes empty \
-             databases. Inspect the file or point PRIORART_DATA_DIR elsewhere."
-                .to_owned(),
-        )
+        return Err(SchemaError::Unrecognized(format!(
+            "Unversioned database already contains a schema; priorart only initializes \
+                 empty databases. If the Python implementation wrote it, open it with priorart \
+                 {PYTHON_RELEASE}; otherwise inspect the file or point PRIORART_DATA_DIR \
+                 elsewhere."
+        ))
         .into());
     }
     transaction.execute_batch(SCHEMA)?;
