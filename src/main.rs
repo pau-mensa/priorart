@@ -44,6 +44,13 @@ enum Command {
 
 #[derive(Subcommand)]
 enum AdminCommand {
+    /// Provision a collection through trusted local administration.
+    CreateCollection {
+        #[arg(long, default_value = priorart::store::LOCAL_ACCOUNT_ID)]
+        account: String,
+        #[arg(long, default_value = "restricted")]
+        visibility: priorart::store::Visibility,
+    },
     /// Bootstrap a credential for an existing owner principal. Prints its secret once.
     Issue {
         #[arg(long, default_value = LOCAL_PRINCIPAL_ID)]
@@ -84,6 +91,12 @@ fn administer(command: AdminCommand) -> Result<(), AnyError> {
     // No encoder, HTTP listener, or remote provisioning is involved.
     let store = Store::open(settings.data_dir.join(DATABASE_FILE))?;
     match command {
+        AdminCommand::CreateCollection {
+            account,
+            visibility,
+        } => {
+            println!("{}", store.create_collection(&account, visibility)?);
+        }
         AdminCommand::Issue {
             principal,
             grants,
@@ -164,11 +177,17 @@ fn serve(host: Option<String>, port: Option<u16>) -> Result<(), AnyError> {
             .await?
             .next()
             .ok_or("the host resolved to no address")?;
+        if !address.ip().is_loopback() {
+            return Err("only loopback listeners are supported".into());
+        }
         let listener = tokio::net::TcpListener::bind(address).await?;
         eprintln!("priorart: listening on http://{address}");
-        axum::serve(listener, api::router(service))
-            .with_graceful_shutdown(shutdown_signal())
-            .await?;
+        axum::serve(
+            listener,
+            api::router(service).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
         Ok(())
     })
 }

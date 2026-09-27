@@ -28,7 +28,14 @@ fn fake() -> Option<Arc<dyn Encoder>> {
 
 fn put(store: &Store, index: &mut Index, record: &str, text: &str) -> i64 {
     let created = store
-        .put(LOCAL, text, None, Some(record), LOCAL_PRINCIPAL_ID)
+        .put(
+            LOCAL,
+            text,
+            None,
+            Some(record),
+            LOCAL_PRINCIPAL_ID,
+            store.get(LOCAL, record, None).ok().map(|r| r.revision),
+        )
         .unwrap();
     let encoded = index.encode(text).unwrap();
     index
@@ -201,7 +208,14 @@ fn a_stale_revision_or_missing_vectors_rebuild() {
     let mut index = open(&directory, &store, fake());
     put(&store, &mut index, "a", "alpha");
     store
-        .put(LOCAL, "alpha two", None, Some("a"), LOCAL_PRINCIPAL_ID)
+        .put(
+            LOCAL,
+            "alpha two",
+            None,
+            Some("a"),
+            LOCAL_PRINCIPAL_ID,
+            Some(1),
+        )
         .unwrap();
     open(&directory, &store, fake());
     assert_eq!(mirror(&store), [(0, "a".to_owned(), 2)]);
@@ -264,7 +278,7 @@ fn switching_encoders_on_and_off() {
     assert_eq!(lexical.document_count(), 1);
     // Vectors left behind by an earlier encoder run are not trusted after
     // lexical-only writes, even when the document count matches.
-    store.delete(LOCAL, "a").unwrap();
+    store.delete(LOCAL, "a", Some(1)).unwrap();
     lexical.remove(&store, "a").unwrap();
     put(&store, &mut lexical, "b", "beta beta gamma");
     let reopened = open(&directory, &store, fake());
@@ -283,7 +297,7 @@ fn lexical_scores_after_writes_match_a_reopened_index() {
     put(&store, &mut index, "b", "beta gamma gamma");
     put(&store, &mut index, "c", "gamma delta alpha");
     put(&store, &mut index, "a", "delta delta beta");
-    store.delete(LOCAL, "b").unwrap();
+    store.delete(LOCAL, "b", Some(1)).unwrap();
     index.remove(&store, "b").unwrap();
     assert_eq!(
         mirror(&store),
@@ -318,7 +332,14 @@ fn collection(store: &Store) -> String {
 fn scoped_put(store: &Store, index: &mut Index, collection: &str, text: &str) {
     let encoded = index.encode(text).unwrap();
     let revision = store
-        .put(collection, text, None, Some("same"), LOCAL_PRINCIPAL_ID)
+        .put(
+            collection,
+            text,
+            None,
+            Some("same"),
+            LOCAL_PRINCIPAL_ID,
+            None,
+        )
         .unwrap();
     index
         .upsert(store, "same", revision.revision, text, encoded)
@@ -365,7 +386,7 @@ fn collection_rebuilds_and_mutations_are_isolated() {
             .unwrap()
             .documents
             .is_empty());
-        store.delete(LOCAL, "same").unwrap();
+        store.delete(LOCAL, "same", Some(1)).unwrap();
         index.remove(&store, "same").unwrap();
         assert_eq!(std::fs::read(other_path).unwrap(), other_bytes);
         assert_eq!(store.index_documents(&other).unwrap(), other_mirror);
@@ -486,7 +507,7 @@ fn failed_rebuild_and_failed_load_remain_recoverable() {
     );
     scoped_put(&store, manager.get(&store, LOCAL).unwrap(), LOCAL, "alpha");
     store
-        .put(&other, "beta", None, Some("same"), LOCAL_PRINCIPAL_ID)
+        .put(&other, "beta", None, Some("same"), LOCAL_PRINCIPAL_ID, None)
         .unwrap();
     encoder.set_failing(true);
     assert!(manager.get(&store, LOCAL).unwrap().rebuild(&store).is_err());

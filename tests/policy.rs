@@ -1,3 +1,4 @@
+use priorart::service::WriteOptions;
 mod common;
 
 use std::path::PathBuf;
@@ -80,6 +81,7 @@ impl Fixture {
                     Some(json!({"tag": "shared"}).as_object().unwrap()),
                     Some("same"),
                     principal,
+                    None,
                 )
                 .unwrap();
             store
@@ -89,9 +91,10 @@ impl Fixture {
                     None,
                     Some("gone"),
                     principal,
+                    None,
                 )
                 .unwrap();
-            store.delete(collection, "gone").unwrap();
+            store.delete(collection, "gone", Some(1)).unwrap();
         }
         let service = Service::new(
             Settings {
@@ -171,12 +174,12 @@ fn unrelated_accounts_cannot_read_mutate_report_or_inspect_forbidden_scope() {
                     "replacement",
                     None,
                     Some(record),
-                    false
+                    WriteOptions::default()
                 )),
                 expected
             );
             assert_eq!(
-                unavailable(f.service.delete(&context, collection, record)),
+                unavailable(f.service.delete(&context, collection, record, Some(1))),
                 expected
             );
             assert_eq!(
@@ -229,7 +232,10 @@ fn read_scope_includes_old_revisions_but_not_mutations_feedback_or_diagnostics()
             "second version",
             None,
             Some("same"),
-            false,
+            WriteOptions {
+                publish: false,
+                expected_revision: Some(1),
+            },
         )
         .unwrap();
     let reader = f.context(&key);
@@ -251,8 +257,11 @@ fn read_scope_includes_old_revisions_but_not_mutations_feedback_or_diagnostics()
         .hits[0]
         .excerpt
         .contains("second"));
-    unavailable(f.service.put(&reader, &f.a, "new", None, None, false));
-    unavailable(f.service.delete(&reader, &f.a, "same"));
+    unavailable(
+        f.service
+            .put(&reader, &f.a, "new", None, None, WriteOptions::default()),
+    );
+    unavailable(f.service.delete(&reader, &f.a, "same", Some(1)));
     unavailable(
         f.service
             .report(&reader, &f.a, "same", "report", None, None),
@@ -285,11 +294,18 @@ fn anonymous_public_reads_never_log_and_mutations_require_credentials() {
         .unwrap();
     assert_eq!(count, 0);
     for context in [&anonymous, &f.bob()] {
-        unavailable(
-            f.service
-                .put(context, &f.public, "unauthorized", None, None, true),
-        );
-        unavailable(f.service.delete(context, &f.public, "same"));
+        unavailable(f.service.put(
+            context,
+            &f.public,
+            "unauthorized",
+            None,
+            None,
+            WriteOptions {
+                publish: true,
+                expected_revision: None,
+            },
+        ));
+        unavailable(f.service.delete(context, &f.public, "same", Some(1)));
         unavailable(
             f.service
                 .report(context, &f.public, "same", "report", Some(1), None),
@@ -312,7 +328,7 @@ fn public_authorship_publication_and_moderation_are_explicit() {
             "public text",
             None,
             Some("bob-record"),
-            false
+            WriteOptions::default()
         ),
         Err(ServiceError::InvalidInput(_))
     ));
@@ -323,7 +339,10 @@ fn public_authorship_publication_and_moderation_are_explicit() {
             "public text",
             None,
             Some("bob-record"),
-            true,
+            WriteOptions {
+                publish: true,
+                expected_revision: None,
+            },
         )
         .unwrap();
     assert_eq!(
@@ -341,7 +360,10 @@ fn public_authorship_publication_and_moderation_are_explicit() {
             "corrected public text",
             None,
             Some("bob-record"),
-            true,
+            WriteOptions {
+                publish: true,
+                expected_revision: Some(1),
+            },
         )
         .unwrap();
     unavailable(f.service.put(
@@ -350,9 +372,12 @@ fn public_authorship_publication_and_moderation_are_explicit() {
         "overwrite Alice",
         None,
         Some("same"),
-        true,
+        WriteOptions {
+            publish: true,
+            expected_revision: None,
+        },
     ));
-    unavailable(f.service.delete(&author, &f.public, "same"));
+    unavailable(f.service.delete(&author, &f.public, "same", Some(1)));
     let owner_limited = f.delegated(&f.alice, &f.public, &[Op::Update, Op::Delete, Op::Admin]);
     let owner_limited = f.context(&owner_limited);
     unavailable(f.service.put(
@@ -361,9 +386,15 @@ fn public_authorship_publication_and_moderation_are_explicit() {
         "owner overwrite",
         None,
         Some("bob-record"),
-        true,
+        WriteOptions {
+            publish: true,
+            expected_revision: None,
+        },
     ));
-    unavailable(f.service.delete(&owner_limited, &f.public, "bob-record"));
+    unavailable(
+        f.service
+            .delete(&owner_limited, &f.public, "bob-record", Some(1)),
+    );
     f.service
         .put(
             &f.alice(),
@@ -371,7 +402,10 @@ fn public_authorship_publication_and_moderation_are_explicit() {
             "moderated",
             None,
             Some("bob-record"),
-            true,
+            WriteOptions {
+                publish: true,
+                expected_revision: Some(2),
+            },
         )
         .unwrap();
     assert_eq!(
@@ -383,10 +417,12 @@ fn public_authorship_publication_and_moderation_are_explicit() {
         Some(f.bob.as_str())
     );
     f.service
-        .delete(&f.alice(), &f.public, "bob-record")
+        .delete(&f.alice(), &f.public, "bob-record", Some(3))
         .unwrap();
     let author = f.context(&contributor);
-    f.service.delete(&author, &f.public, "bob-record").unwrap(); // tombstone retains ownership
+    f.service
+        .delete(&author, &f.public, "bob-record", Some(3))
+        .unwrap(); // tombstone retains ownership
     assert!(f
         .service
         .put(
@@ -395,7 +431,10 @@ fn public_authorship_publication_and_moderation_are_explicit() {
             "resurrect",
             None,
             Some("bob-record"),
-            true
+            WriteOptions {
+                publish: true,
+                expected_revision: None
+            }
         )
         .is_err());
 }
@@ -406,14 +445,25 @@ fn contribute_does_not_grant_update_even_to_the_original_author() {
     let key = f.delegated(&f.bob, &f.a, &[Op::Contribute]);
     let writer = f.context(&key);
     f.service
-        .put(&writer, &f.a, "Bob's record", None, Some("bob"), false)
+        .put(
+            &writer,
+            &f.a,
+            "Bob's record",
+            None,
+            Some("bob"),
+            WriteOptions::default(),
+        )
         .unwrap();
-    unavailable(
-        f.service
-            .put(&writer, &f.a, "correction", None, Some("bob"), false),
-    );
+    unavailable(f.service.put(
+        &writer,
+        &f.a,
+        "correction",
+        None,
+        Some("bob"),
+        WriteOptions::default(),
+    ));
     unavailable(f.service.get(&writer, &f.a, "bob", None));
-    unavailable(f.service.delete(&writer, &f.a, "bob"));
+    unavailable(f.service.delete(&writer, &f.a, "bob", Some(1)));
 }
 
 #[test]
@@ -468,7 +518,9 @@ fn reports_and_attached_receipts_belong_to_the_requesting_principal() {
         f.service
             .reports(&RequestContext::anonymous(), &f.public, "same"),
     );
-    f.service.delete(&alice, &f.public, "same").unwrap();
+    f.service
+        .delete(&alice, &f.public, "same", Some(1))
+        .unwrap();
     assert!(f.service.reports(&bob, &f.public, "same").is_err());
 }
 
@@ -504,7 +556,7 @@ fn local_context_is_neither_anonymous_nor_a_cross_collection_admin() {
             "local text",
             None,
             Some("same"),
-            false,
+            WriteOptions::default(),
         )
         .unwrap();
     assert_eq!(
@@ -531,7 +583,14 @@ fn local_context_is_neither_anonymous_nor_a_cross_collection_admin() {
 fn diagnostics_count_only_the_authorized_collection_after_eviction() {
     let f = Fixture::new(None);
     f.service
-        .put(&f.alice(), &f.a, "extra", None, Some("extra"), false)
+        .put(
+            &f.alice(),
+            &f.a,
+            "extra",
+            None,
+            Some("extra"),
+            WriteOptions::default(),
+        )
         .unwrap();
     assert_eq!(
         f.service.health(&f.alice(), &f.a).unwrap().document_count,
@@ -609,7 +668,10 @@ fn revocation_during_encoding_blocks_search_results_and_record_commits() {
                 "denied update",
                 None,
                 Some("same"),
-                false,
+                WriteOptions {
+                    publish: false,
+                    expected_revision: Some(1),
+                },
             ));
             assert_eq!(f.store.get(&f.a, "same", None).unwrap().revision, 1);
         }
@@ -631,8 +693,18 @@ fn expired_credentials_fail_even_for_public_data() {
         .unwrap();
     unauthenticated(f.service.get(&context, &f.public, "same", None));
     unauthenticated(f.service.search(&context, &f.public, "sentinel", None, 10));
-    unauthenticated(f.service.put(&context, &f.public, "text", None, None, true));
-    unauthenticated(f.service.delete(&context, &f.public, "same"));
+    unauthenticated(f.service.put(
+        &context,
+        &f.public,
+        "text",
+        None,
+        None,
+        WriteOptions {
+            publish: true,
+            expected_revision: None,
+        },
+    ));
+    unauthenticated(f.service.delete(&context, &f.public, "same", Some(1)));
     unauthenticated(
         f.service
             .report(&context, &f.public, "same", "feedback", None, None),
@@ -658,7 +730,7 @@ fn revocation_during_index_recovery_blocks_diagnostics_and_deletes() {
         if diagnostics {
             unauthenticated(f.service.health(&context, &f.a));
         } else {
-            unauthenticated(f.service.delete(&context, &f.a, "same"));
+            unauthenticated(f.service.delete(&context, &f.a, "same", Some(1)));
         }
         assert!(f.store.get(&f.a, "same", None).is_ok());
     }

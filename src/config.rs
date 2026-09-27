@@ -7,8 +7,17 @@ use std::path::PathBuf;
 #[error("{0}")]
 pub struct ConfigError(String);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ServerMode {
+    #[default]
+    Local,
+    Authenticated,
+    Hosted,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
+    pub mode: ServerMode,
     pub data_dir: PathBuf,
     pub encoder: String,
     pub encoder_file: String,
@@ -24,6 +33,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            mode: ServerMode::Local,
             data_dir: PathBuf::from("data"),
             encoder: "none".to_owned(),
             encoder_file: "model_int8.onnx".to_owned(),
@@ -46,6 +56,14 @@ impl Settings {
     pub fn from_vars(vars: HashMap<String, String>) -> Result<Self, ConfigError> {
         let get = |name: &str| vars.get(&format!("PRIORART_{name}")).cloned();
         let mut settings = Self::default();
+        if let Some(value) = get("MODE") {
+            settings.mode = match value.as_str() {
+                "local" => ServerMode::Local,
+                "authenticated" => ServerMode::Authenticated,
+                "hosted" => ServerMode::Hosted,
+                _ => return Err(ConfigError("unknown server mode".into())),
+            };
+        }
         if let Some(value) = get("DATA_DIR") {
             settings.data_dir = PathBuf::from(value);
         }
@@ -85,6 +103,17 @@ impl Settings {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         let invalid = |message: &str| Err(ConfigError(message.to_owned()));
+        if self.mode == ServerMode::Hosted {
+            return invalid("hosted mode is not available");
+        }
+        if self.host != "localhost"
+            && !self
+                .host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+        {
+            return invalid("only loopback hosts are supported until hosted mode is available");
+        }
         if self.max_loaded_indexes == 0 {
             return invalid("max_loaded_indexes must be positive");
         }
@@ -140,6 +169,40 @@ mod tests {
         let blank = Settings::from_vars(vars(&[("PRIORART_ENCODER_THREADS", "")])).unwrap();
         assert_eq!(blank.encoder_threads, None);
         assert!(blank.lexical_only());
+    }
+
+    #[test]
+    fn incomplete_hosted_mode_and_non_loopback_binds_are_rejected() {
+        for mode in ["local", "authenticated"] {
+            for host in ["127.0.0.1", "::1", "localhost"] {
+                assert!(Settings::from_vars(vars(&[
+                    ("PRIORART_MODE", mode),
+                    ("PRIORART_HOST", host)
+                ]))
+                .is_ok());
+            }
+            for host in ["0.0.0.0", "::", "192.168.1.2", "example.com"] {
+                assert!(Settings::from_vars(vars(&[
+                    ("PRIORART_MODE", mode),
+                    ("PRIORART_HOST", host)
+                ]))
+                .is_err());
+            }
+        }
+        assert!(Settings::from_vars(vars(&[("PRIORART_MODE", "hosted")])).is_err());
+        assert!(Settings::from_vars(vars(&[("PRIORART_MODE", "unknown")])).is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            mode: ServerMode::Hosted,
+            data_dir: directory.path().join("unopened"),
+            encoder: "must-not-download".into(),
+            ..Settings::default()
+        };
+        assert!(matches!(
+            crate::service::Service::open(settings),
+            Err(crate::service::OpenError::Config(_))
+        ));
+        assert!(!directory.path().join("unopened").exists());
     }
 
     #[test]

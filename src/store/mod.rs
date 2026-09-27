@@ -31,6 +31,10 @@ pub type Metadata = Map<String, Value>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    #[error("a revision precondition is required")]
+    RevisionRequired,
+    #[error("the revision precondition did not match")]
+    RevisionConflict,
     #[error("no record {record_id}{} in collection {collection_id}", revision.map(|r| format!(" revision {r}")).unwrap_or_default())]
     RecordNotFound {
         collection_id: String,
@@ -298,6 +302,55 @@ impl Store {
             .ok_or_else(|| StoreError::CollectionNotFound(collection_id.to_owned()))
     }
 
+    /// Bounded discovery, with authorization scope applied in SQL before LIMIT.
+    pub(crate) fn visible_collections(
+        &self,
+        context: &crate::auth::RequestContext,
+        after: &str,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id FROM collections WHERE id > ?1 AND
+             ((?2 AND id = 'local') OR (NOT ?2 AND (visibility = 'public' OR id IN
+             (SELECT collection_id FROM credential_grants WHERE credential_id = ?3
+              AND operation IN ('read', 'admin'))))) ORDER BY id LIMIT ?4",
+        )?;
+        let rows = statement.query_map(
+            (
+                after,
+                context.is_local(),
+                context.credential().map(|c| c.id.as_str()),
+                limit,
+            ),
+            |row| row.get(0),
+        )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub(crate) fn check_delete_revision(
+        &self,
+        collection: &str,
+        record: &str,
+        expected: Option<i64>,
+    ) -> Result<()> {
+        if record_state(&self.connection, collection, record)? == RecordState::Missing {
+            return Err(record_not_found(collection, record, None));
+        }
+        check_revision(&self.connection, collection, record, expected, false)
+    }
+
+    pub(crate) fn check_put_revision(
+        &self,
+        collection: &str,
+        record: Option<&str>,
+        expected: Option<i64>,
+    ) -> Result<()> {
+        if let Some(record) = record {
+            check_revision(&self.connection, collection, record, expected, true)?;
+        }
+        Ok(())
+    }
+
     // Records.
 
     pub fn put(
@@ -307,10 +360,18 @@ impl Store {
         metadata: Option<&Metadata>,
         record_id: Option<&str>,
         author_principal_id: &str,
+        expected_revision: Option<i64>,
     ) -> Result<RecordRef> {
         let now = now();
         let record_id = record_id.map_or_else(new_id, str::to_owned);
         let transaction = self.write()?;
+        check_revision(
+            &transaction,
+            collection_id,
+            &record_id,
+            expected_revision,
+            true,
+        )?;
         let revision = match record_state(&transaction, collection_id, &record_id)? {
             RecordState::Missing => {
                 transaction.execute(
@@ -413,13 +474,34 @@ impl Store {
 
     /// Nulls every revision's text and metadata and tombstones the record.
     /// Returns `false` when it was already deleted.
-    pub fn delete(&self, collection_id: &str, record_id: &str) -> Result<bool> {
+    pub fn delete(
+        &self,
+        collection_id: &str,
+        record_id: &str,
+        expected_revision: Option<i64>,
+    ) -> Result<bool> {
         let transaction = self.write()?;
         match record_state(&transaction, collection_id, record_id)? {
             RecordState::Missing => return Err(record_not_found(collection_id, record_id, None)),
-            RecordState::Deleted => return Ok(false),
+            RecordState::Deleted => {
+                check_revision(
+                    &transaction,
+                    collection_id,
+                    record_id,
+                    expected_revision,
+                    false,
+                )?;
+                return Ok(false);
+            }
             RecordState::Live => {}
         }
+        check_revision(
+            &transaction,
+            collection_id,
+            record_id,
+            expected_revision,
+            false,
+        )?;
         transaction.execute(
             "UPDATE revisions SET text = NULL, metadata = NULL \
              WHERE collection_id = ?1 AND record_id = ?2",
@@ -782,4 +864,30 @@ fn set_index_encoder(
         (collection_id, encoder),
     )?;
     Ok(())
+}
+
+fn check_revision(
+    connection: &Connection,
+    collection: &str,
+    record: &str,
+    expected: Option<i64>,
+    create: bool,
+) -> Result<()> {
+    if create && record_state(connection, collection, record)? == RecordState::Deleted {
+        return Err(StoreError::RecordDeleted {
+            collection_id: collection.into(),
+            record_id: record.into(),
+        });
+    }
+    let latest: Option<i64> = connection.query_row(
+        "SELECT MAX(revision) FROM revisions WHERE collection_id = ?1 AND record_id = ?2",
+        (collection, record),
+        |row| row.get(0),
+    )?;
+    match (latest, expected) {
+        (None, None | Some(0)) if create => Ok(()),
+        (Some(actual), Some(expected)) if actual == expected => Ok(()),
+        (Some(_), None) => Err(StoreError::RevisionRequired),
+        _ => Err(StoreError::RevisionConflict),
+    }
 }

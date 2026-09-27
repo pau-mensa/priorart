@@ -1,4 +1,5 @@
 use priorart::auth::RequestContext;
+use priorart::service::WriteOptions;
 use priorart::store::LOCAL_COLLECTION_ID;
 mod common;
 
@@ -24,7 +25,7 @@ async fn session() -> Session {
             "CUDA illegal address in bf16 attention; fixed by padding head dim.",
             None,
             Some("cuda"),
-            false,
+            WriteOptions::default(),
         )
         .unwrap();
     service
@@ -34,7 +35,7 @@ async fn session() -> Session {
             "NCCL worker never reached the barrier: stray exit() in loader.",
             None,
             Some("nccl"),
-            false,
+            WriteOptions::default(),
         )
         .unwrap();
     let url = common::spawn(service).await;
@@ -141,7 +142,7 @@ async fn search_then_report() {
     let reported = call(
         &session,
         "report_outcome",
-        json!({"record_id": "nccl", "outcome": "same cause, fixed", "search_id": search_id}),
+        json!({"record_id": "nccl", "outcome": "same cause, fixed", "revision": 1, "search_id": search_id}),
     )
     .await;
     assert!(structured(&reported)["id"].is_string());
@@ -162,7 +163,7 @@ async fn contribute_revise_and_delete() {
     let revised = call(
         &session,
         "contribute_experience",
-        json!({"text": "corrected account", "id": id, "metadata": {"lang": "python", "gpu": true}}),
+        json!({"text": "corrected account", "expected_revision": 1, "id": id, "metadata": {"lang": "python", "gpu": true}}),
     )
     .await;
     assert_eq!(structured(&revised), &json!({"id": id, "revision": 2}));
@@ -173,7 +174,12 @@ async fn contribute_revise_and_delete() {
     )
     .await;
     assert_eq!(structured(&filtered)["hits"].as_array().unwrap().len(), 1);
-    let deleted = call(&session, "delete_experience", json!({"id": id})).await;
+    let deleted = call(
+        &session,
+        "delete_experience",
+        json!({"id": id, "expected_revision": 2}),
+    )
+    .await;
     assert_eq!(structured(&deleted), &json!({"id": id, "deleted": true}));
     let gone = call(&session, "get_experience", json!({"id": id})).await;
     assert!(error_text(&gone).contains("record_deleted"));
@@ -183,16 +189,16 @@ async fn contribute_revise_and_delete() {
 async fn server_errors_surface_to_the_model() {
     let session = session().await;
     let missing = call(&session, "get_experience", json!({"id": "nope"})).await;
-    assert!(error_text(&missing).contains("record_not_found"));
+    assert!(error_text(&missing).contains("not_found"));
     let empty = call(&session, "contribute_experience", json!({"text": "   "})).await;
     assert!(error_text(&empty).contains("invalid_input"));
     let bad = call(
         &session,
         "report_outcome",
-        json!({"record_id": "cuda", "outcome": "x", "search_id": "zz"}),
+        json!({"record_id": "cuda", "outcome": "x", "revision": 1, "search_id": "zz"}),
     )
     .await;
-    assert!(error_text(&bad).contains("search_not_found"));
+    assert!(error_text(&bad).contains("not_found"));
 }
 
 #[tokio::test]
@@ -200,7 +206,7 @@ async fn ids_that_would_change_the_url_are_rejected() {
     let session = session().await;
     for id in ["..", ".", "x/reports", "cuda?revision=1", "a#b"] {
         for tool in ["get_experience", "delete_experience"] {
-            let result = call(&session, tool, json!({"id": id})).await;
+            let result = call(&session, tool, json!({"id": id, "expected_revision": 1})).await;
             assert!(error_text(&result).contains("invalid id"), "{tool} {id}");
         }
     }

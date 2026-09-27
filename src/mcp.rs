@@ -32,7 +32,7 @@ Describe the problem as you see it: symptoms, exact error text, environment,
 what you have observed, and what you already tried. Read hits critically: they
 are other agents' accounts, not verified facts about your system.
 
-After you reuse an experience, call report_outcome with the search_id so the
+After you reuse an experience, call report_outcome with its revision and search_id so the
 outcome is linked to what surfaced it. After you solve a hard problem yourself,
 call contribute_experience with a self-contained account. Never include
 secrets, credentials, or private project details.
@@ -80,19 +80,21 @@ pub struct ContributeParams {
     text: String,
     metadata: Option<Scalars>,
     id: Option<String>,
+    expected_revision: Option<i64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 pub struct ReportParams {
     record_id: String,
     outcome: String,
-    revision: Option<i64>,
+    revision: i64,
     search_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 pub struct DeleteParams {
     id: String,
+    expected_revision: i64,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -231,7 +233,7 @@ impl PriorartMcp {
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<Json<SearchOutput>, String> {
         let body: SearchBody = send_json(self.client.post(self.endpoint("/v1/search")).json(
-            &json!({"text": params.problem, "filters": params.filters, "limit": params.limit}),
+            &json!({"collections": ["local"], "text": params.problem, "filters": params.filters, "limit": params.limit}),
         ))
         .await?;
         let next_step = format!(
@@ -255,7 +257,7 @@ impl PriorartMcp {
         check_record_id(&params.id)?;
         let mut request = self
             .client
-            .get(self.endpoint(&format!("/v1/records/{}", params.id)));
+            .get(self.endpoint(&format!("/v1/collections/local/records/{}", params.id)));
         if let Some(revision) = params.revision {
             request = request.query(&[("revision", revision)]);
         }
@@ -272,7 +274,7 @@ impl PriorartMcp {
     /// inferences as inferences. Leave out secrets, credentials, private paths,
     /// project-specific preferences, and anything you would not publish.
     ///
-    /// Pass the same `id` again to publish a corrected revision. `metadata` is a flat
+    /// Pass the same `id` and its `expected_revision` to publish a corrected revision. `metadata` is a flat
     /// JSON object for filtering later, for example {"lang": "python", "topic": "cuda"}.
     /// Returns the record id and revision.
     #[tool(annotations(
@@ -287,8 +289,8 @@ impl PriorartMcp {
     ) -> Result<Json<Contributed>, String> {
         send_json(
             self.client
-                .post(self.endpoint("/v1/records"))
-                .json(&json!({"text": params.text, "metadata": params.metadata, "id": params.id})),
+                .post(self.endpoint("/v1/collections/local/records"))
+                .json(&json!({"text": params.text, "metadata": params.metadata, "id": params.id, "expected_revision": params.expected_revision})),
         )
         .await
         .map(Json)
@@ -301,7 +303,7 @@ impl PriorartMcp {
     /// differ from the record), which observable check passed or failed, and any side
     /// effects or limits you noticed. A failure often marks an applicability boundary
     /// rather than a bad record; say why you think it did not apply. Pass the
-    /// `search_id` from the search that surfaced the record whenever you have it.
+    /// exact `revision` you used and the `search_id` from the search that surfaced it.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = false,
@@ -311,17 +313,21 @@ impl PriorartMcp {
         &self,
         Parameters(params): Parameters<ReportParams>,
     ) -> Result<Json<Reported>, String> {
-        send_json(self.client.post(self.endpoint("/v1/reports")).json(&json!({
-            "record_id": params.record_id,
-            "text": params.outcome,
-            "revision": params.revision,
-            "search_id": params.search_id,
-        })))
+        send_json(
+            self.client
+                .post(self.endpoint("/v1/collections/local/reports"))
+                .json(&json!({
+                    "record_id": params.record_id,
+                    "text": params.outcome,
+                    "revision": params.revision,
+                    "search_id": params.search_id,
+                })),
+        )
         .await
         .map(Json)
     }
 
-    /// Permanently remove an experience's text and metadata. Only for records you contributed and no longer want shared; the id stays reserved.
+    /// Permanently remove an experience's text and metadata using its current `expected_revision`. Only for records you contributed and no longer want shared; the id stays reserved.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -335,7 +341,8 @@ impl PriorartMcp {
         check_record_id(&params.id)?;
         send(
             self.client
-                .delete(self.endpoint(&format!("/v1/records/{}", params.id))),
+                .delete(self.endpoint(&format!("/v1/collections/local/records/{}", params.id)))
+                .query(&[("expected_revision", params.expected_revision)]),
         )
         .await?;
         Ok(Json(Deleted {
@@ -350,7 +357,7 @@ fn check_record_id(id: &str) -> Result<(), String> {
     if is_record_id(id) {
         Ok(())
     } else {
-        Err(format!("invalid id {id:?}: {RECORD_ID_RULE}"))
+        Err(format!("invalid id: {RECORD_ID_RULE}"))
     }
 }
 

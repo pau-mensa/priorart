@@ -29,12 +29,11 @@ the Python implementation (release `v0.1.0`, which versioned its schema with
 Schema `v0.3.0` adds credential verifiers, scoped grants, and authentication versions.
 See [local credential administration](credentials.md) for lifecycle and context semantics.
 
-HTTP/MCP still serve a trusted local interface without transport authentication.
-The Rust service enforces [context and collection policy](policy.md), but hosted
-operation remains unavailable. A visibility label alone is not a confidentiality
-guarantee. Encryption at rest is outside the current implementation scope. HTTP
-and MCP are bound to the local collection; neither exposes collection
-provisioning or selection. Keep the server behind a trusted local boundary.
+HTTP v1 accepts header credentials and explicit collection scopes under
+[context and collection policy](policy.md). Local and authenticated modes are
+loopback-only; hosted operation remains disabled. Encryption at rest is outside
+the implementation scope. Collection provisioning requires local administration;
+MCP currently targets `local`. Keep the server behind a trusted local boundary.
 
 ## Collection identities and references
 
@@ -49,14 +48,16 @@ The same client-chosen record ID may exist independently in several collections.
 Every content and index-mirror method takes the collection explicitly, and logged
 search hits carry no collection of their own: they belong to the search's
 collection. Record authorship is separate from collection ownership and is not
-changed by an update.
+changed by an update. Writes/deletes compare an expected revision inside their
+immediate SQLite transaction; stale updates and explicit create collisions fail
+without appending a revision. This does not make independent index writers safe.
 
 Composite primary and foreign keys scope revisions, reports, search hits, and index
 mirror entries to their collection and exact target revision. Report revisions are
 nullable. Index state is keyed by collection and key; internal vector IDs are unique
 within a collection only. The trusted index API accepts an explicit existing
 collection; it does not provide authorization. Service policy authorizes before
-index loading or recovery. HTTP/MCP still select only `local`.
+index loading or recovery. HTTP selects explicit collections; the bundled MCP client selects `local`.
 
 The service uses a collection-index manager with lazy loading and LRU eviction.
 `PRIORART_MAX_LOADED_INDEXES` defaults to 8 and must be positive. Eviction releases

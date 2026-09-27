@@ -58,19 +58,20 @@ without ONNX Runtime; configuring an encoder in that build is a startup error.
 ## Quickstart
 
 ```bash
-curl -s localhost:8000/v1/records -H 'content-type: application/json' -d '{
+curl -s localhost:8000/v1/collections/local/records -H 'content-type: application/json' -d '{
   "text": "NCCL watchdog timeout after epoch 1. Rank 3 had exited early: a stray sys.exit() in a data loader worker. Removed it; all ranks reach the barrier; training completes.",
   "metadata": {"topic": "distributed", "lang": "python"}
 }'
-# {"id":"3f9c…","revision":1}
+# {"collection_id":"local","id":"3f9c…","revision":1}
 
 curl -s localhost:8000/v1/search -H 'content-type: application/json' -d '{
+  "collections": ["local"],
   "text": "multi-GPU training hangs at the end of the first epoch, no error, GPU util drops to zero",
   "limit": 3
 }'
 # {"search_id":"…","hits":[{"id":"3f9c…","revision":1,"score":…,"excerpt":"…"}],…}
 
-curl -s localhost:8000/v1/reports -H 'content-type: application/json' -d '{
+curl -s localhost:8000/v1/collections/local/reports -H 'content-type: application/json' -d '{
   "record_id": "3f9c…", "revision": 1, "search_id": "…",
   "text": "Same cause here (torchrun, 4xA100, torch 2.8). Removing the exit fixed it."
 }'
@@ -113,6 +114,7 @@ session must go through the one server.
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `PRIORART_MODE` | `local` | `local` identity or `authenticated` header access; both loopback-only; `hosted` is disabled |
 | `PRIORART_DATA_DIR` | `./data` | SQLite file and vector store location |
 | `PRIORART_ENCODER` | `none` | Hub id or local directory of a pylate-onnx-export artifact, or `none` for lexical-only |
 | `PRIORART_ENCODER_FILE` | `model_int8.onnx` | which ONNX graph in that repository to load |
@@ -121,7 +123,7 @@ session must go through the one server.
 | `PRIORART_GATHER_LIMIT` | `500` | exhaustive MaxSim up to this many eligible records, BM25 candidates beyond |
 | `PRIORART_MAX_LOADED_INDEXES` | `8` | maximum resident collection indexes (LRU eviction; count, not a byte limit) |
 | `PRIORART_MAX_TEXT_BYTES` | `262144` | maximum size of one record |
-| `PRIORART_HOST` / `PRIORART_PORT` | `127.0.0.1` / `8000` | bind address |
+| `PRIORART_HOST` / `PRIORART_PORT` | `127.0.0.1` / `8000` | loopback bind address |
 
 ## Local credentials
 
@@ -129,18 +131,24 @@ session must go through the one server.
 for the local principal and prints its secret once. Local commands also list,
 rotate, revoke, and replace grants. See [credential administration](docs/credentials.md).
 The Rust service enforces [collection and object policy](docs/policy.md) on explicit
-request contexts. HTTP/MCP authentication remains future work; creating a key does
-not secure the current local endpoints.
+request contexts. Start with `PRIORART_MODE=authenticated priorart serve` to require
+header credentials for restricted content and mutations. Public reads can be anonymous.
+Send credentials only in `Authorization: Bearer …`; invalid supplied keys always fail.
+The default local mode grants requests without credentials access to `local` only.
+`priorart admin create-collection` provisions a restricted collection; add
+`--visibility public` for an explicitly public collection. The bundled MCP client
+currently targets local mode; configurable authenticated MCP access is step 13.
 
 ## Limitations of this version
 
 For database upgrades and recovery behavior, see [storage versions](docs/storage.md).
 
-- HTTP/MCP have no authentication or rate limiting yet. Bind to localhost or use a
-  proxy you control.
-- Persistence is collection-scoped, but HTTP/MCP still serve only the local
-  collection. Restricted visibility does not yet provide access control. Storage
-  is unencrypted.
+- Hosted mode is disabled. Local and authenticated HTTP modes are loopback-only;
+  do not expose them through a proxy. Per-request limits exist, but rate limiting,
+  hosted admission, and full deletion guarantees remain future work.
+- HTTP requests select an explicit collection; search currently accepts exactly
+  one collection. Storage is access-controlled by the trusted service and remains
+  unencrypted.
 - One indexed view per record, truncated by the encoder at 2048 tokens for
   LateOn-Code. Chunking is planned as an internal derived view.
 - Writes index synchronously under one lock; a put returns when it is
@@ -150,7 +158,7 @@ For database upgrades and recovery behavior, see [storage versions](docs/storage
   compares the database, index mirror, and vector store and rebuilds the index
   from SQLite on any disagreement.
 - Authenticated/local searches still log query text; anonymous public searches
-  through the Rust service persist nothing. There is no retention policy yet.
+  persist nothing. There is no retention policy yet.
 - Reports are stored and returned, not scored. Voting is not correctness.
 
 ## Contributing

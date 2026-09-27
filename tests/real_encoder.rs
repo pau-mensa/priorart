@@ -3,6 +3,7 @@
 //! default: `cargo test --release --test real_encoder -- --ignored`.
 //! The first run downloads about 150 MB.
 use priorart::auth::RequestContext;
+use priorart::service::WriteOptions;
 use priorart::store::LOCAL_COLLECTION_ID;
 
 use std::sync::{Arc, OnceLock};
@@ -71,7 +72,7 @@ fn end_to_end() {
             "torch.compile recompiles every step because a Python int changes; mark it dynamic.",
             None,
             Some("compile"),
-            false,
+            WriteOptions::default(),
         )
         .unwrap();
     service
@@ -81,7 +82,7 @@ fn end_to_end() {
             "NCCL watchdog timeout: rank 3 exited early from a stray sys.exit in the data loader.",
             None,
             Some("nccl"),
-            false,
+            WriteOptions::default(),
         )
         .unwrap();
     let outcome = service

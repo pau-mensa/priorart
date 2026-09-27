@@ -357,10 +357,10 @@ impl Index {
     }
 
     fn reconcile(&mut self, store: &Store, result: Result<()>) -> Result<()> {
-        let Err(error) = result else {
+        let Err(_) = result else {
             return Ok(());
         };
-        eprintln!("priorart: index update failed ({error}); rebuilding from the store");
+        eprintln!("priorart: index update failed; rebuilding from the store");
         self.stale = true;
         self.rebuild(store)
     }

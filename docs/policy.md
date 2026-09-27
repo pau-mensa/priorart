@@ -2,9 +2,11 @@
 
 Every content operation on `Service` now takes an explicit `RequestContext` and
 collection ID. There is no default collection or omitted-scope search in the Rust
-service API. HTTP/MCP still use the explicit local principal and `local` collection;
-they do not yet accept credentials or expose collection selection. Hosted operation
-remains unavailable pending the later transport, privacy, and deletion steps.
+service API. HTTP v1 authenticates header credentials and selects explicit collections.
+Its default local mode gives requests without credentials access to `local` only;
+authenticated mode uses anonymous public reads as its credential-free default.
+MCP currently selects `local`. Hosted operation remains disabled pending privacy,
+resource accounting, and deletion work.
 
 The policy follows the [deny-by-default and per-request validation guidance](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html).
 The low-level `Store` and `Index` APIs remain trusted persistence/retrieval primitives;
@@ -48,14 +50,15 @@ immutable, and no operation automatically republishes restricted content.
 
 Reports remain private even on public records. An owner/moderator cannot read another
 requester's reports. Deleted targets do not expose reports through the service.
-An omitted report revision currently resolves to the latest live revision; explicit
-revision requirements and verifying receipt hit membership are later protocol/privacy
-work. Unknown and someone else's receipt IDs produce the same missing-receipt error.
+HTTP requires an exact report revision; trusted service callers may still omit one
+to resolve the latest live revision. Verifying receipt hit membership is step 9. Unknown and someone else's receipt IDs produce the same missing-receipt error.
 
 Anonymous searches return `search_id: None` and persist no query or receipt.
 Authenticated/local searches still use the existing raw query log. Minimal receipts,
 retention, complete deletion, export, and public report publication are later steps.
-No new export, collection-management, or background-job API is introduced here.
+Collection discovery requires read or admin access and applies its scope before
+pagination. Provisioning remains local administration; no remote creation, export,
+collection deletion, or background-job API is available.
 
 ## Delegation across principals
 
@@ -90,3 +93,15 @@ Requests within one `Service` remain serialized under its mutex. External creden
 administration can revoke while encoding/retrieval runs, and regression tests exercise
 that boundary. Direct concurrent content writes through the trusted `Store` API remain
 unsupported; they bypass both policy and in-memory index coordination.
+
+## Revision preconditions
+
+`Service::put` takes `WriteOptions { publish, expected_revision }`. A new record
+allows no precondition or `Some(0)` (explicit absence). Existing updates require
+`Some(current_revision)`; no precondition returns `RevisionRequired`, and stale
+preconditions or explicit create collisions return `RevisionConflict`. An explicit
+create requires contribute, while an update requires update and authorship/moderation.
+`Service::delete` requires the current revision, including on repeat tombstone deletes.
+Checks follow policy, precede index work, and run again inside the SQLite mutation
+transaction. They prevent lost record updates; they do not coordinate independent
+processes' indexes or provide retry idempotency.

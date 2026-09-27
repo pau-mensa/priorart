@@ -1,9 +1,10 @@
 # Local credential administration
 
-Credential lifecycle and [service policy](policy.md) are implemented. HTTP/MCP
-content operations still use the explicit local principal and local collection
-without transport authentication. Issuing a key does not protect those interfaces;
-transport authentication is a subsequent step. Hosted operation remains unavailable.
+Credential lifecycle, [service policy](policy.md), and [HTTP header authentication](protocol.md)
+are implemented. `PRIORART_MODE=authenticated` enables credential-based access with
+anonymous public reads; default `local` mode uses the local principal when no key
+is supplied. Invalid supplied keys always fail. Both modes are loopback-only;
+hosted operation is disabled. MCP currently supports the local workflow only.
 
 ## Bootstrap and administration
 

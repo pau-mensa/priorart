@@ -1,4 +1,5 @@
 use priorart::auth::RequestContext;
+use priorart::service::WriteOptions;
 mod common;
 
 use std::sync::Arc;
@@ -53,7 +54,14 @@ fn seeded() -> (TempDir, Service) {
     for (record, text) in DOCS {
         let tags = metadata(json!({"kind": "fix", "topic": record}));
         service
-            .put(&CALLER, LOCAL, text, Some(&tags), Some(record), false)
+            .put(
+                &CALLER,
+                LOCAL,
+                text,
+                Some(&tags),
+                Some(record),
+                WriteOptions::default(),
+            )
             .unwrap();
     }
     (directory, service)
@@ -98,7 +106,10 @@ fn an_update_supersedes() {
             "completely different: rust borrow checker lifetime",
             None,
             Some("nccl"),
-            false,
+            WriteOptions {
+                publish: false,
+                expected_revision: Some(1),
+            },
         )
         .unwrap();
     assert_eq!(revision, 2);
@@ -126,7 +137,7 @@ fn an_update_supersedes() {
 #[test]
 fn delete_hides() {
     let (_directory, service) = seeded();
-    service.delete(&CALLER, LOCAL, "nccl").unwrap();
+    service.delete(&CALLER, LOCAL, "nccl", Some(1)).unwrap();
     let outcome = service
         .search(&CALLER, LOCAL, "worker never reached barrier", None, 10)
         .unwrap();
@@ -135,9 +146,9 @@ fn delete_hides() {
         service.get(&CALLER, LOCAL, "nccl", None),
         Err(ServiceError::Store(StoreError::RecordDeleted { .. }))
     ));
-    service.delete(&CALLER, LOCAL, "nccl").unwrap();
+    service.delete(&CALLER, LOCAL, "nccl", Some(1)).unwrap();
     assert!(matches!(
-        service.delete(&CALLER, LOCAL, "missing"),
+        service.delete(&CALLER, LOCAL, "missing", Some(1)),
         Err(ServiceError::Store(StoreError::RecordNotFound { .. }))
     ));
 }
@@ -178,7 +189,14 @@ fn the_gather_limit_switches_to_bm25() {
     .unwrap();
     for (record, text) in DOCS {
         service
-            .put(&CALLER, LOCAL, text, None, Some(record), false)
+            .put(
+                &CALLER,
+                LOCAL,
+                text,
+                None,
+                Some(record),
+                WriteOptions::default(),
+            )
             .unwrap();
     }
     let outcome = service
@@ -205,10 +223,24 @@ fn lexical_only_mode() {
     let directory = tempfile::tempdir().unwrap();
     let service = Service::new(settings(&directory), None).unwrap();
     service
-        .put(&CALLER, LOCAL, DOCS[0].1, None, Some("cuda"), false)
+        .put(
+            &CALLER,
+            LOCAL,
+            DOCS[0].1,
+            None,
+            Some("cuda"),
+            WriteOptions::default(),
+        )
         .unwrap();
     service
-        .put(&CALLER, LOCAL, DOCS[2].1, None, Some("nccl"), false)
+        .put(
+            &CALLER,
+            LOCAL,
+            DOCS[2].1,
+            None,
+            Some("nccl"),
+            WriteOptions::default(),
+        )
         .unwrap();
     let outcome = service.search(&CALLER, LOCAL, "barrier", None, 10).unwrap();
     assert_eq!(outcome.hits[0].id, "nccl");
@@ -269,16 +301,21 @@ fn reports() {
 #[test]
 fn validation() {
     let (_directory, service) = seeded();
-    assert!(invalid(
-        service.put(&CALLER, LOCAL, "   ", None, None, false)
-    ));
+    assert!(invalid(service.put(
+        &CALLER,
+        LOCAL,
+        "   ",
+        None,
+        None,
+        WriteOptions::default()
+    )));
     assert!(invalid(service.put(
         &CALLER,
         LOCAL,
         &"x".repeat(300_000),
         None,
         None,
-        false
+        WriteOptions::default()
     )));
     assert!(invalid(service.put(
         &CALLER,
@@ -286,7 +323,7 @@ fn validation() {
         "ok",
         None,
         Some("bad id with spaces"),
-        false
+        WriteOptions::default()
     )));
     assert!(invalid(service.put(
         &CALLER,
@@ -294,7 +331,7 @@ fn validation() {
         "ok",
         None,
         Some(&"x".repeat(129)),
-        false
+        WriteOptions::default()
     )));
     assert!(invalid(service.put(
         &CALLER,
@@ -302,7 +339,7 @@ fn validation() {
         "ok",
         None,
         Some("."),
-        false
+        WriteOptions::default()
     )));
     assert!(invalid(service.put(
         &CALLER,
@@ -310,10 +347,17 @@ fn validation() {
         "ok",
         None,
         Some(".."),
-        false
+        WriteOptions::default()
     )));
     service
-        .put(&CALLER, LOCAL, "ok", None, Some("..."), false)
+        .put(
+            &CALLER,
+            LOCAL,
+            "ok",
+            None,
+            Some("..."),
+            WriteOptions::default(),
+        )
         .unwrap();
     assert!(invalid(service.search(&CALLER, LOCAL, "   ", None, 10)));
     assert!(invalid(service.search(&CALLER, LOCAL, "ok", None, 0)));
@@ -348,7 +392,14 @@ fn reopening_keeps_data() {
     let directory = tempfile::tempdir().unwrap();
     let service = Service::new(settings(&directory), fake()).unwrap();
     service
-        .put(&CALLER, LOCAL, DOCS[2].1, None, Some("nccl"), false)
+        .put(
+            &CALLER,
+            LOCAL,
+            DOCS[2].1,
+            None,
+            Some("nccl"),
+            WriteOptions::default(),
+        )
         .unwrap();
     drop(service);
     let reopened = Service::new(settings(&directory), fake()).unwrap();
@@ -377,6 +428,7 @@ fn the_local_service_never_reads_other_collections() {
             None,
             Some("hidden"),
             LOCAL_PRINCIPAL_ID,
+            None,
         )
         .unwrap();
     drop(store);
@@ -389,7 +441,7 @@ fn the_local_service_never_reads_other_collections() {
             "local searchable sentinel",
             None,
             Some("local-record"),
-            false,
+            WriteOptions::default(),
         )
         .unwrap();
     assert_eq!(service.health(&CALLER, LOCAL).unwrap().document_count, 1);
@@ -426,7 +478,14 @@ fn an_encoder_failure_writes_nothing() {
     let encoder = Arc::new(FakeEncoder::new());
     let service = Service::new(settings(&directory), Some(encoder.clone())).unwrap();
     service
-        .put(&CALLER, LOCAL, DOCS[0].1, None, Some("cuda"), false)
+        .put(
+            &CALLER,
+            LOCAL,
+            DOCS[0].1,
+            None,
+            Some("cuda"),
+            WriteOptions::default(),
+        )
         .unwrap();
     encoder.set_failing(true);
     assert!(matches!(
@@ -436,12 +495,22 @@ fn an_encoder_failure_writes_nothing() {
             "replacement text",
             None,
             Some("cuda"),
-            false
+            WriteOptions {
+                publish: false,
+                expected_revision: Some(1)
+            }
         ),
         Err(ServiceError::Index(_))
     ));
     assert!(service
-        .put(&CALLER, LOCAL, DOCS[1].1, None, Some("pytest"), false)
+        .put(
+            &CALLER,
+            LOCAL,
+            DOCS[1].1,
+            None,
+            Some("pytest"),
+            WriteOptions::default()
+        )
         .is_err());
     encoder.set_failing(false);
     assert_eq!(
@@ -466,7 +535,7 @@ fn a_failed_index_step_is_rebuilt_before_the_next_search() {
     let set_mode =
         |mode| std::fs::set_permissions(&vectors, std::fs::Permissions::from_mode(mode)).unwrap();
     set_mode(0o555);
-    let deleted = service.delete(&CALLER, LOCAL, "nccl");
+    let deleted = service.delete(&CALLER, LOCAL, "nccl", Some(1));
     let search = service.search(&CALLER, LOCAL, "worker never reached barrier", None, 10);
     set_mode(0o755);
     assert!(matches!(deleted, Err(ServiceError::Index(_))));

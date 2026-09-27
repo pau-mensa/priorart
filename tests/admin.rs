@@ -91,3 +91,36 @@ fn local_admin_requires_explicit_scope_and_does_not_echo_invalid_ids() {
         .unwrap()
         .contains(sentinel));
 }
+
+#[test]
+fn local_collection_provisioning_defaults_to_restricted() {
+    let directory = tempfile::tempdir().unwrap();
+    for (arguments, visibility) in [
+        (vec!["create-collection"], "restricted"),
+        (
+            vec!["create-collection", "--visibility", "public"],
+            "public",
+        ),
+    ] {
+        let output = admin(&directory, &arguments);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let id = String::from_utf8(output.stdout).unwrap();
+        let store = Store::open(directory.path().join(DATABASE_FILE)).unwrap();
+        let collection = store.get_collection(id.trim()).unwrap();
+        assert_eq!(collection.visibility.as_str(), visibility);
+        assert_eq!(
+            collection.owner_account_id,
+            priorart::store::LOCAL_ACCOUNT_ID
+        );
+    }
+    assert!(!admin(
+        &directory,
+        &["create-collection", "--visibility", "unknown"]
+    )
+    .status
+    .success());
+}

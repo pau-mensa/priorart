@@ -1,6 +1,7 @@
 use priorart::auth::RequestContext;
 use priorart::auth::{AuthError, Grant, Operation, MAX_CREDENTIAL_DEPTH, MAX_GRANTS};
 use priorart::config::Settings;
+use priorart::service::WriteOptions;
 use priorart::service::{Service, DATABASE_FILE};
 use priorart::store::LOCAL_COLLECTION_ID;
 use priorart::store::{
@@ -398,7 +399,7 @@ fn service_context_revalidation_observes_local_administration() {
             "local",
             None,
             Some("record"),
-            false,
+            WriteOptions::default(),
         )
         .unwrap();
     assert_eq!(

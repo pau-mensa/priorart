@@ -1,361 +1,494 @@
-//! HTTP transport for the protocol. See `docs/protocol.md`.
+//! Collection-aware HTTP transport. Credentials are accepted only in headers.
+use std::{net::SocketAddr, sync::Arc};
 
-use crate::auth::{AuthError, RequestContext};
-use crate::policy::PolicyError;
-use crate::store::LOCAL_COLLECTION_ID;
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use axum::{
+    extract::{
+        rejection::{JsonRejection, PathRejection, QueryRejection},
+        ConnectInfo, DefaultBodyLimit, Path, Query, Request, State,
+    },
+    http::{header::AUTHORIZATION, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Extension, Json, Router,
+};
+use serde::Deserialize;
+use serde_json::{json, Value};
 
-use axum::extract::rejection::{JsonRejection, QueryRejection};
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use crate::{
+    auth::{AuthError, RequestContext},
+    config::ServerMode,
+    policy::PolicyError,
+    service::{is_record_id, Service, ServiceError, WriteOptions},
+    store::{Collection, Metadata, StoreError},
+};
 
-use crate::service::{Health, Service, ServiceError};
-use crate::store::{Metadata, StoreError};
-
-pub struct ApiError {
-    status: StatusCode,
-    code: &'static str,
-    message: String,
-}
-
+pub struct ApiError(StatusCode, &'static str, &'static str);
 impl ApiError {
-    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            status,
-            code,
-            message: message.into(),
-        }
+    fn invalid() -> Self {
+        Self(StatusCode::BAD_REQUEST, "invalid_input", "invalid request")
     }
-
-    fn validation(message: String) -> Self {
-        Self::new(
+    fn validation() -> Self {
+        Self(
             StatusCode::UNPROCESSABLE_ENTITY,
             "validation_error",
-            message,
+            "request does not match the schema",
+        )
+    }
+    fn unauthenticated() -> Self {
+        Self(
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated",
+            "a valid credential is required",
+        )
+    }
+    fn not_found() -> Self {
+        Self(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "requested resource is unavailable",
+        )
+    }
+    fn unavailable() -> Self {
+        Self(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "service is unavailable",
         )
     }
 }
-
 impl From<ServiceError> for ApiError {
     fn from(error: ServiceError) -> Self {
-        let message = error.to_string();
         match error {
-            ServiceError::Policy(PolicyError::Unavailable) => {
-                Self::new(StatusCode::NOT_FOUND, "resource_unavailable", message)
-            }
             ServiceError::Policy(PolicyError::Authentication(AuthError::Unauthenticated)) => {
-                Self::new(StatusCode::UNAUTHORIZED, "unauthenticated", message)
+                Self::unauthenticated()
             }
-            ServiceError::InvalidInput(_) => {
-                Self::new(StatusCode::BAD_REQUEST, "invalid_input", message)
-            }
-            ServiceError::Store(StoreError::RecordNotFound { .. }) => {
-                Self::new(StatusCode::NOT_FOUND, "record_not_found", message)
-            }
-            ServiceError::Store(StoreError::SearchNotFound { .. }) => {
-                Self::new(StatusCode::NOT_FOUND, "search_not_found", message)
-            }
+            ServiceError::Policy(PolicyError::Unavailable)
+            | ServiceError::Store(
+                StoreError::RecordNotFound { .. }
+                | StoreError::SearchNotFound { .. }
+                | StoreError::CollectionNotFound(_),
+            ) => Self::not_found(),
+            ServiceError::InvalidInput(_) => Self::invalid(),
             ServiceError::Store(StoreError::RecordDeleted { .. }) => {
-                Self::new(StatusCode::GONE, "record_deleted", message)
+                Self(StatusCode::GONE, "record_deleted", "record was deleted")
             }
-            _ => {
-                eprintln!("priorart: internal error: {message}");
-                Self::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal_error",
-                    "the server failed to complete the request",
-                )
-            }
+            ServiceError::Store(StoreError::RevisionRequired) => Self(
+                StatusCode::PRECONDITION_REQUIRED,
+                "revision_required",
+                "a revision precondition is required",
+            ),
+            ServiceError::Store(StoreError::RevisionConflict) => Self(
+                StatusCode::CONFLICT,
+                "revision_conflict",
+                "revision precondition did not match",
+            ),
+            _ => Self::unavailable(),
         }
     }
 }
-
 impl From<JsonRejection> for ApiError {
-    fn from(rejection: JsonRejection) -> Self {
-        Self::validation(rejection.body_text())
+    fn from(error: JsonRejection) -> Self {
+        if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            Self(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                "request body is too large",
+            )
+        } else {
+            Self::validation()
+        }
     }
 }
-
 impl From<QueryRejection> for ApiError {
-    fn from(rejection: QueryRejection) -> Self {
-        Self::validation(rejection.body_text())
+    fn from(_: QueryRejection) -> Self {
+        Self::validation()
     }
 }
-
+impl From<PathRejection> for ApiError {
+    fn from(_: PathRejection) -> Self {
+        Self::invalid()
+    }
+}
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = json!({"error": {"code": self.code, "message": self.message}});
-        (self.status, Json(body)).into_response()
+        (
+            self.0,
+            Json(json!({"error": {"code": self.1, "message": self.2}})),
+        )
+            .into_response()
     }
 }
-
 type ApiResult<T> = Result<T, ApiError>;
 
-/// Runs a service call on the blocking pool: calls hold the service lock and
-/// may encode or rewrite the vector store.
-async fn blocking<T, F>(service: &Arc<Service>, call: F) -> ApiResult<T>
-where
-    T: Send + 'static,
-    F: FnOnce(&Service) -> Result<T, ServiceError> + Send + 'static,
-{
+async fn blocking<T: Send + 'static>(
+    service: &Arc<Service>,
+    call: impl FnOnce(&Service) -> Result<T, ServiceError> + Send + 'static,
+) -> ApiResult<T> {
     let service = service.clone();
     tokio::task::spawn_blocking(move || call(&service))
         .await
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                "the server failed to complete the request",
-            )
-        })?
-        .map_err(ApiError::from)
+        .map_err(|_| ApiError::unavailable())?
+        .map_err(Into::into)
+}
+
+/// Missing credentials have meaning only in the explicitly selected local mode.
+/// Supplied invalid credentials never fall back to local or anonymous authority.
+async fn authenticate(
+    State(service): State<Arc<Service>>,
+    mut request: Request,
+    next: Next,
+) -> ApiResult<Response> {
+    if service.settings().mode == ServerMode::Hosted
+        || !request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .is_some_and(|peer| peer.0.ip().is_loopback())
+    {
+        return Err(ApiError::unavailable());
+    }
+    if request
+        .headers()
+        .keys()
+        .any(|name| name == "forwarded" || name.as_str().starts_with("x-forwarded-"))
+    {
+        return Err(ApiError::invalid());
+    }
+    let headers: Vec<_> = request.headers().get_all(AUTHORIZATION).iter().collect();
+    let context = match headers.as_slice() {
+        [] => match service.settings().mode {
+            ServerMode::Local => RequestContext::local(),
+            ServerMode::Authenticated => RequestContext::anonymous(),
+            ServerMode::Hosted => return Err(ApiError::unavailable()),
+        },
+        [header] => {
+            let value = header.to_str().map_err(|_| ApiError::unauthenticated())?;
+            let (scheme, token) = value
+                .split_once(' ')
+                .ok_or_else(ApiError::unauthenticated)?;
+            if !scheme.eq_ignore_ascii_case("bearer")
+                || token.len() > 256
+                || token.is_empty()
+                || token.bytes().any(|b| b.is_ascii_whitespace())
+            {
+                return Err(ApiError::unauthenticated());
+            }
+            let token = token.to_owned();
+            blocking(&service, move |service| {
+                service
+                    .authenticate(&token)
+                    .map_err(|e| ServiceError::Policy(PolicyError::Authentication(e)))
+            })
+            .await?
+        }
+        _ => return Err(ApiError::unauthenticated()),
+    };
+    request.headers_mut().remove(AUTHORIZATION);
+    if !matches!(
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD
+    ) && context.principal_id().is_none()
+    {
+        // Public search is the only anonymous POST operation.
+        if request.uri().path() != "/v1/search" {
+            return Err(ApiError::unauthenticated());
+        }
+    }
+    request.extensions_mut().insert(context);
+    Ok(next.run(request).await)
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PutRequest {
     text: String,
     metadata: Option<Metadata>,
     id: Option<String>,
+    expected_revision: Option<i64>,
+    #[serde(default)]
+    publish: bool,
 }
-
-#[derive(Serialize)]
-struct PutResponse {
-    id: String,
-    revision: i64,
-}
-
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RevisionQuery {
     revision: Option<i64>,
 }
-
-#[derive(Serialize)]
-struct RecordResponse {
-    id: String,
-    revision: i64,
-    text: String,
-    metadata: Option<Metadata>,
-    created_at: String,
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteQuery {
+    expected_revision: Option<i64>,
 }
-
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyQuery {}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListQuery {
+    #[serde(default)]
+    after: String,
+    #[serde(default = "default_page_size")]
+    limit: i64,
+}
+fn default_page_size() -> i64 {
+    50
+}
 fn default_limit() -> i64 {
     10
 }
-
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SearchRequest {
+    collections: Vec<String>,
     text: String,
     filters: Option<Metadata>,
     #[serde(default = "default_limit")]
     limit: i64,
 }
-
-#[derive(Serialize)]
-struct HitResponse {
-    id: String,
-    revision: i64,
-    score: f64,
-    score_semantics: String,
-    excerpt: String,
-    metadata: Option<Metadata>,
-}
-
-#[derive(Serialize)]
-struct SearchResponse {
-    search_id: Option<String>,
-    hits: Vec<HitResponse>,
-    timings: BTreeMap<String, f64>,
-    gatherer: String,
-}
-
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReportRequest {
     record_id: String,
     text: String,
-    revision: Option<i64>,
+    revision: i64,
     search_id: Option<String>,
-}
-
-#[derive(Serialize)]
-struct ReportCreated {
-    id: String,
-}
-
-#[derive(Serialize)]
-struct ReportResponse {
-    id: String,
-    record_id: String,
-    revision: Option<i64>,
-    search_id: Option<String>,
-    text: String,
-    created_at: String,
-}
-
-#[derive(Serialize)]
-struct ReportsResponse {
-    reports: Vec<ReportResponse>,
-}
-
-/// Room for a maximal text with worst-case JSON escaping (`\u0000` is six
-/// bytes per byte) plus metadata, so `PRIORART_MAX_TEXT_BYTES` is the limit
-/// that applies.
-fn body_limit(max_text_bytes: usize) -> usize {
-    max_text_bytes.saturating_mul(6).saturating_add(1 << 20)
 }
 
 pub fn router(service: Arc<Service>) -> Router {
-    let limit = body_limit(service.settings().max_text_bytes);
+    let limit = service
+        .settings()
+        .max_text_bytes
+        .saturating_mul(6)
+        .saturating_add(65_536);
     Router::new()
         .route("/healthz", get(healthz))
-        .route("/v1/records", post(put_record))
-        .route("/v1/records/{id}", get(get_record).delete(delete_record))
-        .route("/v1/records/{id}/reports", get(list_reports))
+        .route("/v1/collections", get(collections))
+        .route("/v1/collections/{collection}", get(collection))
+        .route("/v1/collections/{collection}/diagnostics", get(diagnostics))
+        .route("/v1/collections/{collection}/records", post(put_record))
+        .route(
+            "/v1/collections/{collection}/records/{id}",
+            get(get_record).delete(delete_record),
+        )
+        .route(
+            "/v1/collections/{collection}/records/{id}/reports",
+            get(list_reports),
+        )
+        .route("/v1/collections/{collection}/reports", post(report))
         .route("/v1/search", post(search))
-        .route("/v1/reports", post(report))
+        .fallback(|| async { ApiError::not_found() })
+        .method_not_allowed_fallback(|| async {
+            ApiError(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method_not_allowed",
+                "method is not supported",
+            )
+        })
         .layer(DefaultBodyLimit::max(limit))
+        .layer(middleware::from_fn_with_state(
+            service.clone(),
+            authenticate,
+        ))
         .with_state(service)
 }
-
-async fn healthz(State(service): State<Arc<Service>>) -> ApiResult<Json<Health>> {
-    blocking(&service, |service| {
-        service.health(&RequestContext::local(), LOCAL_COLLECTION_ID)
-    })
-    .await
-    .map(Json)
+fn identifier(id: &str) -> ApiResult<()> {
+    if is_record_id(id) {
+        Ok(())
+    } else {
+        Err(ApiError::invalid())
+    }
 }
-
+fn positive(revision: Option<i64>) -> ApiResult<()> {
+    if revision.is_some_and(|r| r <= 0) {
+        Err(ApiError::invalid())
+    } else {
+        Ok(())
+    }
+}
+fn collection_json(c: Collection) -> Value {
+    json!({"id": c.id, "visibility": c.visibility.as_str(), "created_at": c.created_at})
+}
+async fn healthz(query: Result<Query<EmptyQuery>, QueryRejection>) -> ApiResult<Json<Value>> {
+    query?;
+    Ok(Json(json!({"status": "ok"})))
+}
+async fn collections(
+    State(service): State<Arc<Service>>,
+    Extension(context): Extension<RequestContext>,
+    query: Result<Query<ListQuery>, QueryRejection>,
+) -> ApiResult<Json<Value>> {
+    let Query(query) = query?;
+    let rows = blocking(&service, move |s| {
+        s.collections(&context, &query.after, query.limit)
+    })
+    .await?;
+    Ok(Json(
+        json!({"collections": rows.into_iter().map(collection_json).collect::<Vec<_>>()}),
+    ))
+}
+async fn collection(
+    State(service): State<Arc<Service>>,
+    Extension(context): Extension<RequestContext>,
+    path: Result<Path<String>, PathRejection>,
+    query: Result<Query<EmptyQuery>, QueryRejection>,
+) -> ApiResult<Json<Value>> {
+    query?;
+    let Path(id) = path?;
+    identifier(&id)?;
+    let row = blocking(&service, move |s| s.collection(&context, &id)).await?;
+    Ok(Json(collection_json(row)))
+}
+async fn diagnostics(
+    State(service): State<Arc<Service>>,
+    Extension(context): Extension<RequestContext>,
+    path: Result<Path<String>, PathRejection>,
+    query: Result<Query<EmptyQuery>, QueryRejection>,
+) -> ApiResult<Json<Value>> {
+    query?;
+    let Path(id) = path?;
+    identifier(&id)?;
+    let row = blocking(&service, move |s| s.health(&context, &id)).await?;
+    Ok(Json(
+        json!({"status": row.status, "document_count": row.document_count}),
+    ))
+}
 async fn put_record(
     State(service): State<Arc<Service>>,
+    Extension(context): Extension<RequestContext>,
+    path: Result<Path<String>, PathRejection>,
+    query: Result<Query<EmptyQuery>, QueryRejection>,
     body: Result<Json<PutRequest>, JsonRejection>,
-) -> ApiResult<(StatusCode, Json<PutResponse>)> {
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    query?;
+    let Path(collection) = path?;
+    identifier(&collection)?;
     let Json(body) = body?;
-    let (id, revision) = blocking(&service, move |service| {
-        service.put(
-            &RequestContext::local(),
-            LOCAL_COLLECTION_ID,
+    let response_collection = collection.clone();
+    let (id, revision) = blocking(&service, move |s| {
+        s.put(
+            &context,
+            &collection,
             &body.text,
             body.metadata.as_ref(),
             body.id.as_deref(),
-            false,
+            WriteOptions {
+                publish: body.publish,
+                expected_revision: body.expected_revision,
+            },
         )
     })
     .await?;
-    Ok((StatusCode::CREATED, Json(PutResponse { id, revision })))
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({"collection_id": response_collection, "id": id, "revision": revision})),
+    ))
 }
-
 async fn get_record(
     State(service): State<Arc<Service>>,
-    Path(id): Path<String>,
+    Extension(context): Extension<RequestContext>,
+    path: Result<Path<(String, String)>, PathRejection>,
     query: Result<Query<RevisionQuery>, QueryRejection>,
-) -> ApiResult<Json<RecordResponse>> {
+) -> ApiResult<Json<Value>> {
+    let Path((collection, id)) = path?;
+    identifier(&collection)?;
+    identifier(&id)?;
     let Query(query) = query?;
-    let revision = blocking(&service, move |service| {
-        service.get(
-            &RequestContext::local(),
-            LOCAL_COLLECTION_ID,
-            &id,
-            query.revision,
-        )
+    positive(query.revision)?;
+    let row = blocking(&service, move |s| {
+        s.get(&context, &collection, &id, query.revision)
     })
     .await?;
-    Ok(Json(RecordResponse {
-        id: revision.record_id,
-        revision: revision.revision,
-        text: revision.text.unwrap_or_default(),
-        metadata: revision.metadata,
-        created_at: revision.created_at,
-    }))
+    Ok(Json(
+        json!({"collection_id": row.collection_id, "id": row.record_id, "revision": row.revision, "text": row.text, "metadata": row.metadata, "created_at": row.created_at}),
+    ))
 }
-
 async fn delete_record(
     State(service): State<Arc<Service>>,
-    Path(id): Path<String>,
+    Extension(context): Extension<RequestContext>,
+    path: Result<Path<(String, String)>, PathRejection>,
+    query: Result<Query<DeleteQuery>, QueryRejection>,
 ) -> ApiResult<StatusCode> {
-    blocking(&service, move |service| {
-        service.delete(&RequestContext::local(), LOCAL_COLLECTION_ID, &id)
+    let Path((collection, id)) = path?;
+    identifier(&collection)?;
+    identifier(&id)?;
+    let Query(query) = query?;
+    positive(query.expected_revision)?;
+    blocking(&service, move |s| {
+        s.delete(&context, &collection, &id, query.expected_revision)
     })
     .await?;
     Ok(StatusCode::NO_CONTENT)
 }
-
 async fn search(
     State(service): State<Arc<Service>>,
+    Extension(context): Extension<RequestContext>,
+    query: Result<Query<EmptyQuery>, QueryRejection>,
     body: Result<Json<SearchRequest>, JsonRejection>,
-) -> ApiResult<Json<SearchResponse>> {
+) -> ApiResult<Json<Value>> {
+    query?;
     let Json(body) = body?;
-    let outcome = blocking(&service, move |service| {
-        service.search(
-            &RequestContext::local(),
-            LOCAL_COLLECTION_ID,
+    if body.collections.len() != 1 {
+        return Err(ApiError::invalid());
+    }
+    let collection = body.collections[0].clone();
+    identifier(&collection)?;
+    let outcome = blocking(&service, move |s| {
+        s.search(
+            &context,
+            &collection,
             &body.text,
             body.filters.as_ref(),
             body.limit,
         )
     })
     .await?;
-    Ok(Json(SearchResponse {
-        search_id: outcome.search_id,
-        hits: outcome
-            .hits
-            .into_iter()
-            .map(|hit| HitResponse {
-                id: hit.id,
-                revision: hit.revision,
-                score: hit.score,
-                score_semantics: hit.score_semantics,
-                excerpt: hit.excerpt,
-                metadata: hit.metadata,
-            })
-            .collect(),
-        timings: outcome.timings,
-        gatherer: outcome.gatherer,
-    }))
+    Ok(Json(
+        json!({"collections": body.collections, "search_id": outcome.search_id, "hits": outcome.hits}),
+    ))
 }
-
 async fn report(
     State(service): State<Arc<Service>>,
+    Extension(context): Extension<RequestContext>,
+    path: Result<Path<String>, PathRejection>,
+    query: Result<Query<EmptyQuery>, QueryRejection>,
     body: Result<Json<ReportRequest>, JsonRejection>,
-) -> ApiResult<(StatusCode, Json<ReportCreated>)> {
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    query?;
+    let Path(collection) = path?;
+    identifier(&collection)?;
     let Json(body) = body?;
-    let id = blocking(&service, move |service| {
-        service.report(
-            &RequestContext::local(),
-            LOCAL_COLLECTION_ID,
+    identifier(&body.record_id)?;
+    positive(Some(body.revision))?;
+    if let Some(id) = &body.search_id {
+        identifier(id)?;
+    }
+    let response_collection = collection.clone();
+    let id = blocking(&service, move |s| {
+        s.report(
+            &context,
+            &collection,
             &body.record_id,
             &body.text,
-            body.revision,
+            Some(body.revision),
             body.search_id.as_deref(),
         )
     })
     .await?;
-    Ok((StatusCode::CREATED, Json(ReportCreated { id })))
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({"collection_id": response_collection, "id": id})),
+    ))
 }
-
 async fn list_reports(
     State(service): State<Arc<Service>>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<ReportsResponse>> {
-    let reports = blocking(&service, move |service| {
-        service.reports(&RequestContext::local(), LOCAL_COLLECTION_ID, &id)
-    })
-    .await?;
-    Ok(Json(ReportsResponse {
-        reports: reports
-            .into_iter()
-            .map(|report| ReportResponse {
-                id: report.id,
-                record_id: report.record_id,
-                revision: report.revision,
-                search_id: report.search_id,
-                text: report.text,
-                created_at: report.created_at,
-            })
-            .collect(),
-    }))
+    Extension(context): Extension<RequestContext>,
+    path: Result<Path<(String, String)>, PathRejection>,
+    query: Result<Query<EmptyQuery>, QueryRejection>,
+) -> ApiResult<Json<Value>> {
+    query?;
+    let Path((collection, id)) = path?;
+    identifier(&collection)?;
+    identifier(&id)?;
+    let rows = blocking(&service, move |s| s.reports(&context, &collection, &id)).await?;
+    let rows: Vec<_> = rows.into_iter().map(|r| json!({"collection_id": r.collection_id, "id": r.id, "record_id": r.record_id, "revision": r.revision, "search_id": r.search_id, "text": r.text, "created_at": r.created_at})).collect();
+    Ok(Json(json!({"reports": rows})))
 }

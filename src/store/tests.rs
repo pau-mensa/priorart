@@ -18,7 +18,16 @@ fn metadata(value: Value) -> Metadata {
 
 fn put(store: &Store, collection: &str, text: &str, record: Option<&str>) -> RecordRef {
     store
-        .put(collection, text, None, record, LOCAL_PRINCIPAL_ID)
+        .put(
+            collection,
+            text,
+            None,
+            record,
+            LOCAL_PRINCIPAL_ID,
+            record
+                .and_then(|id| store.get(collection, id, None).ok())
+                .map(|r| r.revision),
+        )
         .unwrap()
 }
 
@@ -43,7 +52,7 @@ fn put_creates_and_get_returns_latest() {
     let (_directory, store) = open();
     let tags = metadata(json!({"lang": "python"}));
     let created = store
-        .put(LOCAL, "first", Some(&tags), None, LOCAL_PRINCIPAL_ID)
+        .put(LOCAL, "first", Some(&tags), None, LOCAL_PRINCIPAL_ID, None)
         .unwrap();
     assert_eq!(created.revision, 1);
     assert_eq!(created.record_id.len(), 32);
@@ -89,11 +98,12 @@ fn delete_nulls_text_and_blocks_reuse() {
             Some(&tags),
             Some("rec"),
             LOCAL_PRINCIPAL_ID,
+            None,
         )
         .unwrap();
     put(&store, LOCAL, "secret 2", Some("rec"));
-    assert!(store.delete(LOCAL, "rec").unwrap());
-    assert!(!store.delete(LOCAL, "rec").unwrap());
+    assert!(store.delete(LOCAL, "rec", Some(2)).unwrap());
+    assert!(!store.delete(LOCAL, "rec", Some(2)).unwrap());
     for revision in [None, Some(1)] {
         assert!(matches!(
             store.get(LOCAL, "rec", revision),
@@ -101,11 +111,11 @@ fn delete_nulls_text_and_blocks_reuse() {
         ));
     }
     assert!(matches!(
-        store.put(LOCAL, "again", None, Some("rec"), LOCAL_PRINCIPAL_ID),
+        store.put(LOCAL, "again", None, Some("rec"), LOCAL_PRINCIPAL_ID, None),
         Err(StoreError::RecordDeleted { .. })
     ));
     assert!(matches!(
-        store.delete(LOCAL, "nope"),
+        store.delete(LOCAL, "nope", Some(1)),
         Err(StoreError::RecordNotFound { .. })
     ));
     assert!(store.live_documents(LOCAL).unwrap().is_empty());
@@ -137,7 +147,7 @@ fn live_documents_are_latest_and_ordered() {
     put(&store, LOCAL, "b1", Some("b"));
     put(&store, LOCAL, "a2", Some("a"));
     put(&store, LOCAL, "c1", Some("c"));
-    store.delete(LOCAL, "c").unwrap();
+    store.delete(LOCAL, "c", Some(1)).unwrap();
     let documents = store
         .live_documents(LOCAL)
         .unwrap()
@@ -167,6 +177,7 @@ fn filters_match_latest_metadata() {
                 Some(&metadata(tags)),
                 Some(record),
                 LOCAL_PRINCIPAL_ID,
+                store.get(LOCAL, record, None).ok().map(|r| r.revision),
             )
             .unwrap();
     };
@@ -221,7 +232,7 @@ fn reports_round_trip_including_deleted_records() {
             LOCAL_PRINCIPAL_ID,
         )
         .unwrap();
-    store.delete(LOCAL, "rec").unwrap();
+    store.delete(LOCAL, "rec", Some(1)).unwrap();
     let reports = store.reports_for(LOCAL, "rec").unwrap();
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].id, report);
@@ -359,7 +370,14 @@ fn scoped() -> Scoped {
 fn put_as(store: &Store, collection: &str, principal: &str, text: &str, record: &str) -> RecordRef {
     let tags = metadata(json!({"tag": "shared"}));
     store
-        .put(collection, text, Some(&tags), Some(record), principal)
+        .put(
+            collection,
+            text,
+            Some(&tags),
+            Some(record),
+            principal,
+            store.get(collection, record, None).ok().map(|r| r.revision),
+        )
         .unwrap()
 }
 
@@ -479,7 +497,7 @@ fn reads_deletes_reports_and_mirrors_are_scoped() {
         (reports[0].collection_id.as_str(), reports[0].text.as_str()),
         (a.as_str(), a.as_str())
     );
-    store.delete(&a, "same").unwrap();
+    store.delete(&a, "same", Some(1)).unwrap();
     store.replace_index_documents(&a, &[], None).unwrap();
     assert!(store.live_documents(&a).unwrap().is_empty());
     assert_eq!(
@@ -748,4 +766,80 @@ fn pending_migrations_commit_or_roll_back_as_one_batch() {
         .unwrap();
     assert_eq!(values, "preserved");
     assert_eq!(schema_version(&connection).as_deref(), Some("v1.1.0"));
+}
+
+#[test]
+fn revision_preconditions_are_atomic_across_connections() {
+    let (directory, store) = open();
+    put(&store, LOCAL, "original", Some("same"));
+    assert!(matches!(
+        store.put(
+            LOCAL,
+            "missing precondition",
+            None,
+            Some("same"),
+            LOCAL_PRINCIPAL_ID,
+            None
+        ),
+        Err(StoreError::RevisionRequired)
+    ));
+    assert!(matches!(
+        store.put(
+            LOCAL,
+            "create collision",
+            None,
+            Some("same"),
+            LOCAL_PRINCIPAL_ID,
+            Some(0)
+        ),
+        Err(StoreError::RevisionConflict)
+    ));
+    assert!(matches!(
+        store.put(
+            LOCAL,
+            "missing target",
+            None,
+            Some("missing"),
+            LOCAL_PRINCIPAL_ID,
+            Some(1)
+        ),
+        Err(StoreError::RevisionConflict)
+    ));
+    assert!(matches!(
+        store.delete(LOCAL, "same", None),
+        Err(StoreError::RevisionRequired)
+    ));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let workers: Vec<_> = ["left", "right"]
+        .into_iter()
+        .map(|text| {
+            let barrier = barrier.clone();
+            let path = directory.path().join("priorart.sqlite");
+            std::thread::spawn(move || {
+                let store = Store::open(path).unwrap();
+                barrier.wait();
+                store.put(LOCAL, text, None, Some("same"), LOCAL_PRINCIPAL_ID, Some(1))
+            })
+        })
+        .collect();
+    let results: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| matches!(r, Err(StoreError::RevisionConflict)))
+            .count(),
+        1
+    );
+    assert_eq!(store.get(LOCAL, "same", None).unwrap().revision, 2);
+    assert!(matches!(
+        store.delete(LOCAL, "same", Some(1)),
+        Err(StoreError::RevisionConflict)
+    ));
+    assert!(store.delete(LOCAL, "same", Some(2)).unwrap());
+    assert!(!store.delete(LOCAL, "same", Some(2)).unwrap());
+    assert!(matches!(
+        store.delete(LOCAL, "same", Some(1)),
+        Err(StoreError::RevisionConflict)
+    ));
 }
