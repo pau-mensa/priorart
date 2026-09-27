@@ -39,8 +39,9 @@ Returns `201 {"id": "…", "revision": 1}`.
 - Without `id` the server creates a record at revision 1 with a 32-character
   hex id.
 - With an `id` that exists, a new revision is appended and returned.
-- With an unknown `id` matching `^[A-Za-z0-9_.:-]{1,128}$`, the record is
-  created under that id.
+- With an unknown `id` matching `^[A-Za-z0-9_.:-]{1,128}$`, other than `.` and
+  `..`, the record is created under that id. Every valid id is safe to use as a
+  URL path segment unencoded.
 - `text` must be non-empty after stripping and at most `PRIORART_MAX_TEXT_BYTES`
   (default 262144) bytes of UTF-8.
 - `metadata` is any JSON object. Only top-level string, number, and boolean

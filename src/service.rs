@@ -27,6 +27,14 @@ pub const DATABASE_FILE: &str = "priorart.sqlite";
 static RECORD_ID: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_.:-]{1,128}$").expect("valid record ID regex"));
 
+pub const RECORD_ID_RULE: &str = "id must match ^[A-Za-z0-9_.:-]{1,128}$ and not be . or ..";
+
+/// Whether `id` can name a record. `.` and `..` are excluded because URL
+/// parsers resolve them as path segments, so `/v1/records/{id}` cannot reach them.
+pub fn is_record_id(id: &str) -> bool {
+    RECORD_ID.is_match(id) && id != "." && id != ".."
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
     /// The request is well-formed but violates a protocol rule.
@@ -141,8 +149,8 @@ impl Service {
                 self.settings.max_text_bytes
             ));
         }
-        if record_id.is_some_and(|record_id| !RECORD_ID.is_match(record_id)) {
-            return invalid("id must match ^[A-Za-z0-9_.:-]{1,128}$");
+        if record_id.is_some_and(|record_id| !is_record_id(record_id)) {
+            return invalid(RECORD_ID_RULE);
         }
         let mut state = self.state();
         let State { store, index } = &mut *state;

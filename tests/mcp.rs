@@ -188,6 +188,19 @@ async fn server_errors_surface_to_the_model() {
 }
 
 #[tokio::test]
+async fn ids_that_would_change_the_url_are_rejected() {
+    let session = session().await;
+    for id in ["..", ".", "x/reports", "cuda?revision=1", "a#b"] {
+        for tool in ["get_experience", "delete_experience"] {
+            let result = call(&session, tool, json!({"id": id})).await;
+            assert!(error_text(&result).contains("invalid id"), "{tool} {id}");
+        }
+    }
+    let cuda = call(&session, "get_experience", json!({"id": "cuda"})).await;
+    assert_eq!(structured(&cuda)["id"], "cuda");
+}
+
+#[tokio::test]
 async fn an_unreachable_server_fails_fast() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());

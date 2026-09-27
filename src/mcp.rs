@@ -18,6 +18,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+use crate::service::{is_record_id, RECORD_ID_RULE};
 use crate::VERSION;
 
 pub const DEFAULT_URL: &str = "http://127.0.0.1:8000";
@@ -251,6 +252,7 @@ impl PriorartMcp {
         &self,
         Parameters(params): Parameters<GetParams>,
     ) -> Result<Json<Experience>, String> {
+        check_record_id(&params.id)?;
         let mut request = self
             .client
             .get(self.endpoint(&format!("/v1/records/{}", params.id)));
@@ -330,6 +332,7 @@ impl PriorartMcp {
         &self,
         Parameters(params): Parameters<DeleteParams>,
     ) -> Result<Json<Deleted>, String> {
+        check_record_id(&params.id)?;
         send(
             self.client
                 .delete(self.endpoint(&format!("/v1/records/{}", params.id))),
@@ -339,6 +342,15 @@ impl PriorartMcp {
             id: params.id,
             deleted: true,
         }))
+    }
+}
+
+/// Record IDs go into URL paths, which only valid IDs can do unchanged.
+fn check_record_id(id: &str) -> Result<(), String> {
+    if is_record_id(id) {
+        Ok(())
+    } else {
+        Err(format!("invalid id {id:?}: {RECORD_ID_RULE}"))
     }
 }
 

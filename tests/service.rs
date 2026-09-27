@@ -246,6 +246,9 @@ fn validation() {
     assert!(invalid(service.put(&"x".repeat(300_000), None, None)));
     assert!(invalid(service.put("ok", None, Some("bad id with spaces"))));
     assert!(invalid(service.put("ok", None, Some(&"x".repeat(129)))));
+    assert!(invalid(service.put("ok", None, Some("."))));
+    assert!(invalid(service.put("ok", None, Some(".."))));
+    service.put("ok", None, Some("...")).unwrap();
     assert!(invalid(service.search("   ", None, 10)));
     assert!(invalid(service.search("ok", None, 0)));
     assert!(invalid(service.search("ok", None, 101)));
