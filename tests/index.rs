@@ -267,6 +267,11 @@ fn lexical_scores_after_writes_match_a_reopened_index() {
     put(&store, &mut index, "a", "delta delta beta");
     store.delete(LOCAL, "b").unwrap();
     index.remove(&store, "b").unwrap();
+    assert_eq!(
+        mirror(&store),
+        [(0, "c".to_owned(), 1), (1, "a".to_owned(), 2)]
+    );
+    assert_eq!(index.record_ids(), ["c", "a"]);
     let reopened = open(&directory, &store, None);
     let ranked = |index: &Index| {
         let result = search(index, "alpha beta gamma delta", 500, 10);

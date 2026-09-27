@@ -53,6 +53,7 @@ pub struct Index {
     encoder: Option<Arc<dyn Encoder>>,
     vectors: Option<Arc<VectorStore>>,
     record_ids: Vec<String>,
+    positions: HashMap<String, usize>,
     revisions: Vec<i64>,
     generation: u64,
     manifest: Option<CorpusManifest>,
@@ -80,6 +81,7 @@ impl Index {
             encoder,
             vectors: None,
             record_ids: Vec::new(),
+            positions: HashMap::new(),
             revisions: Vec::new(),
             generation: 0,
             manifest: None,
@@ -129,6 +131,7 @@ impl Index {
         self.lexical = Arc::new(Bm25::new(&texts));
         self.revisions = mirror.iter().map(|entry| entry.revision).collect();
         self.record_ids = mirror.into_iter().map(|entry| entry.record_id).collect();
+        self.index_positions();
         self.vectors = match &self.encoder {
             Some(_) if !self.record_ids.is_empty() => {
                 Some(Arc::new(VectorStore::open(&self.vectors_path)?))
@@ -168,6 +171,7 @@ impl Index {
             .iter()
             .map(|document| document.record_id.clone())
             .collect();
+        self.index_positions();
         self.revisions = documents.iter().map(|document| document.revision).collect();
         let texts: Vec<String> = documents
             .into_iter()
@@ -185,7 +189,16 @@ impl Index {
                 )?));
             }
         }
-        self.write_mirror(store)?;
+        store.replace_index_documents(
+            &self.collection_id,
+            &self
+                .record_ids
+                .iter()
+                .map(String::as_str)
+                .zip(self.revisions.iter().copied())
+                .collect::<Vec<_>>(),
+            self.encoder_name(),
+        )?;
         self.refresh();
         self.stale = false;
         Ok(())
@@ -246,7 +259,8 @@ impl Index {
         text: &str,
         encoded: EncodedDocument,
     ) -> Result<()> {
-        if let Some(position) = self.position(record_id) {
+        let removed = self.positions.get(record_id).copied();
+        if let Some(position) = removed {
             self.remove_position(position)?;
         }
         if let (Some(encoder), Some(encoded)) = (self.encoder.clone(), encoded.0) {
@@ -266,20 +280,32 @@ impl Index {
                 }
             }
         }
+        self.positions
+            .insert(record_id.to_owned(), self.record_ids.len());
         self.record_ids.push(record_id.to_owned());
         self.revisions.push(revision);
         Arc::make_mut(&mut self.lexical).push(text);
-        self.write_mirror(store)?;
+        store.update_index_documents(
+            &self.collection_id,
+            removed.map(|position| position as u64),
+            Some((record_id, revision)),
+            self.encoder_name(),
+        )?;
         self.refresh();
         Ok(())
     }
 
     fn apply_remove(&mut self, store: &Store, record_id: &str) -> Result<()> {
-        let Some(position) = self.position(record_id) else {
+        let Some(position) = self.positions.get(record_id).copied() else {
             return Ok(());
         };
         self.remove_position(position)?;
-        self.write_mirror(store)?;
+        store.update_index_documents(
+            &self.collection_id,
+            Some(position as u64),
+            None,
+            self.encoder_name(),
+        )?;
         self.refresh();
         Ok(())
     }
@@ -292,7 +318,14 @@ impl Index {
                 vectors.delete(&[position as u64])?;
             }
         }
-        self.record_ids.remove(position);
+        let removed = self.record_ids.remove(position);
+        self.positions.remove(&removed);
+        for later in &self.record_ids[position..] {
+            *self
+                .positions
+                .get_mut(later)
+                .expect("every indexed record has a position") -= 1;
+        }
         self.revisions.remove(position);
         Arc::make_mut(&mut self.lexical).remove(position);
         Ok(())
@@ -306,19 +339,19 @@ impl Index {
         Ok(())
     }
 
-    fn write_mirror(&self, store: &Store) -> Result<()> {
-        let rows: Vec<(&str, i64)> = self
+    fn encoder_name(&self) -> Option<&str> {
+        self.encoder
+            .as_ref()
+            .map(|encoder| encoder.representation().encoder())
+    }
+
+    fn index_positions(&mut self) {
+        self.positions = self
             .record_ids
             .iter()
-            .map(String::as_str)
-            .zip(self.revisions.iter().copied())
+            .enumerate()
+            .map(|(position, record_id)| (record_id.clone(), position))
             .collect();
-        let encoder = self
-            .encoder
-            .as_ref()
-            .map(|encoder| encoder.representation().encoder());
-        store.replace_index_documents(&self.collection_id, &rows, encoder)?;
-        Ok(())
     }
 
     fn refresh(&mut self) {
@@ -333,10 +366,6 @@ impl Index {
             .expect("the corpus identity fields are non-empty")
             .with_generation(self.generation)
         });
-    }
-
-    fn position(&self, record_id: &str) -> Option<usize> {
-        self.record_ids.iter().position(|item| item == record_id)
     }
 
     pub fn document_count(&self) -> usize {

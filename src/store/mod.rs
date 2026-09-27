@@ -684,12 +684,67 @@ impl Store {
                 insert.execute((collection_id, position as i64, record_id, revision))?;
             }
         }
-        transaction.execute(
-            "INSERT INTO index_state (collection_id, key, value) VALUES (?1, 'encoder', ?2) \
-             ON CONFLICT (collection_id, key) DO UPDATE SET value = excluded.value",
-            (collection_id, encoder),
-        )?;
+        set_index_encoder(&transaction, collection_id, encoder)?;
         transaction.commit()?;
         Ok(())
     }
+
+    /// Applies one index write to the mirror atomically: drops `removed`,
+    /// shifting later internal IDs down by one, then appends `appended`.
+    pub fn update_index_documents(
+        &self,
+        collection_id: &str,
+        removed: Option<u64>,
+        appended: Option<(&str, i64)>,
+        encoder: Option<&str>,
+    ) -> Result<()> {
+        let transaction = self.write()?;
+        if let Some(removed) = removed {
+            let removed = removed as i64;
+            transaction.execute(
+                "DELETE FROM index_documents WHERE collection_id = ?1 AND internal_id = ?2",
+                (collection_id, removed),
+            )?;
+            // SQLite checks uniqueness row by row, so shift past every ID first.
+            let offset: i64 = transaction.query_row(
+                "SELECT coalesce(MAX(internal_id), 0) + 1 FROM index_documents \
+                 WHERE collection_id = ?1",
+                [collection_id],
+                |row| row.get(0),
+            )?;
+            transaction.execute(
+                "UPDATE index_documents SET internal_id = internal_id + ?3 \
+                 WHERE collection_id = ?1 AND internal_id > ?2",
+                (collection_id, removed, offset),
+            )?;
+            transaction.execute(
+                "UPDATE index_documents SET internal_id = internal_id - ?2 - 1 \
+                 WHERE collection_id = ?1 AND internal_id >= ?2",
+                (collection_id, offset),
+            )?;
+        }
+        if let Some((record_id, revision)) = appended {
+            transaction.execute(
+                "INSERT INTO index_documents (collection_id, internal_id, record_id, revision) \
+                 SELECT ?1, count(*), ?2, ?3 FROM index_documents WHERE collection_id = ?1",
+                (collection_id, record_id, revision),
+            )?;
+        }
+        set_index_encoder(&transaction, collection_id, encoder)?;
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
+fn set_index_encoder(
+    connection: &Connection,
+    collection_id: &str,
+    encoder: Option<&str>,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO index_state (collection_id, key, value) VALUES (?1, 'encoder', ?2) \
+         ON CONFLICT (collection_id, key) DO UPDATE SET value = excluded.value",
+        (collection_id, encoder),
+    )?;
+    Ok(())
 }
