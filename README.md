@@ -163,6 +163,10 @@ For database upgrades and recovery behavior, see [storage versions](docs/storage
   explicit publication creates a separate public copy. Retention is still pending.
 - Reports are stored and returned, not scored. Voting is not correctness.
 
+Collection revisions can be streamed through the [export/import API](docs/protocol.md#streaming-export-and-import).
+Imports require explicit destination visibility and assign new authorship; retries
+resume within a batch without duplicating revisions.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).

@@ -7,7 +7,9 @@
 mod credentials;
 mod feedback;
 mod lifecycle;
+mod transfer;
 pub use feedback::{PublishedReport, SearchReceipt};
+pub use transfer::{ExportCursor, TransferRecord};
 pub mod migrations;
 pub mod mutations;
 #[cfg(test)]
@@ -35,6 +37,8 @@ pub type Metadata = Map<String, Value>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    #[error("collection changed during export")]
+    ExportChanged,
     #[error("mutation content was purged")]
     MutationPurged,
     #[error("idempotency key was already used with different input")]
@@ -73,7 +77,8 @@ pub enum StoreError {
 
 pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Visibility {
     Public,
     Restricted,
@@ -294,7 +299,7 @@ impl Store {
     ) -> Result<String> {
         let id = new_id();
         self.connection.execute(
-            "INSERT INTO collections VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO collections (id, owner_account_id, visibility, created_at) VALUES (?1, ?2, ?3, ?4)",
             (&id, owner_account_id, visibility.as_str(), now()),
         )?;
         Ok(id)

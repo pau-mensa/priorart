@@ -251,7 +251,7 @@ fn collection_purge_revokes_only_its_grants_and_never_recreates_local() {
     assert!(service.search(&fresh, &public, "public", None, 10).is_err());
     assert!(db
         .execute(
-            "INSERT INTO collections VALUES (?1, ?2, 'public', 'now')",
+            "INSERT INTO collections (id, owner_account_id, visibility, created_at) VALUES (?1, ?2, 'public', 'now')",
             (&public, &account)
         )
         .is_err());

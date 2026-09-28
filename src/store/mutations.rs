@@ -101,7 +101,7 @@ impl Store {
         })
     }
 
-    fn commit_mutation<T: Serialize + DeserializeOwned>(
+    pub(super) fn commit_mutation<T: Serialize + DeserializeOwned>(
         &self,
         intent: &Intent<'_>,
         applied: bool,

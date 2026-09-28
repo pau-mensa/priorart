@@ -23,6 +23,8 @@ use crate::{
     store::{Collection, Metadata, StoreError},
 };
 
+mod transfer;
+
 pub struct ApiError(StatusCode, &'static str, &'static str);
 impl ApiError {
     fn invalid() -> Self {
@@ -60,6 +62,11 @@ impl ApiError {
 impl From<ServiceError> for ApiError {
     fn from(error: ServiceError) -> Self {
         match error {
+            ServiceError::Store(StoreError::ExportChanged) => Self(
+                StatusCode::CONFLICT,
+                "export_changed",
+                "collection changed during export",
+            ),
             ServiceError::Busy => Self(
                 StatusCode::TOO_MANY_REQUESTS,
                 "resource_limit",
@@ -324,6 +331,11 @@ pub fn router(service: Arc<Service>) -> Router {
         .route(
             "/v1/collections/{collection}/searches/{id}",
             get(search_receipt),
+        )
+        .route("/v1/collections/{collection}/export", get(transfer::export))
+        .route(
+            "/v1/collections/{collection}/import",
+            post(transfer::import),
         )
         .route("/v1/search", post(search))
         .fallback(|| async { ApiError::not_found() })

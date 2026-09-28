@@ -123,8 +123,7 @@ Omitting `revision` selects the latest; supplied revisions must be positive.
 `delete` plus authorship or `moderate`. An authorized existing target requires a
 positive current revision, compared inside the deletion transaction. Missing
 preconditions return `428`; stale ones return `409`. Returns `204`, including a
-repeat deletion with the same last revision. Deletes null text/metadata from all
-revisions and remove the indexed record. Tombstones reserve IDs. An authorized
+repeat deletion with the same last revision. Tombstones reserve IDs. An authorized
 read of a deleted record returns `410`; unknown or forbidden targets return `404`.
 Deletion purges all revisions and hashes, private/published reports on the record,
 and its links from search receipts. It removes every generation of the affected
@@ -228,6 +227,83 @@ not physical erasure of old database pages, journals, or backups. Retention,
 standalone feedback removal and retention remain later lifecycle work. Record and
 collection deletion now purge associated feedback and index generations.
 
+
+## Streaming export and import
+
+`GET /v1/collections/{collection}/export?limit=50` requires `export` and current
+read access, even on a public collection. It streams `application/x-ndjson` with
+`Cache-Control: no-store`. Records are ordered by `(record_id, revision)` and
+include every retained revision of live records. Deleted records, reports,
+receipts, credentials, grants, indexes, and private import provenance are excluded.
+Export does not load or run the encoder.
+
+Each revision is a separate line:
+
+```json
+{"type":"revision","record":{"version":1,"collection_id":"source","visibility":"restricted","record_id":"r1","revision":2,"author_principal_id":"author","created_at":"2026-01-01T00:00:00Z","text":"record text","metadata":null}}
+{"type":"end","count":1,"generation":7,"next_cursor":null}
+```
+
+`limit` defaults to 50 and accepts 1–10000. A page is also capped below 128 MiB,
+including its footer; a single revision that cannot fit is rejected. A non-null
+`next_cursor` contains `record_id` and `revision`. Continue with
+`after_record`, `after_revision`, and the footer's `generation` in the same
+collection URL. A cursor is not an access token. Every row rechecks authorization;
+revocation or any content change stops the stream. A generation mismatch before
+headers returns `409 export_changed`. Restart the export after a content change;
+do not combine pages from different generations.
+
+`POST /v1/collections/{collection}/import?visibility=restricted` accepts this
+NDJSON format with `Content-Type: application/x-ndjson` and a required
+`Idempotency-Key` identifying the import batch. The destination must already
+exist; its visibility must match the explicit query parameter. Public imports
+also require `publish=true`. `contribute` is required throughout; appending further
+source revisions to a record also requires `update`. No source collection is
+looked up or implicitly selected, and uploaded source IDs grant no access.
+
+Imports create random destination IDs and privately persist their mapping to the
+principal, destination, batch key digest, and source record reference. Source revisions must arrive
+in increasing order for each source record; gaps are allowed and destination
+revision numbers start at 1. Replaying an identical row in the same batch returns
+its original result. Changing a replay's contents conflicts. A new batch key
+creates a separate copy. Imports never overwrite a pre-existing record or an
+intervening manual edit, and purged batches cannot recreate deleted content.
+
+The destination collection keeps its owner and visibility. The service assigns
+record authorship to the importing principal and uses new creation timestamps.
+Uploaded author, timestamp, visibility, and source references are unverified
+claims, saved separately as private provenance. They are not returned through
+record/search responses or subsequent exports. Import acknowledgements return
+source-to-destination mappings to the importer. Explicit copies survive deletion
+of their source; deleting the destination purges its provenance.
+
+Each accepted row commits content, provenance, and its mutation receipt atomically,
+then indexes it before returning an acknowledgement:
+
+```json
+{"type":"imported","source":{"collection_id":"source","record_id":"r1","revision":2},"collection_id":"destination","record_id":"new-id","revision":1,"mutation_id":"mutation-id"}
+{"type":"end","count":1}
+```
+
+An upload accepts at most 10000 revision rows and 128 MiB. Each row is also bounded
+by the configured text limit, metadata limits, and JSON framing overhead. The
+export `end` footer is required, must contain the correct row count, and must be
+last. Each export page can be imported separately using the same batch key.
+Only transfer version 1 is accepted; unknown fields and formats are rejected.
+
+Both endpoints use a terminal `{"type":"error","error":{"code":"…","message":"…"}}`
+line for failures after response headers. HTTP 200 means the stream started;
+only a valid `end` line establishes completion. A truncated connection is not
+success. Imports are atomic per revision, not per upload: an error or disconnect
+can leave an acknowledged prefix and one in-flight row committed. Retry the same
+input and batch key to recover without duplicates. Never infer success solely
+from curl's exit status. Transfers do not persist bearer credentials or upload
+files, and do not include any billing check.
+
+Imports retain ordinary per-revision write-through indexing cost. Exports are
+content transfers, not database backups: they do not preserve tombstones,
+authority, or private feedback. Use the [restore rules](storage.md#purge-and-restore)
+for recovery of an existing service.
 
 ## Errors and health
 

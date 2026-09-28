@@ -42,6 +42,10 @@ const MIGRATIONS: &[Migration] = &[
         version: "v0.6.0",
         apply: create_lifecycle_schema,
     },
+    Migration {
+        version: "v0.7.0",
+        apply: create_transfer_schema,
+    },
 ];
 
 pub const SCHEMA_VERSION: &str = MIGRATIONS[MIGRATIONS.len() - 1].version;
@@ -346,6 +350,42 @@ fn create_lifecycle_schema(transaction: &Transaction<'_>) -> Result<(), StoreErr
     Ok(())
 }
 
+fn create_transfer_schema(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    transaction.execute_batch(
+        "ALTER TABLE collections ADD COLUMN content_version INTEGER NOT NULL DEFAULT 0;
+         CREATE TRIGGER revision_insert_version AFTER INSERT ON revisions
+             BEGIN UPDATE collections SET content_version = content_version + 1 WHERE id = NEW.collection_id; END;
+         CREATE TRIGGER revision_delete_version AFTER DELETE ON revisions
+             BEGIN UPDATE collections SET content_version = content_version + 1 WHERE id = OLD.collection_id; END;
+         CREATE TRIGGER revision_update_version AFTER UPDATE ON revisions
+             BEGIN UPDATE collections SET content_version = content_version + 1 WHERE id = NEW.collection_id; END;
+         CREATE TABLE import_targets (
+             collection_id TEXT NOT NULL,
+             importer_principal_id TEXT NOT NULL REFERENCES principals(id),
+             source_digest TEXT NOT NULL,
+             record_id TEXT NOT NULL,
+             PRIMARY KEY(collection_id, importer_principal_id, source_digest),
+             UNIQUE(collection_id, record_id),
+             FOREIGN KEY(collection_id, record_id) REFERENCES records(collection_id, id) ON DELETE CASCADE
+         );
+         CREATE TABLE import_provenance (
+             collection_id TEXT NOT NULL,
+             record_id TEXT NOT NULL,
+             revision INTEGER NOT NULL,
+             importer_principal_id TEXT NOT NULL REFERENCES principals(id),
+             source_collection_id TEXT NOT NULL,
+             source_record_id TEXT NOT NULL,
+             source_revision INTEGER NOT NULL CHECK(source_revision > 0),
+             source_visibility TEXT NOT NULL CHECK(source_visibility IN ('public', 'restricted')),
+             source_author_principal_id TEXT,
+             source_created_at TEXT NOT NULL,
+             PRIMARY KEY(collection_id, record_id, revision),
+             FOREIGN KEY(collection_id, record_id, revision) REFERENCES revisions(collection_id, record_id, revision) ON DELETE CASCADE
+         );",
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod credential_tests {
     use super::*;
@@ -633,5 +673,73 @@ mod lifecycle_tests {
             .next()
             .unwrap()
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod transfer_tests {
+    use super::*;
+
+    #[test]
+    fn transfer_migration_preserves_records_and_rolls_back_cleanly() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        run(&connection, &MIGRATIONS[..5]).unwrap();
+        connection
+            .execute_batch(
+                "
+            INSERT INTO records VALUES ('local','record','local-principal','created',NULL,NULL);
+            INSERT INTO revisions VALUES ('local','record',1,'preserved',NULL,'hash','created');
+        ",
+            )
+            .unwrap();
+        fn fail(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+            create_transfer_schema(transaction)?;
+            transaction.execute_batch("SELECT missing_function()")?;
+            Ok(())
+        }
+        let mut broken: Vec<_> = MIGRATIONS[..5]
+            .iter()
+            .map(|m| Migration {
+                version: m.version,
+                apply: m.apply,
+            })
+            .collect();
+        broken.push(Migration {
+            version: "v0.7.0",
+            apply: fail,
+        });
+        assert!(run(&connection, &broken).is_err());
+        assert!(connection
+            .prepare("SELECT content_version FROM collections")
+            .is_err());
+        assert!(connection
+            .prepare("SELECT * FROM import_provenance")
+            .is_err());
+        migrate(&connection).unwrap();
+        migrate(&connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT text FROM revisions", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "preserved"
+        );
+        connection.execute_batch("INSERT INTO import_provenance VALUES ('local','record',1,'local-principal','unverified','source',9,'restricted','claimed-author','old'); DELETE FROM revisions;").unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM import_provenance", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT content_version FROM collections", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 }

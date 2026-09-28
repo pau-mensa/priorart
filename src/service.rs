@@ -22,6 +22,9 @@ use crate::index::{CollectionIndexManager, IndexError};
 use crate::policy::{self, PolicyError};
 use crate::store::{Metadata, Report, Revision, SearchHit, Store, StoreError, Visibility};
 
+mod transfer;
+pub use transfer::ImportOptions;
+
 pub const MAX_LIMIT: i64 = 100;
 pub const DATABASE_FILE: &str = "priorart.sqlite";
 

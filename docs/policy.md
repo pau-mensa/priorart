@@ -43,6 +43,8 @@ These error rules do not promise identical timing or hide operational side chann
 | Read receipt | Owning principal, `feedback_read`, and current scope read access |
 | Publish report | Author, `report_publish`, readable live public target, and selected text |
 | Read published reports | Target read access; anonymous readers allowed for public targets |
+| Export revisions | `export` and current `read`; rechecked for every streamed row |
+| Import revisions | `contribute`, plus `update` for subsequent revisions; explicit destination visibility/publication |
 | Delete collection | `admin`; deletes data and scoped grants, leaving an ID/time tombstone |
 | Scoped health/diagnostics | `admin` on that collection, before loading its index or counting documents |
 
@@ -61,11 +63,15 @@ selected text and the public target reference, without private source links.
 
 Anonymous searches return `search_id: None` and persist no query or receipt.
 Authenticated/local searches persist minimal requester-private receipts without
-queries, filters, scores, or timings. Retention, export/import, and standalone
-feedback removal remain later lifecycle work. Record/collection deletion purges
+queries, filters, scores, or timings. Retention and standalone feedback removal
+remain later lifecycle work. Record/collection deletion purges
 linked feedback and index generations.
 Collection discovery requires read or admin access and applies its scope before
-pagination. Provisioning remains local administration; no remote creation, export, or background-job API is available.
+pagination. Provisioning remains local administration; no remote creation or background-job API is available.
+
+Imports treat source identity and authorship as unverified claims; they never
+resolve source IDs or impersonate the uploaded author. The importer becomes the
+new author. Private provenance is excluded from public responses and exports.
 
 ## Delegation across principals
 

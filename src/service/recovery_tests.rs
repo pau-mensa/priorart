@@ -244,3 +244,76 @@ fn purge_interruptions_resume_on_restart() {
         }
     }
 }
+
+#[test]
+fn interrupted_import_recovers_content_and_provenance_together() {
+    for phase in [
+        "before_record_commit",
+        "after_record_commit",
+        "before_index_activation",
+        "after_index_activation",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let service = Service::new(settings(dir.path()), None).unwrap();
+        service.health(&CALLER, LOCAL).unwrap();
+        let row = crate::store::TransferRecord {
+            version: 1,
+            collection_id: "uploaded-source".into(),
+            visibility: Visibility::Restricted,
+            record_id: "original".into(),
+            revision: 9,
+            author_principal_id: Some("claimed-author".into()),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            text: "imported text".into(),
+            metadata: None,
+        };
+        let options = ImportOptions {
+            batch_key: "resume-import",
+            visibility: Visibility::Restricted,
+            publish: false,
+        };
+        crate::fault::set(Some(phase));
+        assert!(
+            service
+                .import_revision(&CALLER, LOCAL, &row, options)
+                .is_err(),
+            "{phase}"
+        );
+        crate::fault::set(None);
+        drop(service);
+        let service = Service::new(settings(dir.path()), None).unwrap();
+        let result = service
+            .import_revision(&CALLER, LOCAL, &row, options)
+            .unwrap();
+        assert_eq!(
+            result,
+            service
+                .import_revision(&CALLER, LOCAL, &row, options)
+                .unwrap()
+        );
+        assert_eq!(result.value.1, 1);
+        assert_eq!(
+            service
+                .search(&CALLER, LOCAL, "imported", None, 10)
+                .unwrap()
+                .hits
+                .len(),
+            1
+        );
+        let db = rusqlite::Connection::open(dir.path().join(DATABASE_FILE)).unwrap();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM import_provenance", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.query_row("SELECT source_revision FROM import_provenance", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            9
+        );
+    }
+}

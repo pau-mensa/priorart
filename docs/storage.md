@@ -17,11 +17,12 @@ are independent of the HTTP protocol version.
 |---|---|
 | Empty database | Create the current schema transactionally |
 | No `schema_version`, any existing schema | Reject; priorart only initializes empty databases |
-| `v0.2.0` | Apply credential, mutation, feedback, and lifecycle migrations |
-| `v0.3.0` | Apply mutation, feedback, and lifecycle migrations |
-| `v0.4.0` | Apply feedback and lifecycle migrations |
-| `v0.5.0` | Purge existing tombstoned content and add resumable index cleanup |
-| `v0.6.0` | Open without rerunning migrations |
+| `v0.2.0` | Apply credential, mutation, feedback, lifecycle, and transfer migrations |
+| `v0.3.0` | Apply mutation, feedback, lifecycle, and transfer migrations |
+| `v0.4.0` | Apply feedback, lifecycle, and transfer migrations |
+| `v0.5.0` | Apply lifecycle and transfer migrations |
+| `v0.6.0` | Add content generations and private import provenance |
+| `v0.7.0` | Open without rerunning migrations |
 | A tag this build does not know | Reject, naming that release as the one to use |
 | Nonzero `PRAGMA user_version` | Reject as a Python implementation directory; use `v0.1.0` |
 
@@ -204,8 +205,33 @@ when taking a live SQLite backup.
 Purge removes logical rows, caches, and index files from the live service. It does
 not promise physical erasure from SQLite free pages, WAL/journals, filesystem
 snapshots, storage media, exported files, or backups. Backup rotation and any
-storage-level erasure must be handled separately. Standalone feedback deletion,
-retention jobs, and export/import remain the next lifecycle changes.
+storage-level erasure must be handled separately. Standalone feedback deletion and retention jobs remain the next lifecycle change.
+
+## Content transfers
+
+Schema `v0.7.0` adds a per-collection content generation, incremented transactionally
+by revision changes, plus `import_provenance` and `import_targets`. Export uses indexed keyset reads of
+one revision at a time; each read checks the original generation and current
+access. It holds no database snapshot or collection lock while waiting for a
+client. A changed generation aborts the export rather than mixing states.
+
+Import commits each revision, its unverified source claim, and the existing
+mutation journal together. Provenance is bound to the destination revision with
+a cascading foreign key, so record/collection purge removes it. Source references
+are claims, not foreign keys into another collection. Only the trusted service
+can inspect this table; normal exports expose canonical destination authorship
+and references, never the private source claims.
+
+Random destination IDs group a batch's source history through a private persisted
+mapping. They neither adopt nor encode source IDs. A minimal mapping (destination
+record ID, importer principal, and a digest of the batch/source reference) survives
+record purge so unseen later rows in that batch cannot bypass the tombstone. It
+contains no text, metadata, raw batch key, or raw source identifiers; collection
+purge removes it. Each row has a derived retry key in the `put` mutation namespace
+(`import:` followed by a digest); clients should reserve that key prefix for
+imports. Raw batch keys and uploaded files are not stored. Index recovery and
+purged-key markers apply exactly as for ordinary writes. Transfers are not an
+account/database restore format and do not carry old grants or tombstones.
 
 ## Operating an upgrade
 

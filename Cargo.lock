@@ -2279,12 +2279,13 @@ dependencies = [
 
 [[package]]
 name = "priorart"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "axum",
  "caseless",
  "clap",
  "fs2",
+ "futures-util",
  "getrandom 0.4.3",
  "hf-hub",
  "lateweave",
