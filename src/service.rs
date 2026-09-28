@@ -161,7 +161,18 @@ impl Service {
         encoder: Option<Arc<dyn Encoder>>,
         owner: crate::ownership::DirectoryOwner,
     ) -> Result<Self, OpenError> {
-        Store::open(settings.data_dir.join(DATABASE_FILE))?;
+        let store = Store::open(settings.data_dir.join(DATABASE_FILE))?;
+        let mut after = String::new();
+        loop {
+            let pending = store.pending_purges(&after)?;
+            if pending.is_empty() {
+                break;
+            }
+            for collection in pending {
+                crate::index::purge_index_files(&settings.data_dir, &store, &collection)?;
+                after = collection;
+            }
+        }
         let encoder_name = encoder
             .as_ref()
             .map(|e| e.representation().encoder().to_owned());
@@ -366,17 +377,25 @@ impl Service {
             return invalid("invalid revision precondition");
         }
         store.check_delete_revision(collection_id, record_id, options.expected_revision)?;
-        let index = indexes.get(store, collection_id);
         policy::mutation(store, context, collection_id, record_id, Operation::Delete)?;
-        let index = index?;
         let committed = store.commit_delete(&intent, record_id, options.expected_revision)?;
         crate::fault::check("after_record_commit").map_err(IndexError::from)?;
-        let result = index.remove(store, record_id);
+        indexes.get(store, collection_id)?;
         policy::validate(store, context)?;
-        result?;
         store.complete_mutations(collection_id)?;
         crate::fault::check("after_mutation_complete").map_err(IndexError::from)?;
         Ok(committed)
+    }
+
+    pub fn delete_collection(&self, context: &RequestContext, collection: &str) -> Result<()> {
+        let handle = self.state(context, collection, Operation::Admin)?;
+        let mut state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
+        let State { store, indexes } = &mut *state;
+        policy::collection(store, context, collection, Operation::Admin)?;
+        store.purge_collection(collection)?;
+        crate::fault::check("after_collection_purge_commit").map_err(IndexError::from)?;
+        indexes.finish_purge(store, collection)?;
+        Ok(())
     }
 
     pub fn search(

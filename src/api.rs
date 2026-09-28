@@ -80,6 +80,11 @@ impl From<ServiceError> for ApiError {
                 | StoreError::CollectionNotFound(_),
             ) => Self::not_found(),
             ServiceError::InvalidInput(_) => Self::invalid(),
+            ServiceError::Store(StoreError::MutationPurged) => Self(
+                StatusCode::GONE,
+                "mutation_purged",
+                "mutation content was purged",
+            ),
             ServiceError::Store(StoreError::RecordDeleted { .. }) => {
                 Self(StatusCode::GONE, "record_deleted", "record was deleted")
             }
@@ -293,7 +298,10 @@ pub fn router(service: Arc<Service>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/collections", get(collections))
-        .route("/v1/collections/{collection}", get(collection))
+        .route(
+            "/v1/collections/{collection}",
+            get(collection).delete(delete_collection),
+        )
         .route("/v1/collections/{collection}/diagnostics", get(diagnostics))
         .route("/v1/collections/{collection}/records", post(put_record))
         .route(
@@ -621,4 +629,20 @@ async fn search_receipt(
     })
     .await?;
     Ok(Json(json!(receipt)))
+}
+
+async fn delete_collection(
+    State(service): State<Arc<Service>>,
+    Extension(context): Extension<RequestContext>,
+    path: Result<Path<String>, PathRejection>,
+    query: Result<Query<EmptyQuery>, QueryRejection>,
+) -> ApiResult<StatusCode> {
+    query?;
+    let Path(collection) = path?;
+    identifier(&collection)?;
+    blocking(&service, move |s| {
+        s.delete_collection(&context, &collection)
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
 }

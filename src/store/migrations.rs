@@ -38,6 +38,10 @@ const MIGRATIONS: &[Migration] = &[
         version: "v0.5.0",
         apply: create_private_feedback_schema,
     },
+    Migration {
+        version: "v0.6.0",
+        apply: create_lifecycle_schema,
+    },
 ];
 
 pub const SCHEMA_VERSION: &str = MIGRATIONS[MIGRATIONS.len() - 1].version;
@@ -309,6 +313,39 @@ fn create_private_feedback_schema(transaction: &Transaction<'_>) -> Result<(), S
     Ok(())
 }
 
+fn create_lifecycle_schema(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    transaction.execute_batch(
+        "ALTER TABLE records ADD COLUMN deleted_revision INTEGER;
+         ALTER TABLE mutations ADD COLUMN target_record_id TEXT;
+         UPDATE mutations SET target_record_id = CASE operation
+             WHEN 'put' THEN json_extract(result, '$[0]')
+             WHEN 'report' THEN COALESCE(
+                 (SELECT record_id FROM reports WHERE collection_id = mutations.collection_id AND id = json_extract(mutations.result, '$')),
+                 (SELECT record_id FROM published_reports WHERE collection_id = mutations.collection_id AND id = json_extract(mutations.result, '$')))
+             END;
+         CREATE INDEX mutations_target ON mutations(collection_id, target_record_id);
+         CREATE INDEX search_hits_record ON search_hits(collection_id, record_id, revision);
+         CREATE INDEX published_reports_record ON published_reports(collection_id, record_id);
+         CREATE TABLE purge_jobs (collection_id TEXT PRIMARY KEY);
+         CREATE TABLE collection_tombstones (id TEXT PRIMARY KEY, deleted_at TEXT NOT NULL);
+         CREATE TRIGGER prevent_collection_resurrection BEFORE INSERT ON collections
+             WHEN EXISTS(SELECT 1 FROM collection_tombstones WHERE id = NEW.id)
+             BEGIN SELECT RAISE(ABORT, 'collection was deleted'); END;
+         UPDATE records SET created_at = '', deleted_revision =
+             (SELECT MAX(revision) FROM revisions r WHERE r.collection_id = records.collection_id AND r.record_id = records.id)
+             WHERE deleted_at IS NOT NULL;",
+    )?;
+    let mut statement = transaction
+        .prepare("SELECT collection_id, id FROM records WHERE deleted_at IS NOT NULL")?;
+    let deleted = statement
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (collection, record) in deleted {
+        super::lifecycle::purge_record_content(transaction, &collection, &record)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod credential_tests {
     use super::*;
@@ -501,6 +538,93 @@ mod feedback_tests {
             .query_row("SELECT revision FROM search_hits", [], |r| r.get(0))
             .unwrap();
         assert_eq!(revision, 1);
+        assert!(connection
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .query([])
+            .unwrap()
+            .next()
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn upgrade_purges_tombstoned_content_and_is_transactional() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        run(&connection, &MIGRATIONS[..4]).unwrap();
+        connection.execute_batch("
+            INSERT INTO records VALUES ('local','gone','local-principal','created','deleted');
+            INSERT INTO revisions VALUES ('local','gone',1,NULL,NULL,'retained-sensitive-hash','created');
+            INSERT INTO reports VALUES ('local','feedback','local-principal','gone',1,NULL,'quoted secret','created');
+            INSERT INTO mutations VALUES ('mutation','local','local-principal','report','key-digest','content-digest','report','\"feedback\"','applied','created');
+        ").unwrap();
+        fn fail(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+            create_lifecycle_schema(transaction)?;
+            transaction.execute_batch("SELECT missing_function()")?;
+            Ok(())
+        }
+        let mut broken: Vec<_> = MIGRATIONS[..4]
+            .iter()
+            .map(|m| Migration {
+                version: m.version,
+                apply: m.apply,
+            })
+            .collect();
+        broken.push(Migration {
+            version: "v0.6.0",
+            apply: fail,
+        });
+        assert!(run(&connection, &broken).is_err());
+        assert_eq!(
+            stored_version(&connection).unwrap().as_deref(),
+            Some("v0.5.0")
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT text FROM reports", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "quoted secret"
+        );
+        migrate(&connection).unwrap();
+        migrate(&connection).unwrap();
+        for table in ["revisions", "reports"] {
+            assert_eq!(
+                connection
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        assert_eq!(
+            connection
+                .query_row("SELECT deleted_revision FROM records", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT payload_digest FROM mutations", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            ""
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT collection_id FROM purge_jobs", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            "local"
+        );
         assert!(connection
             .prepare("PRAGMA foreign_key_check")
             .unwrap()

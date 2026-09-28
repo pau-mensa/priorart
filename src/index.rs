@@ -53,6 +53,7 @@ impl CollectionIndexManager {
     }
 
     pub fn get(&mut self, store: &Store, collection_id: &str) -> Result<&mut Index> {
+        self.finish_purge(store, collection_id)?;
         store.get_collection(collection_id)?;
         if !self.loaded.contains_key(collection_id) {
             // Evict before loading, so even a rebuild respects the loaded-count bound.
@@ -76,6 +77,15 @@ impl CollectionIndexManager {
         Ok(index)
     }
 
+    pub(crate) fn finish_purge(&mut self, store: &Store, collection: &str) -> Result<()> {
+        if store.needs_purge(collection)? {
+            self.loaded.remove(collection);
+            self.lru.retain(|id| id != collection);
+            purge_index_files(&self.data_dir, store, collection)?;
+        }
+        Ok(())
+    }
+
     pub fn loaded_count(&self) -> usize {
         self.loaded.len()
     }
@@ -83,6 +93,21 @@ impl CollectionIndexManager {
     pub fn loaded(&self, collection_id: &str) -> Option<&Index> {
         self.loaded.get(collection_id)
     }
+}
+
+pub(crate) fn purge_index_files(data_dir: &Path, store: &Store, collection: &str) -> Result<()> {
+    let directory = collection_index_path(data_dir, collection);
+    match std::fs::remove_dir_all(&directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    if let Some(parent) = directory.parent().filter(|path| path.exists()) {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    crate::fault::check("after_purge_files")?;
+    store.complete_purge(collection)?;
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -94,6 +119,7 @@ struct Activation {
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
     collection_id: String,
+    purge_version: String,
     version: String,
     recipe: String,
     generation: u64,
@@ -155,6 +181,9 @@ impl Index {
         collection_id: &str,
     ) -> Result<Self> {
         store.get_collection(collection_id)?;
+        if store.needs_purge(collection_id)? {
+            purge_index_files(data_dir, store, collection_id)?;
+        }
         let directory = collection_index_path(data_dir, collection_id);
         std::fs::create_dir_all(&directory)?;
         std::fs::File::open(directory.parent().expect("indexes directory"))?.sync_all()?;
@@ -214,6 +243,27 @@ impl Index {
         let snapshot = std::fs::read(&self.manifest_path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Snapshot>(&bytes).ok());
+        let purge_version = store
+            .index_purge_version(&self.collection_id)?
+            .unwrap_or_default();
+        if !purge_version.is_empty()
+            && snapshot
+                .as_ref()
+                .is_none_or(|saved| saved.purge_version != purge_version)
+        {
+            purge_index_files(
+                self.directory
+                    .parent()
+                    .and_then(Path::parent)
+                    .expect("data directory"),
+                store,
+                &self.collection_id,
+            )?;
+            std::fs::create_dir_all(&self.directory)?;
+            self.active = None;
+            self.previous = None;
+            return self.rebuild(store);
+        }
         let snapshot_matches = snapshot.as_ref().is_some_and(|saved| {
             saved.collection_id == self.collection_id
                 && saved.recipe == INDEX_RECIPE
@@ -537,6 +587,9 @@ impl Index {
         self.generation += 1;
         let snapshot = Snapshot {
             collection_id: self.collection_id.clone(),
+            purge_version: store
+                .index_purge_version(&self.collection_id)?
+                .unwrap_or_default(),
             version: self.corpus_version.clone(),
             recipe: INDEX_RECIPE.to_owned(),
             generation: self.generation,

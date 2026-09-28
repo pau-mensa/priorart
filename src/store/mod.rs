@@ -6,6 +6,7 @@
 
 mod credentials;
 mod feedback;
+mod lifecycle;
 pub use feedback::{PublishedReport, SearchReceipt};
 pub mod migrations;
 pub mod mutations;
@@ -34,6 +35,8 @@ pub type Metadata = Map<String, Value>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    #[error("mutation content was purged")]
+    MutationPurged,
     #[error("idempotency key was already used with different input")]
     IdempotencyConflict,
     #[error("invalid mutation journal data")]
@@ -451,7 +454,7 @@ impl Store {
         )?)
     }
 
-    /// Nulls every revision's text and metadata and tombstones the record.
+    /// Purges content and associated feedback, retaining a minimal tombstone.
     /// Returns `false` when it was already deleted.
     pub fn delete(
         &self,
@@ -524,7 +527,7 @@ impl Store {
         Ok(result)
     }
 
-    /// Reports on a record in creation order; deleted records keep theirs.
+    /// Reports on a record in creation order.
     pub fn reports_for(&self, collection_id: &str, record_id: &str) -> Result<Vec<Report>> {
         if record_state(&self.connection, collection_id, record_id)? == RecordState::Missing {
             return Err(record_not_found(collection_id, record_id, None));
@@ -792,7 +795,8 @@ fn check_revision(
         });
     }
     let latest: Option<i64> = connection.query_row(
-        "SELECT MAX(revision) FROM revisions WHERE collection_id = ?1 AND record_id = ?2",
+        "SELECT COALESCE((SELECT MAX(revision) FROM revisions WHERE collection_id = ?1 AND record_id = ?2),
+         (SELECT deleted_revision FROM records WHERE collection_id = ?1 AND id = ?2))",
         (collection, record),
         |row| row.get(0),
     )?;
@@ -894,14 +898,12 @@ fn delete_in(
         false,
     )?;
     transaction.execute(
-        "UPDATE revisions SET text = NULL, metadata = NULL \
-             WHERE collection_id = ?1 AND record_id = ?2",
-        (collection_id, record_id),
-    )?;
-    transaction.execute(
-        "UPDATE records SET deleted_at = ?1 WHERE collection_id = ?2 AND id = ?3",
+        "UPDATE records SET deleted_at = ?1, created_at = '', deleted_revision =
+         (SELECT MAX(revision) FROM revisions WHERE collection_id = ?2 AND record_id = ?3)
+         WHERE collection_id = ?2 AND id = ?3",
         (now(), collection_id, record_id),
     )?;
+    lifecycle::purge_record_content(transaction, collection_id, record_id)?;
     Ok(true)
 }
 

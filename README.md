@@ -156,7 +156,8 @@ For database upgrades and recovery behavior, see [storage versions](docs/storage
 - Record mutations use a durable journal and atomic index-generation activation.
   HTTP retry keys avoid duplicate mutations after lost responses or recovery.
   Staging currently copies vector files, adding disk I/O proportional to index size.
-  Previous generations are retained; complete derived-data purging is later work.
+  Deletion purges associated feedback and all affected index generations, then
+  rebuilds surviving records. Backups and physical storage erasure are separate.
 - Authenticated/local searches keep requester-private receipts without queries or
   filters; anonymous public searches persist nothing. Reports default to private;
   explicit publication creates a separate public copy. Retention is still pending.

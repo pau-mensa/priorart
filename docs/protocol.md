@@ -104,7 +104,8 @@ deletes. With a matching key, a retry returns the original result and mutation I
 even if the original response was lost. Authentication and current original-operation
 authority are still required. Create retries need contribute/authorship, not an
 update grant; revoked credentials fail. A put/report replay on a deleted target is
-rejected. Replaying an older successful update never replaces a later revision.
+rejected. Purged keyed mutations retain a key marker without the content digest
+or result; retrying that key returns `410 mutation_purged`. Replaying an older successful update never replaces a later revision.
 
 The mutation receipt is committed atomically with the content. A retry recovers
 pending index work before succeeding. Without a key the mutation still has a
@@ -125,7 +126,23 @@ preconditions return `428`; stale ones return `409`. Returns `204`, including a
 repeat deletion with the same last revision. Deletes null text/metadata from all
 revisions and remove the indexed record. Tombstones reserve IDs. An authorized
 read of a deleted record returns `410`; unknown or forbidden targets return `404`.
-This is not yet complete erasure of linked feedback, search logs, or backups.
+Deletion purges all revisions and hashes, private/published reports on the record,
+and its links from search receipts. It removes every generation of the affected
+collection index and rebuilds from surviving records before returning success.
+Receipt IDs and links to other records remain. Record IDs cannot be reused.
+A failed rebuild can return an error after deletion commits; the tombstone is
+already authoritative, and retries resume recovery.
+
+`DELETE /v1/collections/{collection}` requires `admin`. It purges collection
+records, reports, receipts, mutation receipts, index state/files, and grants.
+Returns `204`; a repeated request returns the same `404` as any unavailable
+collection. Credentials lose only grants for the deleted collection; existing
+contexts carrying changed grants become stale and must authenticate again.
+Collection IDs cannot be reused, including `local`. No collection is recreated
+on startup. Interrupted filesystem cleanup resumes on restart before serving.
+
+These operations remove live service data, not historical backup copies or every
+residual byte on storage media. See [purge and restore rules](storage.md#purge-and-restore).
 
 ## Search
 
@@ -208,7 +225,8 @@ scope. Private reports remain private after publication.
 Schema `v0.5.0` removes query/filter/timing/score columns from existing search
 logs, preserving receipt IDs and revision links. This is a logical migration,
 not physical erasure of old database pages, journals, or backups. Retention,
-purge, and published-report removal remain lifecycle work in step 10.
+standalone feedback removal and retention remain later lifecycle work. Record and
+collection deletion now purge associated feedback and index generations.
 
 
 ## Errors and health

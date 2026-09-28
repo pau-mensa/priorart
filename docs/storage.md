@@ -17,10 +17,11 @@ are independent of the HTTP protocol version.
 |---|---|
 | Empty database | Create the current schema transactionally |
 | No `schema_version`, any existing schema | Reject; priorart only initializes empty databases |
-| `v0.2.0` | Add credentials/grants, mutation journal, and private feedback schema |
-| `v0.3.0` | Add the mutation journal and private feedback schema |
-| `v0.4.0` | Remove raw search data and add published report copies |
-| `v0.5.0` | Open without rerunning migrations |
+| `v0.2.0` | Apply credential, mutation, feedback, and lifecycle migrations |
+| `v0.3.0` | Apply mutation, feedback, and lifecycle migrations |
+| `v0.4.0` | Apply feedback and lifecycle migrations |
+| `v0.5.0` | Purge existing tombstoned content and add resumable index cleanup |
+| `v0.6.0` | Open without rerunning migrations |
 | A tag this build does not know | Reject, naming that release as the one to use |
 | Nonzero `PRAGMA user_version` | Reject as a Python implementation directory; use `v0.1.0` |
 
@@ -112,7 +113,8 @@ only after a complete index generation is activated or validated against the
 current live records. Recovery reconciles all committed mutations in that
 collection to its latest state. It does not replay an old record payload over a
 newer update or deletion. Applied receipts remain available for idempotent retries.
-Receipt retention/purging is deferred to step 10.
+Content purge scrubs affected receipts as described below. Time-based receipt
+retention remains step 10c.
 
 A matching idempotency retry reauthenticates, checks current original-operation
 permission and target availability, recovers the index if needed, and returns the
@@ -132,8 +134,8 @@ The previous activated generation is retained. Abandoned staging generations and
 older generations are reclaimed on subsequent builds, preserving the active and
 previous generations. Unrecognized old layouts are never served or adopted; an
 absent/invalid current pointer causes a rebuild from SQLite. Existing unrelated
-files are left alone. Retained generations can contain deleted derived data;
-this is not complete erasure, which remains step 10.
+files are left alone. Ordinary writes retain a previous generation. Record or collection purge removes
+all generations in the affected collection; see the purge rules below.
 
 The manifest binds collection, index incarnation, generation, encoder representation,
 recipe, ordered record/revision mapping, and vector-store generation. Loading checks
@@ -154,6 +156,56 @@ although unchanged records are not re-encoded. Filesystem syncs establish the
 publication order; actual power-loss durability still depends on the filesystem
 and storage hardware honoring them. Tokenizer fingerprints and chunking recipe
 versions remain later retrieval work.
+
+## Purge and restore
+
+Record deletion commits the tombstone, removal of all revisions/checksums,
+associated private/published reports, receipt-result links, and a durable purge
+job in one SQLite transaction. Other receipt results are preserved. The remaining
+record tombstone contains collection/record IDs, author principal, deletion time,
+and last revision for authorization and retry preconditions; its creation time is
+cleared. Deleted IDs cannot be reused.
+
+Affected mutation receipts without retry keys are removed. Keyed create/update/
+report receipts become markers containing no payload digest or result, so delayed
+retries cannot recreate auto-ID records or feedback. Delete receipts retain only
+non-content retry evidence. No billing evidence exists at this stage.
+
+After commit, the collection's cached index is dropped and its entire index
+storage directory is removed and synced. Recovery acknowledges the job only after
+file removal succeeds. The index is rebuilt solely from surviving records before
+a record deletion returns success. This re-encodes the surviving collection and
+has cost proportional to its size; unrelated collection indexes are untouched.
+An encoder failure cannot undo a committed deletion. Revocation during a rebuild
+blocks the response, but cannot undo the already authorized database commit.
+
+Collection deletion atomically removes all collection data and scoped grants,
+bumps affected credentials' grant versions, and leaves only a collection ID/time
+tombstone plus pending filesystem cleanup. A transaction interrupted before commit
+rolls back; an interruption after commit leaves the scope unavailable. Startup
+resumes cleanup before serving, even when no caller retains a grant. Deleting
+`local` does not bootstrap a replacement.
+
+Schema `v0.6.0` applies the same purge to records already tombstoned in the database.
+An index manifest carries the collection's purge version. An older restored index
+cannot match a newer deletion boundary and is removed before rebuilding. Deleted
+collection directories are also removed on startup. The authoritative database,
+not an index generation, decides which records exist.
+
+A supported restore uses a consistent database backup that includes every deletion
+that must remain effective; discard all copied index directories and rebuild.
+Never serve an older database snapshot that lacks subsequent tombstones. If only
+an older backup is available, replay all intervening deletions in an isolated
+instance before allowing access; without that deletion history, a no-resurrection
+guarantee is impossible. Do not merge an old index mirror or old records into the
+current database. Keep the service stopped while restoring and preserve WAL files
+when taking a live SQLite backup.
+
+Purge removes logical rows, caches, and index files from the live service. It does
+not promise physical erasure from SQLite free pages, WAL/journals, filesystem
+snapshots, storage media, exported files, or backups. Backup rotation and any
+storage-level erasure must be handled separately. Standalone feedback deletion,
+retention jobs, and export/import remain the next lifecycle changes.
 
 ## Operating an upgrade
 

@@ -43,6 +43,7 @@ These error rules do not promise identical timing or hide operational side chann
 | Read receipt | Owning principal, `feedback_read`, and current scope read access |
 | Publish report | Author, `report_publish`, readable live public target, and selected text |
 | Read published reports | Target read access; anonymous readers allowed for public targets |
+| Delete collection | `admin`; deletes data and scoped grants, leaving an ID/time tombstone |
 | Scoped health/diagnostics | `admin` on that collection, before loading its index or counting documents |
 
 Ownership and `admin` do not imply other credential operations. Moderation preserves
@@ -60,11 +61,11 @@ selected text and the public target reference, without private source links.
 
 Anonymous searches return `search_id: None` and persist no query or receipt.
 Authenticated/local searches persist minimal requester-private receipts without
-queries, filters, scores, or timings. Retention, complete deletion, export, and
-published-report removal remain later lifecycle work.
+queries, filters, scores, or timings. Retention, export/import, and standalone
+feedback removal remain later lifecycle work. Record/collection deletion purges
+linked feedback and index generations.
 Collection discovery requires read or admin access and applies its scope before
-pagination. Provisioning remains local administration; no remote creation, export,
-collection deletion, or background-job API is available.
+pagination. Provisioning remains local administration; no remote creation, export, or background-job API is available.
 
 ## Delegation across principals
 

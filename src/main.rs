@@ -1,5 +1,3 @@
-use priorart::auth::RequestContext;
-use priorart::store::LOCAL_COLLECTION_ID;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -165,12 +163,9 @@ fn serve(host: Option<String>, port: Option<u16>) -> Result<(), AnyError> {
     // with a blocking client that owns its own runtime.
     let service = Arc::new(Service::open(settings.clone())?);
     eprintln!(
-        "priorart {VERSION}: data at {}, encoder {}, {} documents",
+        "priorart {VERSION}: data at {}, encoder {}",
         settings.data_dir.display(),
-        settings.encoder,
-        service
-            .health(&RequestContext::local(), LOCAL_COLLECTION_ID)?
-            .document_count
+        settings.encoder
     );
     runtime()?.block_on(async move {
         let address: SocketAddr = tokio::net::lookup_host((settings.host.as_str(), settings.port))

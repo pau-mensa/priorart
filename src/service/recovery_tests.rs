@@ -144,3 +144,103 @@ fn failed_delete_never_serves_the_previous_generation() {
             .is_empty());
     }
 }
+
+#[test]
+fn purge_interruptions_resume_on_restart() {
+    for collection_delete in [false, true] {
+        let phases: &[&str] = if collection_delete {
+            &[
+                "before_collection_purge_commit",
+                "after_collection_purge_commit",
+                "after_purge_files",
+            ]
+        } else {
+            &[
+                "before_record_commit",
+                "after_record_commit",
+                "after_purge_files",
+                "before_index_activation",
+                "after_index_activation",
+            ]
+        };
+        for phase in phases {
+            let dir = tempfile::tempdir().unwrap();
+            let service = Service::new(settings(dir.path()), None).unwrap();
+            service
+                .put(
+                    &CALLER,
+                    LOCAL,
+                    "secret",
+                    None,
+                    Some("record"),
+                    Default::default(),
+                )
+                .unwrap();
+            service
+                .report(
+                    &CALLER,
+                    LOCAL,
+                    "record",
+                    "quotes secret",
+                    ReportOptions {
+                        revision: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            crate::fault::set(Some(phase));
+            let result = if collection_delete {
+                service.delete_collection(&CALLER, LOCAL)
+            } else {
+                service
+                    .delete(
+                        &CALLER,
+                        LOCAL,
+                        "record",
+                        DeleteOptions {
+                            expected_revision: Some(1),
+                            idempotency_key: Some("purge"),
+                        },
+                    )
+                    .map(|_| ())
+            };
+            assert!(result.is_err(), "{phase}");
+            crate::fault::set(None);
+            drop(service);
+            let service = Service::new(settings(dir.path()), None).unwrap();
+            let before = phase.starts_with("before_") && *phase != "before_index_activation";
+            if before {
+                assert!(service.get(&CALLER, LOCAL, "record", None).is_ok());
+            } else if collection_delete {
+                assert!(service.get(&CALLER, LOCAL, "record", None).is_err());
+                assert!(!crate::index::collection_index_path(dir.path(), LOCAL).exists());
+            } else {
+                assert!(service
+                    .search(&CALLER, LOCAL, "secret", None, 10)
+                    .unwrap()
+                    .hits
+                    .is_empty());
+                let store = service.connect().unwrap();
+                assert!(store.reports_for(LOCAL, "record").unwrap().is_empty());
+                service
+                    .delete(
+                        &CALLER,
+                        LOCAL,
+                        "record",
+                        DeleteOptions {
+                            expected_revision: Some(1),
+                            idempotency_key: Some("purge"),
+                        },
+                    )
+                    .unwrap();
+            }
+            assert!(service
+                .connect()
+                .unwrap()
+                .pending_purges("")
+                .unwrap()
+                .iter()
+                .all(|c| collection_delete && c == LOCAL));
+        }
+    }
+}

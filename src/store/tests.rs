@@ -88,7 +88,7 @@ fn second_put_appends_a_revision() {
 }
 
 #[test]
-fn delete_nulls_text_and_blocks_reuse() {
+fn delete_purges_revisions_and_blocks_reuse() {
     let (_directory, store) = open();
     let tags = metadata(json!({"a": 1}));
     let record = store
@@ -134,10 +134,7 @@ fn delete_nulls_text_and_blocks_reuse() {
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    assert_eq!(rows.len(), 2);
-    assert!(rows.iter().all(|(text, metadata, digest)| text.is_none()
-        && metadata.is_none()
-        && !digest.is_empty()));
+    assert!(rows.is_empty());
 }
 
 #[test]
@@ -202,7 +199,7 @@ fn filters_match_latest_metadata() {
 }
 
 #[test]
-fn reports_round_trip_including_deleted_records() {
+fn reports_round_trip_and_are_purged_with_the_record() {
     let (_directory, store) = open();
     put(&store, LOCAL, "x", Some("rec"));
     let hit = SearchHit {
@@ -224,7 +221,6 @@ fn reports_round_trip_including_deleted_records() {
             LOCAL_PRINCIPAL_ID,
         )
         .unwrap();
-    store.delete(LOCAL, "rec", Some(1)).unwrap();
     let reports = store.reports_for(LOCAL, "rec").unwrap();
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].id, report);
@@ -246,6 +242,14 @@ fn reports_round_trip_including_deleted_records() {
         store.add_report(LOCAL, "rec", None, Some("bogus"), "x", LOCAL_PRINCIPAL_ID),
         Err(StoreError::SearchNotFound { .. })
     ));
+    store.delete(LOCAL, "rec", Some(1)).unwrap();
+    assert!(store.reports_for(LOCAL, "rec").unwrap().is_empty());
+    assert!(store
+        .search_receipt(LOCAL, &search, LOCAL_PRINCIPAL_ID)
+        .unwrap()
+        .unwrap()
+        .hits
+        .is_empty());
 }
 
 #[test]

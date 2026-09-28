@@ -1035,3 +1035,65 @@ async fn private_receipts_and_explicit_public_report_copies() {
     assert!(rows.1["reports"][0].get("search_id").is_none());
     assert!(!rows.1.to_string().contains("private details"));
 }
+
+#[tokio::test]
+async fn collection_deletion_is_authorized_and_removes_discovery_and_content() {
+    let api = Api::start().await;
+    let collection = format!("/v1/collections/{}", api.public);
+    let hidden = api
+        .request(Method::DELETE, &collection, Some(&api.bob_key), None)
+        .await;
+    assert_eq!(hidden.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        hidden,
+        api.request(
+            Method::DELETE,
+            "/v1/collections/unknown",
+            Some(&api.bob_key),
+            None
+        )
+        .await
+    );
+    assert_eq!(
+        api.request(Method::DELETE, &collection, None, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        api.request(Method::DELETE, &collection, Some(&api.alice_key), None)
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(api.get(&collection, None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        api.get(&format!("{collection}/records/same"), None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        api.post(
+            "/v1/search",
+            None,
+            json!({"collections": [api.public], "text": "sentinel"})
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let listing = api.get("/v1/collections", None).await.1.to_string();
+    assert!(!listing.contains(&api.public));
+    assert_eq!(
+        api.get(
+            &format!("{}/same", api.records(&api.a)),
+            Some(&api.alice_key)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        api.request(Method::DELETE, &collection, Some(&api.alice_key), None)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+}

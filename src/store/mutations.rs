@@ -43,7 +43,10 @@ impl Store {
                 intent.principal,
                 expected,
             )?;
-            Ok((record.record_id, record.revision))
+            Ok((
+                (record.record_id.clone(), record.revision),
+                record.record_id,
+            ))
         })
     }
 
@@ -55,7 +58,7 @@ impl Store {
     ) -> Result<Mutation<()>> {
         self.commit_mutation(intent, false, |transaction| {
             delete_in(transaction, intent.collection, record, expected)?;
-            Ok(())
+            Ok(((), record.to_owned()))
         })
     }
 
@@ -68,7 +71,7 @@ impl Store {
         text: &str,
     ) -> Result<Mutation<String>> {
         self.commit_mutation(intent, true, |transaction| {
-            add_report_in(
+            let id = add_report_in(
                 transaction,
                 intent.collection,
                 record,
@@ -76,7 +79,8 @@ impl Store {
                 search,
                 text,
                 intent.principal,
-            )
+            )?;
+            Ok((id, record.to_owned()))
         })
     }
 
@@ -93,7 +97,7 @@ impl Store {
                 "INSERT INTO published_reports VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 (intent.collection, &id, record, revision, text, now()),
             )?;
-            Ok(id)
+            Ok((id, record.to_owned()))
         })
     }
 
@@ -101,16 +105,16 @@ impl Store {
         &self,
         intent: &Intent<'_>,
         applied: bool,
-        change: impl FnOnce(&Transaction<'_>) -> Result<T>,
+        change: impl FnOnce(&Transaction<'_>) -> Result<(T, String)>,
     ) -> Result<Mutation<T>> {
         let transaction = self.write()?;
         if let Some((result, _)) = replay(&transaction, intent)? {
             return Ok(result);
         }
-        let value = change(&transaction)?;
+        let (value, target_record) = change(&transaction)?;
         let mutation_id = new_id();
         transaction.execute(
-            "INSERT INTO mutations VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            "INSERT INTO mutations VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             rusqlite::params![
                 mutation_id,
                 intent.collection,
@@ -121,7 +125,8 @@ impl Store {
                 intent.authority,
                 serde_json::to_string(&value).map_err(|_| StoreError::Journal)?,
                 if applied { "applied" } else { "committed" },
-                now()
+                now(),
+                target_record
             ],
         )?;
         crate::fault::check("before_record_commit")?;
@@ -152,6 +157,9 @@ fn replay<T: DeserializeOwned>(
         (intent.collection, intent.principal, intent.operation, digest(key)),
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?;
     row.map(|(id, payload, value, authority)| {
+        if payload.is_empty() {
+            return Err(StoreError::MutationPurged);
+        }
         if payload != intent.payload {
             return Err(StoreError::IdempotencyConflict);
         }

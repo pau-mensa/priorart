@@ -842,7 +842,7 @@ fn expired_credentials_fail_even_for_public_data() {
 }
 
 #[test]
-fn revocation_during_index_recovery_blocks_diagnostics_and_deletes() {
+fn revocation_during_recovery_blocks_responses_but_does_not_undo_committed_deletion() {
     for diagnostics in [false, true] {
         let encoder = Arc::new(RevokingEncoder {
             fake: FakeEncoder::new(),
@@ -850,6 +850,9 @@ fn revocation_during_index_recovery_blocks_diagnostics_and_deletes() {
         });
         let f = Fixture::new(Some(encoder.clone()));
         let context = f.alice();
+        f.store
+            .put(&f.a, "survivor", None, Some("survivor"), &f.alice, None)
+            .unwrap();
         *encoder.action.lock().unwrap() = Some((
             f.store.path().to_owned(),
             context.credential().unwrap().id.clone(),
@@ -868,7 +871,14 @@ fn revocation_during_index_recovery_blocks_diagnostics_and_deletes() {
                 },
             ));
         }
-        assert!(f.store.get(&f.a, "same", None).is_ok());
+        if diagnostics {
+            assert!(f.store.get(&f.a, "same", None).is_ok());
+        } else {
+            assert!(matches!(
+                f.store.get(&f.a, "same", None),
+                Err(priorart::store::StoreError::RecordDeleted { .. })
+            ));
+        }
     }
 }
 
