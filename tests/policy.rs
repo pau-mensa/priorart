@@ -23,6 +23,7 @@ const ALL: &[Op] = &[
     Op::Delete,
     Op::Report,
     Op::FeedbackRead,
+    Op::ReportPublish,
     Op::Moderate,
     Op::Admin,
     Op::Delegate,
@@ -869,4 +870,249 @@ fn revocation_during_index_recovery_blocks_diagnostics_and_deletes() {
         }
         assert!(f.store.get(&f.a, "same", None).is_ok());
     }
+}
+
+#[test]
+fn receipts_and_publication_preserve_requester_privacy() {
+    let f = Fixture::new(None);
+    let alice = f.alice();
+    let key = f.delegated(
+        &f.bob,
+        &f.public,
+        &[Op::Report, Op::FeedbackRead, Op::ReportPublish],
+    );
+    let bob = f.context(&key);
+    let search = f
+        .service
+        .search(&bob, &f.public, "sentinel", None, 10)
+        .unwrap();
+    let receipt = search.search_id.unwrap();
+    assert_eq!(
+        f.service
+            .search_receipt(&bob, &f.public, &receipt)
+            .unwrap()
+            .hits
+            .len(),
+        1
+    );
+    unavailable(f.service.search_receipt(&alice, &f.public, &receipt));
+    unavailable(f.service.search_receipt(&alice, &f.public, "guessed"));
+    unavailable(
+        f.service
+            .search_receipt(&RequestContext::anonymous(), &f.public, &receipt),
+    );
+    let report = f
+        .service
+        .report(
+            &bob,
+            &f.public,
+            "same",
+            "private project details",
+            priorart::service::ReportOptions {
+                revision: Some(1),
+                search_id: Some(&receipt),
+                idempotency_key: None,
+            },
+        )
+        .unwrap();
+    unavailable(
+        f.service
+            .publish_report(&alice, &f.public, &report.value, "stolen", None),
+    );
+    assert!(f
+        .service
+        .reports(&alice, &f.public, "same")
+        .unwrap()
+        .is_empty());
+    let limited = f.context(&f.delegated(&f.bob, &f.public, &[Op::Report]));
+    unavailable(
+        f.service
+            .publish_report(&limited, &f.public, &report.value, "no grant", None),
+    );
+    unavailable(f.service.search_receipt(&limited, &f.public, &receipt));
+    unauthenticated(f.service.search_receipt(&bob, &f.public, &receipt));
+    unauthenticated(f.service.publish_report(
+        &bob,
+        &f.public,
+        &report.value,
+        "stale context",
+        None,
+    ));
+    let bob = f.context(&key);
+    let anonymous = RequestContext::anonymous();
+    assert!(f
+        .service
+        .published_reports(&anonymous, &f.public, "same")
+        .unwrap()
+        .is_empty());
+    let published = f
+        .service
+        .publish_report(
+            &bob,
+            &f.public,
+            &report.value,
+            "selected public text",
+            Some("publish-once"),
+        )
+        .unwrap();
+    assert_eq!(
+        published,
+        f.service
+            .publish_report(
+                &bob,
+                &f.public,
+                &report.value,
+                "selected public text",
+                Some("publish-once")
+            )
+            .unwrap()
+    );
+    let rows = f
+        .service
+        .published_reports(&anonymous, &f.public, "same")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_ne!(rows[0].id, report.value);
+    let encoded = serde_json::to_string(&rows).unwrap();
+    for private in [
+        &receipt,
+        &report.value,
+        "private project details",
+        "search_id",
+        "reporter_principal_id",
+    ] {
+        assert!(!encoded.contains(private));
+    }
+    let private = f
+        .service
+        .report(
+            &alice,
+            &f.a,
+            "same",
+            "private",
+            priorart::service::ReportOptions {
+                revision: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    unavailable(
+        f.service
+            .publish_report(&alice, &f.a, &private.value, "no", None),
+    );
+    f.service
+        .delete(
+            &alice,
+            &f.public,
+            "same",
+            priorart::service::DeleteOptions {
+                expected_revision: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(f
+        .service
+        .published_reports(&anonymous, &f.public, "same")
+        .is_err());
+    assert!(f
+        .service
+        .publish_report(
+            &bob,
+            &f.public,
+            &report.value,
+            "selected public text",
+            Some("publish-once")
+        )
+        .is_err());
+}
+
+#[test]
+fn receipt_evidence_requires_the_exact_returned_revision() {
+    let f = Fixture::new(None);
+    let alice = f.alice();
+    assert!(matches!(
+        f.service.report(
+            &alice,
+            &f.public,
+            "same",
+            "missing revision",
+            Default::default()
+        ),
+        Err(ServiceError::InvalidInput(_))
+    ));
+
+    let receipt = f
+        .service
+        .search(&alice, &f.public, "sentinel", None, 10)
+        .unwrap()
+        .search_id
+        .unwrap();
+    f.service
+        .put(
+            &alice,
+            &f.public,
+            "new revision",
+            None,
+            Some("same"),
+            WriteOptions {
+                expected_revision: Some(1),
+                publish: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(f
+        .service
+        .report(
+            &alice,
+            &f.public,
+            "same",
+            "wrong revision",
+            priorart::service::ReportOptions {
+                revision: Some(2),
+                search_id: Some(&receipt),
+                ..Default::default()
+            }
+        )
+        .is_err());
+    f.service
+        .report(
+            &alice,
+            &f.public,
+            "same",
+            "old exact revision",
+            priorart::service::ReportOptions {
+                revision: Some(1),
+                search_id: Some(&receipt),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let empty = f
+        .service
+        .search(
+            &alice,
+            &f.public,
+            "sentinel",
+            Some(json!({"absent": true}).as_object().unwrap()),
+            10,
+        )
+        .unwrap()
+        .search_id
+        .unwrap();
+    assert!(f
+        .service
+        .report(
+            &alice,
+            &f.public,
+            "same",
+            "not returned",
+            priorart::service::ReportOptions {
+                revision: Some(2),
+                search_id: Some(&empty),
+                ..Default::default()
+            }
+        )
+        .is_err());
 }

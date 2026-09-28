@@ -157,8 +157,9 @@ For database upgrades and recovery behavior, see [storage versions](docs/storage
   HTTP retry keys avoid duplicate mutations after lost responses or recovery.
   Staging currently copies vector files, adding disk I/O proportional to index size.
   Previous generations are retained; complete derived-data purging is later work.
-- Authenticated/local searches still log query text; anonymous public searches
-  persist nothing. There is no retention policy yet.
+- Authenticated/local searches keep requester-private receipts without queries or
+  filters; anonymous public searches persist nothing. Reports default to private;
+  explicit publication creates a separate public copy. Retention is still pending.
 - Reports are stored and returned, not scored. Voting is not correctness.
 
 ## Contributing

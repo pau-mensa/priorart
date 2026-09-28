@@ -34,6 +34,10 @@ const MIGRATIONS: &[Migration] = &[
         version: "v0.4.0",
         apply: create_mutation_schema,
     },
+    Migration {
+        version: "v0.5.0",
+        apply: create_private_feedback_schema,
+    },
 ];
 
 pub const SCHEMA_VERSION: &str = MIGRATIONS[MIGRATIONS.len() - 1].version;
@@ -284,6 +288,27 @@ fn create_mutation_schema(transaction: &Transaction<'_>) -> Result<(), StoreErro
     Ok(())
 }
 
+fn create_private_feedback_schema(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    transaction.execute_batch(
+        "ALTER TABLE searches DROP COLUMN text;
+         ALTER TABLE searches DROP COLUMN filters;
+         ALTER TABLE searches DROP COLUMN timings;
+         ALTER TABLE search_hits DROP COLUMN score;
+         CREATE TABLE published_reports (
+             collection_id TEXT NOT NULL,
+             id TEXT NOT NULL,
+             record_id TEXT NOT NULL,
+             revision INTEGER NOT NULL,
+             text TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             PRIMARY KEY (collection_id, id),
+             FOREIGN KEY (collection_id, record_id, revision)
+                 REFERENCES revisions(collection_id, record_id, revision)
+         );",
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod credential_tests {
     use super::*;
@@ -398,7 +423,7 @@ mod mutation_tests {
         migrate(&connection).unwrap();
         assert_eq!(
             stored_version(&connection).unwrap().as_deref(),
-            Some("v0.4.0")
+            Some(SCHEMA_VERSION)
         );
         let count: i64 = connection
             .query_row("SELECT COUNT(*) FROM records WHERE id = 'kept'", [], |r| {
@@ -410,5 +435,79 @@ mod mutation_tests {
             .query_row("SELECT COUNT(*) FROM mutations", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+}
+
+#[cfg(test)]
+mod feedback_tests {
+    use super::*;
+
+    #[test]
+    fn feedback_upgrade_removes_query_data_and_rolls_back_on_failure() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        run(&connection, &MIGRATIONS[..3]).unwrap();
+        connection.execute_batch("
+            INSERT INTO records VALUES ('local', 'r', 'local-principal', 'now', NULL);
+            INSERT INTO revisions VALUES ('local', 'r', 1, 'record', NULL, 'hash', 'now');
+            INSERT INTO searches VALUES ('local', 's', 'local-principal', 'secret query', '{\"secret\":true}', '{}', 'now');
+            INSERT INTO search_hits VALUES ('local', 's', 0, 'r', 1, 0.5);
+            INSERT INTO reports VALUES ('local', 'f', 'local-principal', 'r', 1, 's', 'private', 'now');
+        ").unwrap();
+        fn fail(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+            create_private_feedback_schema(transaction)?;
+            transaction.execute_batch("SELECT missing_function()")?;
+            Ok(())
+        }
+        let broken = [
+            Migration {
+                version: "v0.2.0",
+                apply: create_collection_schema,
+            },
+            Migration {
+                version: "v0.3.0",
+                apply: create_credential_schema,
+            },
+            Migration {
+                version: "v0.4.0",
+                apply: create_mutation_schema,
+            },
+            Migration {
+                version: "v0.5.0",
+                apply: fail,
+            },
+        ];
+        assert!(run(&connection, &broken).is_err());
+        assert_eq!(
+            stored_version(&connection).unwrap().as_deref(),
+            Some("v0.4.0")
+        );
+        assert!(connection.prepare("SELECT text FROM searches").is_ok());
+        migrate(&connection).unwrap();
+        migrate(&connection).unwrap();
+        for column in ["text", "filters", "timings"] {
+            assert!(connection
+                .prepare(&format!("SELECT {column} FROM searches"))
+                .is_err());
+        }
+        assert!(connection.prepare("SELECT score FROM search_hits").is_err());
+        let link: String = connection
+            .query_row("SELECT search_id FROM reports", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(link, "s");
+        let revision: i64 = connection
+            .query_row("SELECT revision FROM search_hits", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(revision, 1);
+        assert!(connection
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .query([])
+            .unwrap()
+            .next()
+            .unwrap()
+            .is_none());
     }
 }

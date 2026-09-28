@@ -305,6 +305,18 @@ pub fn router(service: Arc<Service>) -> Router {
             get(list_reports),
         )
         .route("/v1/collections/{collection}/reports", post(report))
+        .route(
+            "/v1/collections/{collection}/reports/{id}/publish",
+            post(publish_report),
+        )
+        .route(
+            "/v1/collections/{collection}/records/{id}/published-reports",
+            get(published_reports),
+        )
+        .route(
+            "/v1/collections/{collection}/searches/{id}",
+            get(search_receipt),
+        )
         .route("/v1/search", post(search))
         .fallback(|| async { ApiError::not_found() })
         .method_not_allowed_fallback(|| async {
@@ -544,4 +556,69 @@ async fn list_reports(
     let rows = blocking(&service, move |s| s.reports(&context, &collection, &id)).await?;
     let rows: Vec<_> = rows.into_iter().map(|r| json!({"collection_id": r.collection_id, "id": r.id, "record_id": r.record_id, "revision": r.revision, "search_id": r.search_id, "text": r.text, "created_at": r.created_at})).collect();
     Ok(Json(json!({"reports": rows})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicationRequest {
+    text: String,
+}
+
+async fn publish_report(
+    State(service): State<Arc<Service>>,
+    Extension(context): Extension<RequestContext>,
+    Extension(key): Extension<IdempotencyKey>,
+    path: Result<Path<(String, String)>, PathRejection>,
+    query: Result<Query<EmptyQuery>, QueryRejection>,
+    body: Result<Json<PublicationRequest>, JsonRejection>,
+) -> ApiResult<(StatusCode, [(&'static str, String); 1], Json<Value>)> {
+    query?;
+    let Path((collection, id)) = path?;
+    identifier(&collection)?;
+    identifier(&id)?;
+    let Json(body) = body?;
+    let response_collection = collection.clone();
+    let result = blocking(&service, move |s| {
+        s.publish_report(&context, &collection, &id, &body.text, key.0.as_deref())
+    })
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        [("mutation-id", result.mutation_id)],
+        Json(json!({"collection_id": response_collection, "id": result.value})),
+    ))
+}
+
+async fn published_reports(
+    State(service): State<Arc<Service>>,
+    Extension(context): Extension<RequestContext>,
+    path: Result<Path<(String, String)>, PathRejection>,
+    query: Result<Query<EmptyQuery>, QueryRejection>,
+) -> ApiResult<Json<Value>> {
+    query?;
+    let Path((collection, id)) = path?;
+    identifier(&collection)?;
+    identifier(&id)?;
+    let rows = blocking(&service, move |s| {
+        s.published_reports(&context, &collection, &id)
+    })
+    .await?;
+    Ok(Json(json!({"reports": rows})))
+}
+
+async fn search_receipt(
+    State(service): State<Arc<Service>>,
+    Extension(context): Extension<RequestContext>,
+    path: Result<Path<(String, String)>, PathRejection>,
+    query: Result<Query<EmptyQuery>, QueryRejection>,
+) -> ApiResult<Json<Value>> {
+    query?;
+    let Path((collection, id)) = path?;
+    identifier(&collection)?;
+    identifier(&id)?;
+    let receipt = blocking(&service, move |s| {
+        s.search_receipt(&context, &collection, &id)
+    })
+    .await?;
+    Ok(Json(json!(receipt)))
 }

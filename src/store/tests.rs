@@ -208,17 +208,9 @@ fn reports_round_trip_including_deleted_records() {
     let hit = SearchHit {
         record_id: "rec".into(),
         revision: 1,
-        score: 1.0,
     };
     let search = store
-        .log_search(
-            LOCAL,
-            "q",
-            None,
-            &[hit],
-            &Metadata::new(),
-            LOCAL_PRINCIPAL_ID,
-        )
+        .create_search_receipt(LOCAL, &[hit], LOCAL_PRINCIPAL_ID)
         .unwrap();
     assert!(store.has_search(LOCAL, &search).unwrap());
     assert!(!store.has_search(LOCAL, "nope").unwrap());
@@ -527,9 +519,7 @@ fn cross_collection_references_fail_in_the_database() {
     put_as(&store, &b, &bob, "text", "same");
     put_as(&store, &b, &bob, "text", "same");
     put_as(&store, &b, &bob, "text", "only-b");
-    let search = store
-        .log_search(&b, "q", None, &[], &Metadata::new(), &bob)
-        .unwrap();
+    let search = store.create_search_receipt(&b, &[], &bob).unwrap();
     let connection = &store.connection;
     assert!(is_constraint(connection.execute(
         "INSERT INTO revisions (collection_id, record_id, revision, text_sha256, created_at) \
@@ -559,14 +549,10 @@ fn cross_collection_references_fail_in_the_database() {
     let foreign = SearchHit {
         record_id: "same".into(),
         revision: 2,
-        score: 1.0,
     };
-    assert!(store_constraint(store.log_search(
+    assert!(store_constraint(store.create_search_receipt(
         &a,
-        "q",
-        None,
         &[foreign],
-        &Metadata::new(),
         &alice
     )));
     let count: i64 = connection
@@ -579,7 +565,7 @@ fn cross_collection_references_fail_in_the_database() {
     assert_eq!(count, 0);
     assert!(!store.has_search(&a, &search).unwrap());
     assert!(is_constraint(connection.execute(
-        "INSERT INTO search_hits VALUES (?1, ?2, 0, 'same', 1, 1.0)",
+        "INSERT INTO search_hits VALUES (?1, ?2, 0, 'same', 1)",
         [&a, &search],
     )));
 }

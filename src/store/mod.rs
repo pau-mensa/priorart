@@ -5,6 +5,8 @@
 //! requests must go through the policy-enforcing Service.
 
 mod credentials;
+mod feedback;
+pub use feedback::{PublishedReport, SearchReceipt};
 pub mod migrations;
 pub mod mutations;
 #[cfg(test)]
@@ -140,12 +142,11 @@ pub struct Report {
     pub reporter_principal_id: Option<String>,
 }
 
-/// One logged hit; its collection is the logged search's collection.
-#[derive(Clone, Debug, PartialEq)]
+/// One receipt result, scoped to its search collection.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct SearchHit {
     pub record_id: String,
     pub revision: i64,
-    pub score: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -578,33 +579,26 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn log_search(
+    pub fn create_search_receipt(
         &self,
         collection_id: &str,
-        text: &str,
-        filters: Option<&Metadata>,
         hits: &[SearchHit],
-        timings: &Metadata,
         requester_principal_id: &str,
     ) -> Result<String> {
         let id = new_id();
         let transaction = self.write()?;
         transaction.execute(
-            "INSERT INTO searches (collection_id, id, requester_principal_id, text, filters, \
-             timings, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO searches (collection_id, id, requester_principal_id, created_at) VALUES (?1, ?2, ?3, ?4)",
             (
                 collection_id,
                 &id,
                 requester_principal_id,
-                text,
-                filters.map(encode),
-                encode(timings),
                 now(),
             ),
         )?;
         {
             let mut insert =
-                transaction.prepare("INSERT INTO search_hits VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?;
+                transaction.prepare("INSERT INTO search_hits VALUES (?1, ?2, ?3, ?4, ?5)")?;
             for (position, hit) in hits.iter().enumerate() {
                 insert.execute((
                     collection_id,
@@ -612,7 +606,6 @@ impl Store {
                     position as i64,
                     &hit.record_id,
                     hit.revision,
-                    hit.score,
                 ))?;
             }
         }
@@ -939,7 +932,21 @@ fn add_report_in(
         }
     }
     if let Some(search_id) = search_id {
-        if !search_exists(transaction, collection_id, search_id)? {
+        let matches: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM searches s JOIN search_hits h
+             ON h.collection_id = s.collection_id AND h.search_id = s.id
+             WHERE s.collection_id = ?1 AND s.id = ?2 AND s.requester_principal_id = ?3
+             AND h.record_id = ?4 AND h.revision = ?5)",
+            (
+                collection_id,
+                search_id,
+                reporter_principal_id,
+                record_id,
+                revision,
+            ),
+            |row| row.get(0),
+        )?;
+        if !matches {
             return Err(StoreError::SearchNotFound {
                 collection_id: collection_id.to_owned(),
                 search_id: search_id.to_owned(),

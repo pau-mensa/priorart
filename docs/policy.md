@@ -38,8 +38,11 @@ These error rules do not promise identical timing or hide operational side chann
 | Create record | Authenticated `contribute`; author is the requesting principal |
 | Update record | `update` plus original authorship, or `update` plus `moderate` |
 | Delete record | `delete` plus original authorship, or `delete` plus `moderate`; tombstones retain authorship |
-| Create report | `report` plus target read access; attached receipt must belong to requester in the same collection |
+| Create report | `report` plus target read access; attached receipt must belong to requester and contain the exact target revision |
 | List reports | `feedback_read` plus target read access; only the requester's rows are loaded |
+| Read receipt | Owning principal, `feedback_read`, and current scope read access |
+| Publish report | Author, `report_publish`, readable live public target, and selected text |
+| Read published reports | Target read access; anonymous readers allowed for public targets |
 | Scoped health/diagnostics | `admin` on that collection, before loading its index or counting documents |
 
 Ownership and `admin` do not imply other credential operations. Moderation preserves
@@ -50,12 +53,15 @@ immutable, and no operation automatically republishes restricted content.
 
 Reports remain private even on public records. An owner/moderator cannot read another
 requester's reports. Deleted targets do not expose reports through the service.
-HTTP requires an exact report revision; trusted service callers may still omit one
-to resolve the latest live revision. Verifying receipt hit membership is step 9. Unknown and someone else's receipt IDs produce the same missing-receipt error.
+HTTP and direct service calls require an exact positive report revision. Attached
+receipts must contain that exact result. Unknown and someone else's receipt IDs
+produce the same missing-receipt error. Publication creates a separate copy with
+selected text and the public target reference, without private source links.
 
 Anonymous searches return `search_id: None` and persist no query or receipt.
-Authenticated/local searches still use the existing raw query log. Minimal receipts,
-retention, complete deletion, export, and public report publication are later steps.
+Authenticated/local searches persist minimal requester-private receipts without
+queries, filters, scores, or timings. Retention, complete deletion, export, and
+published-report removal remain later lifecycle work.
 Collection discovery requires read or admin access and applies its scope before
 pagination. Provisioning remains local administration; no remote creation, export,
 collection deletion, or background-job API is available.

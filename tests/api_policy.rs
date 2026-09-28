@@ -18,6 +18,7 @@ const ALL: &[Op] = &[
     Op::Delete,
     Op::Report,
     Op::FeedbackRead,
+    Op::ReportPublish,
     Op::Moderate,
     Op::Admin,
     Op::Delegate,
@@ -989,4 +990,48 @@ async fn idempotency_is_principal_and_collection_scoped_and_rechecks_authority()
         .0,
         StatusCode::BAD_REQUEST
     );
+}
+
+#[tokio::test]
+async fn private_receipts_and_explicit_public_report_copies() {
+    let api = Api::start().await;
+    let root = format!("/v1/collections/{}", api.public);
+    let search = api
+        .post(
+            "/v1/search",
+            Some(&api.alice_key),
+            json!({"collections": [api.public], "text": "sentinel"}),
+        )
+        .await
+        .1;
+    let receipt = format!("{root}/searches/{}", search["search_id"].as_str().unwrap());
+    assert_eq!(
+        api.get(&receipt, Some(&api.alice_key)).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        api.get(&receipt, Some(&api.bob_key)).await,
+        api.get(&format!("{root}/searches/guessed"), Some(&api.bob_key))
+            .await
+    );
+    let report = api.post(&format!("{root}/reports"), Some(&api.alice_key), json!({"record_id": "same", "revision": 1, "text": "private details", "search_id": search["search_id"]})).await;
+    assert_eq!(report.0, StatusCode::CREATED);
+    let public = format!("{root}/records/same/published-reports");
+    assert_eq!(api.get(&public, None).await.1, json!({"reports": []}));
+    let published = api
+        .post(
+            &format!(
+                "{root}/reports/{}/publish",
+                report.1["id"].as_str().unwrap()
+            ),
+            Some(&api.alice_key),
+            json!({"text": "selected text"}),
+        )
+        .await;
+    assert_eq!(published.0, StatusCode::CREATED);
+    let rows = api.get(&public, None).await;
+    assert_eq!(rows.0, StatusCode::OK);
+    assert_eq!(rows.1["reports"][0]["text"], "selected text");
+    assert!(rows.1["reports"][0].get("search_id").is_none());
+    assert!(!rows.1.to_string().contains("private details"));
 }

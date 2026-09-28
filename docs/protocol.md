@@ -159,8 +159,16 @@ Hits bind excerpts/metadata to the exact qualified revision. `score_semantics`
 identifies the scoring recipe; scores from different recipes are not interchangeable.
 Pipeline timing, encoder paths, and global counts are not part of this response.
 Anonymous public searches return `search_id:null` and persist nothing.
-Authenticated/local searches still persist raw query text and filters; minimal
-private receipts and retention are step 9.
+Authenticated/local searches persist only the requesting principal, opaque ID,
+authorized collection, ordered returned record/revision links, and creation time.
+Queries, filters, excerpts, scores, and timings are not persisted. Diagnostic query
+retention is not supported.
+
+`GET /v1/collections/{collection}/searches/{id}` requires the owning principal,
+`feedback_read`, and current read access to the collection. It returns
+`{"collection_id","id","created_at","hits":[{"record_id","revision"}]}`.
+Unknown and other principals' receipts return the same unavailable response.
+Collection ownership grants no access to visitors' receipts.
 
 ## Feedback
 
@@ -173,7 +181,7 @@ private receipts and retention are step 9.
 Returns `201 {"collection_id":"…","id":"…"}`. A positive, readable, live target
 revision is required. Text must be nonempty and at most 65536 UTF-8 bytes.
 `search_id` is optional; if supplied it must belong to the requester in the same
-collection. Exact receipt-hit membership checks remain step 9. Both `report` and
+collection and contain the exact reported record/revision. Both `report` and
 target read access are required. Reports on deleted targets are rejected.
 
 `GET /v1/collections/{collection}/records/{id}/reports` requires `feedback_read`
@@ -181,6 +189,27 @@ and target read access. Returns `{"reports":[{"collection_id","id","record_id",
 "revision","search_id","text","created_at"}]}` in creation order, containing
 only the requester's private reports. Public visibility, ownership, or moderation
 does not expose another principal's feedback. Deleted targets expose no reports.
+
+`POST /v1/collections/{collection}/reports/{id}/publish` with `{"text":"selected text"}`
+creates a separate public copy. Only the private report's author with
+`report_publish` and current target read access may publish, and the target must
+be public and live. Selected text is required (nonempty, at most 65536 UTF-8 bytes);
+review it for private details before publishing. The response is
+`201 {"collection_id","id"}` with a new public ID and `Mutation-Id` header.
+`Idempotency-Key` is supported and shares the report operation's key namespace.
+Retries recheck authorship, permissions, and the live target.
+
+`GET /v1/collections/{collection}/records/{id}/published-reports` requires target
+read access, including anonymous access to public targets. It returns
+`{"reports":[{"collection_id","id","record_id","revision","text","created_at"}]}`.
+Copies contain no private report ID, receipt link, reporter identity, or search
+scope. Private reports remain private after publication.
+
+Schema `v0.5.0` removes query/filter/timing/score columns from existing search
+logs, preserving receipt IDs and revision links. This is a logical migration,
+not physical erasure of old database pages, journals, or backups. Retention,
+purge, and published-report removal remain lifecycle work in step 10.
+
 
 ## Errors and health
 

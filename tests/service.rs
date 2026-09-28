@@ -279,7 +279,7 @@ fn lexical_only_mode() {
 }
 
 #[test]
-fn an_empty_corpus_still_logs_the_search() {
+fn an_empty_corpus_still_creates_a_receipt() {
     let directory = tempfile::tempdir().unwrap();
     let service = Service::new(settings(&directory), fake()).unwrap();
     let outcome = service
@@ -324,7 +324,7 @@ fn reports() {
             "cuda",
             "x",
             priorart::service::ReportOptions {
-                revision: None,
+                revision: Some(1),
                 search_id: Some("bogus"),
                 idempotency_key: None
             }
@@ -338,7 +338,7 @@ fn reports() {
             "missing",
             "x",
             priorart::service::ReportOptions {
-                revision: None,
+                revision: Some(1),
                 search_id: None,
                 idempotency_key: None
             }
@@ -351,7 +351,7 @@ fn reports() {
         "cuda",
         "   ",
         priorart::service::ReportOptions {
-            revision: None,
+            revision: Some(1),
             search_id: None,
             idempotency_key: None
         }

@@ -484,26 +484,12 @@ impl Service {
             .map(|hit| SearchHit {
                 record_id: hit.id.clone(),
                 revision: hit.revision,
-                score: hit.score,
             })
-            .collect();
-        let encoded_timings: Metadata = timings
-            .iter()
-            .map(|(key, value)| (key.clone(), Value::from(*value)))
             .collect();
         policy::collection(store, context, collection_id, Operation::Read)?;
         let search_id = context
             .principal_id()
-            .map(|principal| {
-                store.log_search(
-                    collection_id,
-                    text,
-                    filters,
-                    &logged,
-                    &encoded_timings,
-                    principal,
-                )
-            })
+            .map(|principal| store.create_search_receipt(collection_id, &logged, principal))
             .transpose()?;
         policy::collection(store, context, collection_id, Operation::Read)?;
         Ok(SearchOutcome {
@@ -544,20 +530,30 @@ impl Service {
             json!([record_id, text, options.revision, options.search_id]),
             "report",
         )?;
-        if let Some((result, _)) = store.replay::<String>(&intent)? {
-            store.get(collection_id, record_id, options.revision)?;
-            policy::validate(store, context)?;
-            return Ok(result);
-        }
-        let target = store.get(collection_id, record_id, options.revision)?;
+        let revision = options.revision.filter(|r| *r > 0).ok_or_else(|| {
+            ServiceError::InvalidInput("an exact positive report revision is required".into())
+        })?;
+        let target = store.get(collection_id, record_id, Some(revision))?;
         if let Some(search_id) = options.search_id {
-            if !store.search_owned_by(collection_id, search_id, principal)? {
+            if !store
+                .search_receipt(collection_id, search_id, principal)?
+                .is_some_and(|receipt| {
+                    receipt
+                        .hits
+                        .iter()
+                        .any(|hit| hit.record_id == record_id && hit.revision == revision)
+                })
+            {
                 return Err(StoreError::SearchNotFound {
                     collection_id: collection_id.to_owned(),
                     search_id: search_id.to_owned(),
                 }
                 .into());
             }
+        }
+        if let Some((result, _)) = store.replay::<String>(&intent)? {
+            policy::validate(store, context)?;
+            return Ok(result);
         }
         policy::collection(store, context, collection_id, Operation::Report)?;
         policy::collection(store, context, collection_id, Operation::Read)?;
@@ -591,6 +587,76 @@ impl Service {
         let reports = store.reports_for_principal(collection_id, record_id, principal)?;
         policy::collection(store, context, collection_id, Operation::FeedbackRead)?;
         policy::collection(store, context, collection_id, Operation::Read)?;
+        Ok(reports)
+    }
+
+    pub fn search_receipt(
+        &self,
+        context: &RequestContext,
+        collection: &str,
+        id: &str,
+    ) -> Result<crate::store::SearchReceipt> {
+        let store = self.connect()?;
+        policy::collection(&store, context, collection, Operation::FeedbackRead)?;
+        policy::collection(&store, context, collection, Operation::Read)?;
+        let principal = context.principal_id().ok_or(PolicyError::Unavailable)?;
+        let receipt = store
+            .search_receipt(collection, id, principal)?
+            .ok_or(PolicyError::Unavailable)?;
+        policy::validate(&store, context)?;
+        Ok(receipt)
+    }
+
+    pub fn publish_report(
+        &self,
+        context: &RequestContext,
+        collection: &str,
+        report: &str,
+        text: &str,
+        idempotency_key: Option<&str>,
+    ) -> Result<Mutation<String>> {
+        let handle = self.state(context, collection, Operation::ReportPublish)?;
+        let state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
+        let store = &state.store;
+        policy::collection(store, context, collection, Operation::ReportPublish)?;
+        let target = policy::collection(store, context, collection, Operation::Read)?;
+        if target.visibility != Visibility::Public {
+            return Err(PolicyError::Unavailable.into());
+        }
+        let principal = context.principal_id().ok_or(PolicyError::Unavailable)?;
+        let (record, revision) = store
+            .own_report_target(collection, report, principal)?
+            .ok_or(PolicyError::Unavailable)?;
+        store.get(collection, &record, Some(revision))?;
+        if text.trim().is_empty() || text.len() > 65_536 {
+            return invalid("publication text must be non-empty and at most 65536 bytes");
+        }
+        let intent = intent(
+            context,
+            collection,
+            "report",
+            idempotency_key,
+            json!(["publish", report, text]),
+            "report_publish",
+        )?;
+        let result = store.commit_publication(&intent, &record, revision, text)?;
+        policy::validate(store, context)?;
+        Ok(result)
+    }
+
+    pub fn published_reports(
+        &self,
+        context: &RequestContext,
+        collection: &str,
+        record: &str,
+    ) -> Result<Vec<crate::store::PublishedReport>> {
+        let handle = self.state(context, collection, Operation::Read)?;
+        let state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
+        let store = &state.store;
+        policy::collection(store, context, collection, Operation::Read)?;
+        store.get(collection, record, None)?;
+        let reports = store.published_reports(collection, record)?;
+        policy::validate(store, context)?;
         Ok(reports)
     }
 

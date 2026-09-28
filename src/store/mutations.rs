@@ -80,6 +80,23 @@ impl Store {
         })
     }
 
+    pub(crate) fn commit_publication(
+        &self,
+        intent: &Intent<'_>,
+        record: &str,
+        revision: i64,
+        text: &str,
+    ) -> Result<Mutation<String>> {
+        self.commit_mutation(intent, true, |transaction| {
+            let id = new_id();
+            transaction.execute(
+                "INSERT INTO published_reports VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (intent.collection, &id, record, revision, text, now()),
+            )?;
+            Ok(id)
+        })
+    }
+
     fn commit_mutation<T: Serialize + DeserializeOwned>(
         &self,
         intent: &Intent<'_>,
