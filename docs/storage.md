@@ -17,12 +17,13 @@ are independent of the HTTP protocol version.
 |---|---|
 | Empty database | Create the current schema transactionally |
 | No `schema_version`, any existing schema | Reject; priorart only initializes empty databases |
-| `v0.2.0` | Apply credential, mutation, feedback, lifecycle, and transfer migrations |
-| `v0.3.0` | Apply mutation, feedback, lifecycle, and transfer migrations |
-| `v0.4.0` | Apply feedback, lifecycle, and transfer migrations |
-| `v0.5.0` | Apply lifecycle and transfer migrations |
-| `v0.6.0` | Add content generations and private import provenance |
-| `v0.7.0` | Open without rerunning migrations |
+| `v0.2.0` | Apply credential, mutation, feedback, lifecycle, transfer, and retention migrations |
+| `v0.3.0` | Apply mutation, feedback, lifecycle, transfer, and retention migrations |
+| `v0.4.0` | Apply feedback, lifecycle, transfer, and retention migrations |
+| `v0.5.0` | Apply lifecycle, transfer, and retention migrations |
+| `v0.6.0` | Add content generations, private import provenance, and retention jobs |
+| `v0.7.0` | Add publication authorship and retention jobs |
+| `v0.8.0` | Open without rerunning migrations |
 | A tag this build does not know | Reject, naming that release as the one to use |
 | Nonzero `PRAGMA user_version` | Reject as a Python implementation directory; use `v0.1.0` |
 
@@ -114,8 +115,7 @@ only after a complete index generation is activated or validated against the
 current live records. Recovery reconciles all committed mutations in that
 collection to its latest state. It does not replay an old record payload over a
 newer update or deletion. Applied receipts remain available for idempotent retries.
-Content purge scrubs affected receipts as described below. Time-based receipt
-retention remains step 10c.
+Content purge and explicit retention jobs scrub affected receipts as described below.
 
 A matching idempotency retry reauthenticates, checks current original-operation
 permission and target availability, recovers the index if needed, and returns the
@@ -205,7 +205,7 @@ when taking a live SQLite backup.
 Purge removes logical rows, caches, and index files from the live service. It does
 not promise physical erasure from SQLite free pages, WAL/journals, filesystem
 snapshots, storage media, exported files, or backups. Backup rotation and any
-storage-level erasure must be handled separately. Standalone feedback deletion and retention jobs remain the next lifecycle change.
+storage-level erasure must be handled separately.
 
 ## Content transfers
 
@@ -261,3 +261,52 @@ decisions. Server ownership is separately enforced by the directory lock.
 Migrations receive the open transaction and must not issue `BEGIN`, `COMMIT`, or
 `ROLLBACK`, nor write files outside SQLite. Add tests for data preservation,
 repeated startup, and rollback when a later migration in the batch fails.
+
+
+## Retention jobs
+
+Schema `v0.8.0` adds durable collection-scoped retention jobs and private publication
+ownership. Migration derives existing publication authors from their committed
+publication mutation receipts and fails transactionally if ownership cannot be
+established. New publications store ownership in the same transaction as their
+content. The ownership table cascades on publication deletion and is never included
+in public responses or exports. Private source reports and published copies have
+independent lifetimes.
+
+The [retention API](protocol.md#feedback-deletion-and-retention) uses explicit,
+fixed cutoffs with no default expiry policy. Each batch commits content removal,
+its durable cursor/count, mutation replay barriers, and any index purge marker
+atomically. Revision scans advance by creation time, record ID, and revision;
+latest revisions are preserved without rescanning them in every batch. Indexed
+age queries and a partial mutation index exclude already scrubbed key markers.
+There is no database transaction held between batch requests. Authority is checked
+on every execution; revocation pauses future runs until an authorized admin resumes.
+
+Receipt deletion detaches reports before removing foreign-key targets. Historical
+revision removal erases associated feedback and import provenance, removes receipt
+hits, and strips affected mutation results. Revision cleanup also uses the durable
+index purge path, including its generation marker, so restored stale index files
+cannot expose expired history. Index cleanup completes on startup or on the next
+run/access; retrieval rebuilds from surviving current revisions. Committed indexing
+work must be reconciled before mutation receipt retention can expire it.
+
+Minimal keyed mutation markers retain operation ID, collection/principal scope,
+operation, key digest, original authority, timestamp, and applied state; payload
+digest and result are cleared and the target record link is removed. Unkeyed
+receipts are deleted. Retention job metadata (including the last scanned revision
+identifier) remains until collection deletion, as do existing record/collection
+tombstones and import target mappings. These are operational identifiers, not
+content or billing records. No query text, feedback text, or credentials are kept
+in jobs. Finished jobs are not automatically deleted or scheduled again.
+
+A batch bounds primary candidates, not the number of their dependent rows or the
+cost of pending index recovery. Large feedback fan-out can lengthen a SQLite write
+transaction; revision cleanup can make the next search rebuild its index. These
+limits must be considered when scheduling maintenance alongside serving traffic.
+
+As with record deletion, live retention does not erase backups, exports, WALs,
+free pages, or filesystem snapshots. After restoring an older database, replay all
+intervening feedback deletions and retention policies as well as record/collection
+deletions before serving. Restoring an old job cursor alone cannot establish what
+was removed after that backup. Maintain the external deletion history needed for
+restore, or discard backups under the deployment's documented retention policy.

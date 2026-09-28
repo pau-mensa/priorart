@@ -97,6 +97,10 @@ impl Store {
                 "INSERT INTO published_reports VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 (intent.collection, &id, record, revision, text, now()),
             )?;
+            transaction.execute(
+                "INSERT INTO publication_authors VALUES (?1, ?2, ?3)",
+                (intent.collection, &id, intent.principal),
+            )?;
             Ok((id, record.to_owned()))
         })
     }

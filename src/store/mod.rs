@@ -7,6 +7,8 @@
 mod credentials;
 mod feedback;
 mod lifecycle;
+mod retention;
+pub use retention::{FeedbackKind, RetentionJob, RetentionKind};
 mod transfer;
 pub use feedback::{PublishedReport, SearchReceipt};
 pub use transfer::{ExportCursor, TransferRecord};

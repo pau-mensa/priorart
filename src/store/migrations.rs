@@ -46,6 +46,10 @@ const MIGRATIONS: &[Migration] = &[
         version: "v0.7.0",
         apply: create_transfer_schema,
     },
+    Migration {
+        version: "v0.8.0",
+        apply: create_retention_schema,
+    },
 ];
 
 pub const SCHEMA_VERSION: &str = MIGRATIONS[MIGRATIONS.len() - 1].version;
@@ -740,6 +744,106 @@ mod transfer_tests {
                     .get::<_, i64>(0))
                 .unwrap(),
             1
+        );
+    }
+}
+
+fn create_retention_schema(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    transaction.execute_batch(
+        "CREATE TABLE publication_authors (
+            collection_id TEXT NOT NULL,
+            publication_id TEXT NOT NULL,
+            principal_id TEXT NOT NULL REFERENCES principals(id),
+            PRIMARY KEY(collection_id, publication_id),
+            FOREIGN KEY(collection_id, publication_id) REFERENCES published_reports(collection_id, id) ON DELETE CASCADE
+         );
+         CREATE INDEX mutations_feedback ON mutations(collection_id, operation, json_extract(result, '$'));
+         INSERT INTO publication_authors
+            SELECT p.collection_id, p.id,
+                (SELECT m.principal_id FROM mutations m WHERE m.collection_id = p.collection_id
+                 AND m.operation = 'report' AND m.authority = 'report_publish'
+                 AND json_extract(m.result, '$') = p.id)
+            FROM published_reports p;
+         CREATE TABLE retention_jobs (
+            collection_id TEXT NOT NULL REFERENCES collections(id),
+            id TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('revisions','receipts','reports','mutations')),
+            cutoff TEXT NOT NULL,
+            cursor_created TEXT NOT NULL DEFAULT '',
+            cursor_record TEXT NOT NULL DEFAULT '',
+            cursor_revision INTEGER NOT NULL DEFAULT 0,
+            processed INTEGER NOT NULL DEFAULT 0,
+            complete INTEGER NOT NULL DEFAULT 0 CHECK(complete IN (0,1)),
+            PRIMARY KEY(collection_id, id)
+         );
+         CREATE INDEX retention_revisions ON revisions(collection_id, created_at, record_id, revision);
+         CREATE INDEX retention_searches ON searches(collection_id, created_at, id);
+         CREATE INDEX retention_reports ON reports(collection_id, created_at);
+         CREATE INDEX retention_publications ON published_reports(collection_id, created_at);
+         CREATE INDEX retention_mutations ON mutations(collection_id, state, created_at, id) WHERE payload_digest != '';
+         CREATE INDEX reports_search ON reports(collection_id, search_id);",
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    #[test]
+    fn retention_upgrade_recovers_publishers_and_rolls_back_on_failure() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        run(&connection, &MIGRATIONS[..6]).unwrap();
+        connection.execute_batch("INSERT INTO records VALUES ('local','r','local-principal','now',NULL,NULL);
+            INSERT INTO revisions VALUES ('local','r',1,'kept',NULL,'hash','now');
+            INSERT INTO published_reports VALUES ('local','p','r',1,'published','now');
+            INSERT INTO mutations VALUES ('m','local','local-principal','report','key','digest','report_publish','\"p\"','applied','now','r');").unwrap();
+        fn fail(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+            create_retention_schema(transaction)?;
+            transaction.execute_batch("SELECT missing_function()")?;
+            Ok(())
+        }
+        let mut broken: Vec<_> = MIGRATIONS[..6]
+            .iter()
+            .map(|m| Migration {
+                version: m.version,
+                apply: m.apply,
+            })
+            .collect();
+        broken.push(Migration {
+            version: "v0.8.0",
+            apply: fail,
+        });
+        assert!(run(&connection, &broken).is_err());
+        assert_eq!(
+            stored_version(&connection).unwrap().as_deref(),
+            Some("v0.7.0")
+        );
+        assert!(connection
+            .prepare("SELECT * FROM publication_authors")
+            .is_err());
+        migrate(&connection).unwrap();
+        migrate(&connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT principal_id FROM publication_authors", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap(),
+            "local-principal"
+        );
+        connection
+            .execute("DELETE FROM published_reports", [])
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM publication_authors", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
         );
     }
 }

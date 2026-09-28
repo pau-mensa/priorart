@@ -22,6 +22,7 @@ use crate::index::{CollectionIndexManager, IndexError};
 use crate::policy::{self, PolicyError};
 use crate::store::{Metadata, Report, Revision, SearchHit, Store, StoreError, Visibility};
 
+mod retention;
 mod transfer;
 pub use transfer::ImportOptions;
 

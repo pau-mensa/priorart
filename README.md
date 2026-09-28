@@ -164,6 +164,8 @@ For database upgrades and recovery behavior, see [storage versions](docs/storage
 - Reports are stored and returned, not scored. Voting is not correctness.
 
 Collection revisions can be streamed through the [export/import API](docs/protocol.md#streaming-export-and-import).
+[Feedback deletion and resumable retention jobs](docs/protocol.md#feedback-deletion-and-retention)
+provide explicit lifecycle controls; no automatic retention policy is enabled.
 Imports require explicit destination visibility and assign new authorship; retries
 resume within a batch without duplicating revisions.
 

@@ -23,6 +23,7 @@ use crate::{
     store::{Collection, Metadata, StoreError},
 };
 
+mod retention;
 mod transfer;
 
 pub struct ApiError(StatusCode, &'static str, &'static str);
@@ -330,7 +331,27 @@ pub fn router(service: Arc<Service>) -> Router {
         )
         .route(
             "/v1/collections/{collection}/searches/{id}",
-            get(search_receipt),
+            get(search_receipt).delete(retention::delete_receipt),
+        )
+        .route(
+            "/v1/collections/{collection}/reports/{id}",
+            axum::routing::delete(retention::delete_report),
+        )
+        .route(
+            "/v1/collections/{collection}/published-reports/{id}",
+            axum::routing::delete(retention::delete_publication),
+        )
+        .route(
+            "/v1/collections/{collection}/retention-jobs",
+            post(retention::create),
+        )
+        .route(
+            "/v1/collections/{collection}/retention-jobs/{id}",
+            get(retention::inspect),
+        )
+        .route(
+            "/v1/collections/{collection}/retention-jobs/{id}/run",
+            post(retention::run),
         )
         .route("/v1/collections/{collection}/export", get(transfer::export))
         .route(

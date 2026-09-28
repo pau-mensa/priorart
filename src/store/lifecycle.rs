@@ -92,6 +92,7 @@ impl Store {
             [collection],
         )?;
         for table in [
+            "retention_jobs",
             "credential_grants",
             "mutations",
             "reports",

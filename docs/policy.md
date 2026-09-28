@@ -42,6 +42,9 @@ These error rules do not promise identical timing or hide operational side chann
 | List reports | `feedback_read` plus target read access; only the requester's rows are loaded |
 | Read receipt | Owning principal, `feedback_read`, and current scope read access |
 | Publish report | Author, `report_publish`, readable live public target, and selected text |
+| Delete private report/receipt | `feedback_delete` plus requester ownership; no read permission required |
+| Delete published report | `feedback_delete` plus publisher ownership, or `feedback_delete` plus `moderate` |
+| Create/inspect/run retention job | Current `admin` on its explicit collection; no private feedback text returned |
 | Read published reports | Target read access; anonymous readers allowed for public targets |
 | Export revisions | `export` and current `read`; rechecked for every streamed row |
 | Import revisions | `contribute`, plus `update` for subsequent revisions; explicit destination visibility/publication |
@@ -124,3 +127,10 @@ transaction. `DeleteOptions` and `ReportOptions` carry their preconditions/targe
 and optional retry key. Each service mutation returns `Mutation<T>` containing a
 durable mutation ID and its operation result. Replays revalidate current original
 operation authority and use the same collection synchronization as new writes.
+
+Retention administration authorizes scoped age-based removal of private feedback
+without granting read access to that feedback. No policy runs automatically:
+operators must choose and communicate retention cutoffs before scheduling jobs.
+Each execution revalidates the current credential; jobs store no bearer secrets
+or reusable authority. They cannot select another collection's data. Retention and
+feedback deletion have no credit/balance precondition.

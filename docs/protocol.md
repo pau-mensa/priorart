@@ -223,9 +223,8 @@ scope. Private reports remain private after publication.
 
 Schema `v0.5.0` removes query/filter/timing/score columns from existing search
 logs, preserving receipt IDs and revision links. This is a logical migration,
-not physical erasure of old database pages, journals, or backups. Retention,
-standalone feedback removal and retention remain later lifecycle work. Record and
-collection deletion now purge associated feedback and index generations.
+not physical erasure of old database pages, journals, or backups. Record and
+collection deletion purge associated feedback and index generations.
 
 
 ## Streaming export and import
@@ -339,3 +338,78 @@ The bundled MCP client uses explicit `local` routes and search scope. Correction
 and deletes require `expected_revision`; reports require `revision`. It currently
 supports the default local server only. Configurable credentials, collection
 selection, and authenticated MCP workflows remain step 13.
+
+
+## Feedback deletion and retention
+
+`DELETE /v1/collections/{collection}/searches/{id}` removes the caller's receipt
+and its hit links. Reports survive with their receipt link cleared.
+`DELETE /v1/collections/{collection}/reports/{id}` removes the caller's private
+report. `DELETE /v1/collections/{collection}/published-reports/{id}` removes a
+public copy owned by the caller, or one moderated by a caller with `moderate`.
+All three require `feedback_delete` on the collection. Read permission is not
+required to remove one's own feedback. Collection ownership and moderation do
+not authorize deleting someone else's private report or receipt through these
+routes. Success is `204`; missing, previously deleted, and forbidden IDs return
+`404`. The deletion is atomic and needs no idempotency key.
+
+Publications are independent copies: deleting a private source report leaves its
+publications in place. Delete those separately by their public IDs. Removing a
+report or publication also removes its unkeyed mutation receipt and scrubs its
+keyed receipt to a minimal replay barrier; a delayed retry cannot recreate it.
+The record itself is unchanged.
+
+Retention is disabled by default. Administrators explicitly choose a scope,
+category, and cutoff; there is no built-in timer or billing-triggered deletion.
+An operator can schedule the following calls with an external scheduler. Requests
+use the normal authentication headers; persisted jobs contain no credentials.
+
+`POST /v1/collections/{collection}/retention-jobs` requires `admin` and accepts:
+
+```json
+{"id":"receipts-2026-09","kind":"receipts","before_unix":1788220800}
+```
+
+The caller chooses a job ID using the normal identifier rules. `before_unix` is
+an integer UTC Unix timestamp from the epoch through the current time. Only rows
+strictly older than that fixed cutoff qualify. Repeating the same ID and inputs
+returns the existing job; changing its kind or cutoff returns `409`.
+Creation returns `201` and does not delete anything.
+
+`GET /v1/collections/{collection}/retention-jobs/{id}` inspects the job.
+`POST /v1/collections/{collection}/retention-jobs/{id}/run` executes one batch.
+Both require current `admin` authority. Job responses contain
+`collection_id`, `id`, `kind`, the normalized UTC `cutoff`, cumulative `processed`
+(primary rows removed or mutation receipts scrubbed), and `complete`.
+Run until `complete` is true; a batch can advance without removing anything.
+A retry after a lost response continues from committed progress. Completed jobs
+are inert; a later policy run needs a new ID. Missing/forbidden jobs return `404`.
+
+| Kind | Effect |
+|---|---|
+| `revisions` | Examine at most 100 old revisions per batch, preserving each live record's latest revision; remove qualifying history and its reports, public copies, receipt hits, import provenance, and affected mutation results |
+| `receipts` | Remove up to 100 receipts and their hits; detach links from surviving private reports |
+| `reports` | Remove up to 100 private reports/public copies, by each copy's own creation time, with their mutation results |
+| `mutations` | Reconcile pending record/index work before expiring up to 100 applied mutation receipts; unkeyed receipts disappear, keyed ones retain replay barriers |
+
+Revision jobs persist a cursor, including progress past preserved latest rows.
+Rows passed by that cursor are reconsidered only by a new job, even if a later
+write makes a preserved revision historical. Dependencies are removed atomically
+with their primary row; a large number of attached reports/hits can make a batch
+cost more than its primary-row limit suggests. SQLite serializes these write
+transactions. Each request releases the collection lock after its batch.
+
+Revision cleanup invalidates exports and purges all stored index generations and
+loaded index state for the collection. File cleanup resumes after interruption;
+a job does not report complete while that cleanup is pending. The next retrieval
+rebuilds the latest index, which can incur encoding cost. Receipt/report retention
+requires no index rebuild. Pending committed mutations are recovered, never
+abandoned by age before their content becomes searchable.
+
+Job IDs, kinds, cutoffs, cursors, counts, and completion flags remain until
+collection deletion. Record/collection tombstones, minimal keyed mutation markers,
+and import target mappings are not aged out: removing them could allow delayed
+retries or stale artifacts to recreate deleted content. Retention never removes
+the last live revision or changes visibility. No billing evidence exists at this
+stage; future accounting retention must remain separate from content retention.
+See [storage and restore rules](storage.md#retention-jobs) for backup limits.
