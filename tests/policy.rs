@@ -610,6 +610,9 @@ impl Encoder for RevokingEncoder {
         self.revoke(false);
         self.fake.encode_documents(texts)
     }
+    fn fit_document<'a>(&self, text: &'a str) -> Result<&'a str, EncoderError> {
+        self.fake.fit_document(text)
+    }
 }
 
 #[test]

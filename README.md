@@ -19,7 +19,7 @@ protocol change.
 - **Raw text queries.** Describe the current problem, context, observations,
   and failed attempts; get ranked references with query-aware excerpts.
 - **Late-interaction retrieval** with [lateweave](https://github.com/pau-mensa/lateweave)
-  and [LateOn-Code](https://huggingface.co/lightonai/LateOn-Code) on ONNX
+  and [mLateOn](https://huggingface.co/lightonai/mLateOn) on ONNX
   Runtime (no torch): exact MaxSim over the whole corpus while it is small,
   BM25 candidates plus MaxSim rerank once it exceeds the gather limit. Without
   a model it runs lexical-only.
@@ -41,15 +41,14 @@ priorart serve                # lexical-only, http://127.0.0.1:8000
 With the encoder:
 
 ```bash
-PRIORART_ENCODER=lightonai/LateOn-Code priorart serve
+PRIORART_ENCODER=lightonai/mLateOn priorart serve
 ```
 
-The default `onnx` feature runs the official LateOn-Code ONNX export on CPU
+The default `onnx` feature runs the official mLateOn ONNX export on CPU
 through ONNX Runtime (the runtime library is downloaded at build time). The
-first start downloads about 150 MB (`model_int8.onnx` plus tokenizer) into the
+first start downloads about 320 MB (`model_int8.onnx` plus tokenizer) into the
 Hugging Face cache and re-encodes every stored record; later starts reuse the
-vector store. Set `PRIORART_ENCODER_FILE=model.onnx` for the FP32 graph
-(597 MB). `cargo build --no-default-features` produces a lexical-only binary
+vector store. Set `PRIORART_ENCODER_FILE=model.onnx` for the FP32 graph. `cargo build --no-default-features` produces a lexical-only binary
 without ONNX Runtime; configuring an encoder in that build is a startup error.
 
 ## Quickstart
@@ -114,7 +113,7 @@ session must go through the one server.
 | `PRIORART_ENCODER_THREADS` | auto | ONNX Runtime intra-op threads |
 | `PRIORART_GATHER_LIMIT` | `500` | exhaustive MaxSim up to this many eligible records, BM25 candidates beyond |
 | `PRIORART_MAX_LOADED_INDEXES` | `8` | cached/active collection states and indexes; idle LRU eviction, busy admission returns 429 |
-| `PRIORART_MAX_TEXT_BYTES` | `262144` | maximum size of one record |
+| `PRIORART_MAX_TOKENS` | `8192` | document token cutoff; longer text is truncated before storing; must not exceed the model's document length |
 | `PRIORART_HOST` / `PRIORART_PORT` | `127.0.0.1` / `8000` | loopback bind address |
 
 ## Local credentials
@@ -141,8 +140,12 @@ For database upgrades and recovery behavior, see [storage versions](docs/storage
 - HTTP requests select an explicit collection; search currently accepts exactly
   one collection. Storage is access-controlled by the trusted service and remains
   unencrypted.
-- One indexed view per record, truncated by the encoder at 2048 tokens for
-  LateOn-Code. Chunking is planned as an internal derived view.
+- One indexed view per record. Text beyond `PRIORART_MAX_TOKENS` is truncated
+  before storing, so stored and indexed text match; there is no chunking.
+  The cutoff counts the encoder's tokenizer tokens, special and prefix tokens
+  included; lexical-only mode counts analyzer terms instead.
+  Each stored token is one int8 vector: a record at the 8192-token cutoff adds
+  about 1.1 MB to its collection's vector store with mLateOn.
 - One server owns each data directory. Writes index synchronously under a
   per-collection lock; different collections can run concurrently within capacity.
 - Record mutations use a durable journal and atomic index-generation activation.

@@ -278,6 +278,61 @@ fn lexical_only_mode() {
 }
 
 #[test]
+fn lexical_only_truncation_counts_analyzer_terms() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = Service::new(
+        Settings {
+            max_tokens: 3,
+            ..settings(&directory)
+        },
+        None,
+    )
+    .unwrap();
+    let options = WriteOptions {
+        idempotency_key: Some("retry"),
+        ..WriteOptions::default()
+    };
+    let text = "  Straße café, naïve résumé";
+    let first = service
+        .put(&CALLER, LOCAL, text, None, Some("long"), options)
+        .unwrap();
+    assert!(first.value.2);
+    let retried = service
+        .put(&CALLER, LOCAL, text, None, Some("long"), options)
+        .unwrap();
+    assert_eq!(retried, first);
+    let stored = service.get(&CALLER, LOCAL, "long", None).unwrap();
+    assert_eq!(stored.text.as_deref(), Some("  Straße café, naïve"));
+    assert!(service
+        .search(&CALLER, LOCAL, "resume", None, 10)
+        .unwrap()
+        .hits
+        .is_empty());
+    assert_eq!(
+        service
+            .search(&CALLER, LOCAL, "naive", None, 10)
+            .unwrap()
+            .hits[0]
+            .id,
+        "long"
+    );
+    let exact = service
+        .put(
+            &CALLER,
+            LOCAL,
+            "one two three",
+            None,
+            Some("long"),
+            WriteOptions {
+                expected_revision: Some(1),
+                ..WriteOptions::default()
+            },
+        )
+        .unwrap();
+    assert!(!exact.value.2);
+}
+
+#[test]
 fn an_empty_corpus_returns_no_hits() {
     let directory = tempfile::tempdir().unwrap();
     let service = Service::new(settings(&directory), fake()).unwrap();
@@ -296,14 +351,6 @@ fn validation() {
         &CALLER,
         LOCAL,
         "   ",
-        None,
-        None,
-        WriteOptions::default()
-    )));
-    assert!(invalid(service.put(
-        &CALLER,
-        LOCAL,
-        &"x".repeat(300_000),
         None,
         None,
         WriteOptions::default()

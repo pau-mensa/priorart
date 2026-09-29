@@ -115,6 +115,7 @@ pub struct Experience {
 pub struct Contributed {
     id: String,
     revision: i64,
+    truncated: bool,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -243,7 +244,7 @@ impl PriorartMcp {
     ///
     /// Pass the same `id` and its `expected_revision` to publish a corrected revision. `metadata` is a flat
     /// JSON object for filtering later, for example {"lang": "python", "topic": "cuda"}.
-    /// Returns the record id and revision.
+    /// Returns the record id, revision, and whether the text was truncated at the token cutoff.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = false,

@@ -243,11 +243,7 @@ pub(super) async fn import(
         pending: Bytes::new(),
         partial: Vec::new(),
         bytes: 0,
-        max_line: service
-            .settings()
-            .max_text_bytes
-            .saturating_mul(6)
-            .saturating_add(70_000),
+        max_line: service.settings().max_body_bytes(),
     };
     let state = (service, context, collection, key, lines, 0usize, false);
     let output = stream::unfold(

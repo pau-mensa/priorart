@@ -15,7 +15,7 @@ fn settings(directory: &std::path::Path) -> Settings {
         ..Settings::default()
     }
 }
-fn update(service: &Service) -> Result<Mutation<(String, i64)>> {
+fn update(service: &Service) -> Result<Mutation<(String, i64, bool)>> {
     service.put(
         &CALLER,
         LOCAL,

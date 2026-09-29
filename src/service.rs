@@ -240,6 +240,15 @@ impl Service {
         Ok(states.loaded[collection].clone())
     }
 
+    /// Text beyond `PRIORART_MAX_TOKENS` is cut before storing, so stored and
+    /// indexed text match. Lexical-only operation counts analyzer terms.
+    fn cutoff<'a>(&self, text: &'a str) -> Result<&'a str> {
+        match &self.encoder {
+            Some(encoder) => Ok(encoder.fit_document(text).map_err(IndexError::from)?),
+            None => Ok(crate::analyzer::prefix(text, self.settings.max_tokens)),
+        }
+    }
+
     pub fn put(
         &self,
         context: &RequestContext,
@@ -248,7 +257,7 @@ impl Service {
         metadata: Option<&Metadata>,
         record_id: Option<&str>,
         options: WriteOptions<'_>,
-    ) -> Result<Mutation<(String, i64)>> {
+    ) -> Result<Mutation<(String, i64, bool)>> {
         let handle = self.state(context, collection_id, Operation::Contribute)?;
         let mut state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
         let State { store, indexes } = &mut *state;
@@ -275,7 +284,7 @@ impl Service {
                 "contribute"
             },
         )?;
-        if let Some((result, authority)) = store.replay::<(String, i64)>(&intent)? {
+        if let Some((result, authority)) = store.replay::<(String, i64, bool)>(&intent)? {
             let operation = if authority == "contribute" {
                 Operation::Contribute
             } else {
@@ -297,32 +306,28 @@ impl Service {
         if text.trim().is_empty() {
             return invalid("text must be a non-empty string");
         }
-        if text.len() > self.settings.max_text_bytes {
-            return invalid(format!(
-                "text is {} bytes; the limit is {}",
-                text.len(),
-                self.settings.max_text_bytes
-            ));
-        }
         if record_id.is_some_and(|record_id| !is_record_id(record_id)) {
             return invalid(RECORD_ID_RULE);
         }
+        let stored = self.cutoff(text)?;
+        let truncated = stored.len() < text.len();
         store.check_put_revision(collection_id, record_id, options.expected_revision)?;
         let index = indexes.get(store, collection_id);
         authorize_put(store, context, collection_id, record_id, options)?;
         let index = index?;
-        let encoded = index.encode(text);
+        let encoded = index.encode(stored);
         authorize_put(store, context, collection_id, record_id, options)?;
         let encoded = encoded?;
         let created = store.commit_put(
             &intent,
-            text,
+            stored,
+            truncated,
             metadata,
             record_id,
             options.expected_revision,
         )?;
         crate::fault::check("after_record_commit").map_err(IndexError::from)?;
-        let result = index.upsert(store, &created.value.0, created.value.1, text, encoded);
+        let result = index.upsert(store, &created.value.0, created.value.1, stored, encoded);
         policy::validate(store, context)?;
         result?;
         crate::fault::check("after_mutation_complete").map_err(IndexError::from)?;

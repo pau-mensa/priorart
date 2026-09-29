@@ -151,7 +151,10 @@ async fn contribute_revise_and_delete() {
         json!({"text": "corrected account", "expected_revision": 1, "id": id, "metadata": {"lang": "python", "gpu": true}}),
     )
     .await;
-    assert_eq!(structured(&revised), &json!({"id": id, "revision": 2}));
+    assert_eq!(
+        structured(&revised),
+        &json!({"id": id, "revision": 2, "truncated": false})
+    );
     let filtered = call(
         &session,
         "search_experiences",

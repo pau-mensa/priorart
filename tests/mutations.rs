@@ -91,6 +91,9 @@ impl Encoder for GatedEncoder {
         }
         self.fake.encode_queries(texts)
     }
+    fn fit_document<'a>(&self, text: &'a str) -> Result<&'a str, EncoderError> {
+        self.fake.fit_document(text)
+    }
 }
 
 #[test]

@@ -25,7 +25,7 @@ pub struct Settings {
     pub encoder_threads: Option<usize>,
     pub gather_limit: usize,
     pub max_loaded_indexes: usize,
-    pub max_text_bytes: usize,
+    pub max_tokens: usize,
     pub host: String,
     pub port: u16,
 }
@@ -41,7 +41,7 @@ impl Default for Settings {
             encoder_threads: None,
             gather_limit: 500,
             max_loaded_indexes: 8,
-            max_text_bytes: 262_144,
+            max_tokens: 8192,
             host: "127.0.0.1".to_owned(),
             port: 8000,
         }
@@ -88,8 +88,8 @@ impl Settings {
         if let Some(value) = get("GATHER_LIMIT") {
             settings.gather_limit = parse("PRIORART_GATHER_LIMIT", &value)?;
         }
-        if let Some(value) = get("MAX_TEXT_BYTES") {
-            settings.max_text_bytes = parse("PRIORART_MAX_TEXT_BYTES", &value)?;
+        if let Some(value) = get("MAX_TOKENS") {
+            settings.max_tokens = parse("PRIORART_MAX_TOKENS", &value)?;
         }
         if let Some(value) = get("HOST") {
             settings.host = value;
@@ -120,8 +120,8 @@ impl Settings {
         if self.gather_limit == 0 {
             return invalid("gather_limit must be positive");
         }
-        if self.max_text_bytes == 0 {
-            return invalid("max_text_bytes must be positive");
+        if self.max_tokens == 0 {
+            return invalid("max_tokens must be positive");
         }
         if self.encoder_threads == Some(0) {
             return invalid("encoder_threads must be positive");
@@ -130,6 +130,11 @@ impl Settings {
             return invalid("port must be in 1..65535");
         }
         Ok(())
+    }
+
+    /// The coarse HTTP body limit: generous enough that text is truncated, not rejected.
+    pub fn max_body_bytes(&self) -> usize {
+        self.max_tokens.saturating_mul(256).saturating_add(65_536)
     }
 
     pub fn lexical_only(&self) -> bool {
@@ -157,12 +162,12 @@ mod tests {
     #[test]
     fn encoder_fields_come_from_the_environment() {
         let settings = Settings::from_vars(vars(&[
-            ("PRIORART_ENCODER", "lightonai/LateOn-Code"),
+            ("PRIORART_ENCODER", "lightonai/mLateOn"),
             ("PRIORART_ENCODER_FILE", "model.onnx"),
             ("PRIORART_ENCODER_THREADS", "4"),
         ]))
         .unwrap();
-        assert_eq!(settings.encoder, "lightonai/LateOn-Code");
+        assert_eq!(settings.encoder, "lightonai/mLateOn");
         assert_eq!(settings.encoder_file, "model.onnx");
         assert_eq!(settings.encoder_threads, Some(4));
         assert!(!settings.lexical_only());
@@ -211,7 +216,7 @@ mod tests {
             ("PRIORART_ENCODER_THREADS", "0"),
             ("PRIORART_GATHER_LIMIT", "0"),
             ("PRIORART_MAX_LOADED_INDEXES", "0"),
-            ("PRIORART_MAX_TEXT_BYTES", "-1"),
+            ("PRIORART_MAX_TOKENS", "0"),
             ("PRIORART_PORT", "0"),
             ("PRIORART_PORT", "70000"),
         ] {

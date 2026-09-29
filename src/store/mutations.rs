@@ -29,10 +29,11 @@ impl Store {
         &self,
         intent: &Intent<'_>,
         text: &str,
+        truncated: bool,
         metadata: Option<&Metadata>,
         record: Option<&str>,
         expected: Option<i64>,
-    ) -> Result<Mutation<(String, i64)>> {
+    ) -> Result<Mutation<(String, i64, bool)>> {
         self.commit_mutation(intent, |transaction| {
             let record = put_in(
                 transaction,
@@ -44,7 +45,7 @@ impl Store {
                 expected,
             )?;
             Ok((
-                (record.record_id.clone(), record.revision),
+                (record.record_id.clone(), record.revision, truncated),
                 record.record_id,
             ))
         })

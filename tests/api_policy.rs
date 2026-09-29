@@ -565,7 +565,7 @@ async fn input_limits_and_errors_do_not_reflect_payloads_or_credentials() {
         .post(format!("{}{records}", api.url))
         .bearer_auth(&api.alice_key)
         .header("Content-Type", "application/json")
-        .body("x".repeat(2_000_000))
+        .body("x".repeat(3_000_000))
         .send()
         .await
         .unwrap();

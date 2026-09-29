@@ -1,7 +1,7 @@
 #![cfg(feature = "onnx")]
-//! Smoke tests against the official LateOn-Code ONNX artifact, ignored by
+//! Smoke tests against the official mLateOn ONNX artifact, ignored by
 //! default: `cargo test --release --test real_encoder -- --ignored`.
-//! The first run downloads about 150 MB.
+//! The first run downloads about 320 MB.
 use priorart::auth::RequestContext;
 use priorart::service::WriteOptions;
 use priorart::store::LOCAL_COLLECTION_ID;
@@ -12,19 +12,19 @@ use priorart::config::Settings;
 use priorart::encoder::{Encoder, OnnxEncoder};
 use priorart::service::Service;
 
-const MODEL: &str = "lightonai/LateOn-Code";
+const MODEL: &str = "lightonai/mLateOn";
 
 fn encoder() -> Arc<OnnxEncoder> {
     static ENCODER: OnceLock<Arc<OnnxEncoder>> = OnceLock::new();
     ENCODER
         .get_or_init(|| {
-            Arc::new(OnnxEncoder::load(MODEL, "model_int8.onnx", "main", None).unwrap())
+            Arc::new(OnnxEncoder::load(MODEL, "model_int8.onnx", "main", None, 8192).unwrap())
         })
         .clone()
 }
 
 #[test]
-#[ignore = "downloads LateOn-Code"]
+#[ignore = "downloads mLateOn"]
 fn representation_and_vectors() {
     let encoder = encoder();
     let representation = encoder.representation();
@@ -39,11 +39,11 @@ fn representation_and_vectors() {
         let norm = token.iter().map(|value| value * value).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-3);
     }
-    // Bare punctuation tokens are on the skiplist and dropped from documents only.
+    // No skiplist: queries and documents differ only in their prefix token.
     let text = "foo(bar); x = y[0]";
     let document = encoder.encode_documents(&[text]).unwrap().remove(0);
     let query = encoder.encode_queries(&[text]).unwrap().remove(0);
-    assert_eq!(query.tokens() - document.tokens(), 3);
+    assert_eq!(query.tokens(), document.tokens());
     let stripped = encoder.encode_documents(&["  padded  "]).unwrap().remove(0);
     let plain = encoder.encode_documents(&["padded"]).unwrap().remove(0);
     assert_eq!(stripped.tokens(), plain.tokens());
@@ -55,7 +55,7 @@ fn representation_and_vectors() {
 }
 
 #[test]
-#[ignore = "downloads LateOn-Code"]
+#[ignore = "downloads mLateOn"]
 fn end_to_end() {
     let encoder = encoder();
     let directory = tempfile::tempdir().unwrap();
@@ -96,4 +96,21 @@ fn end_to_end() {
         .unwrap();
     assert_eq!(outcome.hits[0].id, "nccl");
     assert_eq!(outcome.gatherer, "exhaustive");
+}
+
+#[test]
+#[ignore = "downloads mLateOn"]
+fn documents_are_cut_at_the_token_cutoff() {
+    assert!(OnnxEncoder::load(MODEL, "model_int8.onnx", "main", None, 8193).is_err());
+    let encoder = OnnxEncoder::load(MODEL, "model_int8.onnx", "main", None, 16).unwrap();
+    let text = "  Die Straße führt über café résumé naïve 東京 def f(): return 1; ".repeat(8);
+    let fitted = encoder.fit_document(&text).unwrap();
+    assert!(fitted.len() < text.len() && text.starts_with(fitted));
+    let full = encoder.encode_documents(&[&text]).unwrap().remove(0);
+    let cut = encoder.encode_documents(&[fitted]).unwrap().remove(0);
+    assert_eq!(full.tokens(), 16);
+    // A word split at the cutoff can re-tokenize into fewer pieces.
+    assert!(cut.tokens() <= 16);
+    assert_eq!(encoder.fit_document(fitted).unwrap(), fitted);
+    assert_eq!(encoder.fit_document("short text").unwrap(), "short text");
 }

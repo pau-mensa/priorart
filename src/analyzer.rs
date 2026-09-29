@@ -54,6 +54,19 @@ pub fn token_spans(text: &str) -> Vec<(String, Range<usize>)> {
         .collect()
 }
 
+/// The longest prefix of `text` with at most `max_terms` terms, ending at the
+/// last kept term. `text` itself when it already fits; `max_terms` is positive.
+pub fn prefix(text: &str, max_terms: usize) -> &str {
+    let spans = token_spans(text);
+    if spans.len() <= max_terms {
+        return text;
+    }
+    let end = spans[max_terms - 1].1.end;
+    text.char_indices()
+        .nth(end)
+        .map_or(text, |(end, _)| &text[..end])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,6 +94,14 @@ mod tests {
             sources,
             ["Ǆemo", "CUDA_ERROR", "café", "ﬁx", "Straße", "x\u{301}y"]
         );
+    }
+
+    #[test]
+    fn prefix_keeps_whole_terms_and_multibyte_characters() {
+        assert_eq!(prefix("café au lait", 2), "café au");
+        assert_eq!(prefix("  Straße, x\u{301}y z", 2), "  Straße, x\u{301}y");
+        assert_eq!(prefix("one two ", 2), "one two ");
+        assert_eq!(prefix("one two three", 3), "one two three");
     }
 
     #[test]

@@ -286,11 +286,7 @@ struct SearchRequest {
     limit: i64,
 }
 pub fn router(service: Arc<Service>) -> Router {
-    let limit = service
-        .settings()
-        .max_text_bytes
-        .saturating_mul(6)
-        .saturating_add(65_536);
+    let limit = service.settings().max_body_bytes();
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/collections", get(collections))
@@ -414,11 +410,13 @@ async fn put_record(
         )
     })
     .await?;
-    let (id, revision) = result.value;
+    let (id, revision, truncated) = result.value;
     Ok((
         StatusCode::CREATED,
         [("mutation-id", result.mutation_id)],
-        Json(json!({"collection_id": response_collection, "id": id, "revision": revision})),
+        Json(
+            json!({"collection_id": response_collection, "id": id, "revision": revision, "truncated": truncated}),
+        ),
     ))
 }
 async fn get_record(

@@ -12,18 +12,18 @@ struct Api {
 
 impl Api {
     async fn start() -> Self {
-        Self::with_max_text_bytes(priorart::config::Settings::default().max_text_bytes).await
+        Self::with_max_tokens(priorart::config::Settings::default().max_tokens).await
     }
 
-    async fn with_max_text_bytes(max_text_bytes: usize) -> Self {
+    async fn with_max_tokens(max_tokens: usize) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let settings = priorart::config::Settings {
             data_dir: directory.path().to_path_buf(),
-            max_text_bytes,
+            max_tokens,
             ..priorart::config::Settings::default()
         };
         let encoder: std::sync::Arc<dyn priorart::encoder::Encoder> =
-            std::sync::Arc::new(common::FakeEncoder::new());
+            std::sync::Arc::new(common::FakeEncoder::with_max_tokens(max_tokens));
         let service = priorart::service::Service::new(settings, Some(encoder)).unwrap();
         let url = common::spawn(std::sync::Arc::new(service)).await;
         Self {
@@ -99,7 +99,7 @@ async fn record_lifecycle() {
         .await;
     assert_eq!(
         updated,
-        json!({"collection_id": "local", "id": id, "revision": 2})
+        json!({"collection_id": "local", "id": id, "revision": 2, "truncated": false})
     );
     assert_eq!(
         api.get(&format!("/v1/collections/local/records/{id}?revision=1"))
@@ -249,23 +249,40 @@ async fn healthz() {
 }
 
 #[tokio::test]
-async fn the_configured_text_limit_governs_request_size() {
-    let api = Api::with_max_text_bytes(3_000_000).await;
-    let (status, _) = api
-        .post(
-            "/v1/collections/local/records",
-            json!({"text": "word ".repeat(560_000)}),
-        )
-        .await;
-    assert_eq!(status, StatusCode::CREATED);
+async fn text_beyond_the_token_cutoff_is_truncated() {
+    let api = Api::with_max_tokens(4).await;
     let (status, body) = api
         .post(
             "/v1/collections/local/records",
-            json!({"text": "x".repeat(3_000_001)}),
+            json!({"id": "long", "text": "one two three four five six"}),
         )
         .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"]["message"], "invalid request");
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["truncated"], true);
+    let (_, record) = api.get("/v1/collections/local/records/long").await;
+    assert_eq!(record["text"], "one two three four");
+
+    let (status, body) = api
+        .post(
+            "/v1/collections/local/records",
+            json!({"id": "long", "text": "one two three", "expected_revision": 1}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["truncated"], false);
+
+    let limit = priorart::config::Settings {
+        max_tokens: 4,
+        ..Default::default()
+    }
+    .max_body_bytes();
+    let (status, _) = api
+        .post(
+            "/v1/collections/local/records",
+            json!({"text": "x".repeat(limit)}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
 }
 
 #[tokio::test]

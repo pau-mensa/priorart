@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use lateweave::{Representation, TokenMatrix};
-use priorart::analyzer::tokens;
+use priorart::analyzer::{prefix, tokens};
 use priorart::encoder::{Encoder, EncoderError};
 use sha2::{Digest, Sha256};
 
@@ -12,6 +12,7 @@ pub struct FakeEncoder {
     representation: Representation,
     calls: AtomicUsize,
     failing: AtomicBool,
+    max_tokens: usize,
 }
 
 impl FakeEncoder {
@@ -24,6 +25,15 @@ impl FakeEncoder {
             representation: Representation::new(name, "test", dimension, true).unwrap(),
             calls: AtomicUsize::new(0),
             failing: AtomicBool::new(false),
+            max_tokens: priorart::config::Settings::default().max_tokens,
+        }
+    }
+
+    /// Documents keep at most `max_tokens` terms, like a model's document length.
+    pub fn with_max_tokens(max_tokens: usize) -> Self {
+        Self {
+            max_tokens,
+            ..Self::new()
         }
     }
 
@@ -82,7 +92,15 @@ impl Encoder for FakeEncoder {
         if self.failing.load(Ordering::SeqCst) {
             return Err(EncoderError::Failed("injected".to_owned()));
         }
-        Ok(self.encode(texts))
+        let fitted: Vec<&str> = texts
+            .iter()
+            .map(|text| prefix(text, self.max_tokens))
+            .collect();
+        Ok(self.encode(&fitted))
+    }
+
+    fn fit_document<'a>(&self, text: &'a str) -> Result<&'a str, EncoderError> {
+        Ok(prefix(text, self.max_tokens))
     }
 }
 

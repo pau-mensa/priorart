@@ -30,6 +30,10 @@ pub trait Encoder: Send + Sync {
     fn encode_queries(&self, texts: &[&str]) -> Result<Vec<TokenMatrix>, EncoderError>;
 
     fn encode_documents(&self, texts: &[&str]) -> Result<Vec<TokenMatrix>, EncoderError>;
+
+    /// The longest prefix of `text` that fits the configured document length,
+    /// ending after the last kept token.
+    fn fit_document<'a>(&self, text: &'a str) -> Result<&'a str, EncoderError>;
 }
 
 /// Concatenates `[tokens, dimension]` matrices into lateweave's packed form.
@@ -54,6 +58,7 @@ pub fn load_encoder(settings: &Settings) -> Result<Option<Arc<dyn Encoder>>, Enc
             &settings.encoder_file,
             &settings.encoder_revision,
             settings.encoder_threads,
+            settings.max_tokens,
         )?;
         Ok(Some(Arc::new(encoder)))
     }

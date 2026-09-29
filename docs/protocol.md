@@ -69,7 +69,7 @@ local administration only; see [credentials](credentials.md).
  "expected_revision": 0, "publish": false}
 ```
 
-Returns `201 {"collection_id":"…","id":"…","revision":1}`.
+Returns `201 {"collection_id":"…","id":"…","revision":1,"truncated":false}`.
 
 - Omit `id` to generate an ID, or supply a collection-relative ID.
 - Omit `expected_revision` for a new record, or use `0` to explicitly require
@@ -81,8 +81,9 @@ Returns `201 {"collection_id":"…","id":"…","revision":1}`.
   Of two updates expecting the same revision, only one can append the next revision.
 - Creating needs `contribute`. Updating needs `update` plus original authorship or
   `moderate`. Public writes additionally require `publish:true` on every request.
-- Text must be nonempty and at most `PRIORART_MAX_TEXT_BYTES` UTF-8 bytes (default
-  262144). Metadata must be an object, at most 65536 serialized UTF-8 bytes,
+- Text must be nonempty. Text beyond `PRIORART_MAX_TOKENS` (default 8192) is cut
+  after the last token that fits and stored that way; the response reports
+  `"truncated": true`. Metadata must be an object, at most 65536 serialized UTF-8 bytes,
   depth 8, and 1024 value nodes including its root.
 
 A successful write is searchable before its collection lock is released. A failure
@@ -95,8 +96,8 @@ Put and delete accept one optional `Idempotency-Key` header (1–128 ASCII
 letters/digits or `._:-`). Use a fresh key per intended mutation and retain it across
 retries. Keys are scoped to the authenticated principal, collection, and operation.
 Reusing a scoped key with different input returns `409 idempotency_conflict`.
-Input fingerprints include the submitted ID, text, metadata, publication intent,
-and revision precondition as applicable. JSON object key order
+Input fingerprints include the submitted ID, text (before truncation), metadata,
+publication intent, and revision precondition as applicable. JSON object key order
 is irrelevant; omitted optional fields and explicit null normalize alike.
 
 Every successful mutation returns `Mutation-Id: <opaque ID>`, including `204`
@@ -213,7 +214,8 @@ in increasing order for each source record; gaps are allowed and destination
 revision numbers start at 1. Replaying an identical row in the same batch returns
 its original result. Changing a replay's contents conflicts. A new batch key
 creates a separate copy. Imports never overwrite a pre-existing record or an
-intervening manual edit, and purged batches cannot recreate deleted content.
+intervening manual edit, and purged batches cannot recreate deleted content. Imported
+text beyond the destination's token cutoff is truncated like any other write.
 
 The destination collection keeps its owner and visibility. The service assigns
 record authorship to the importing principal and uses new creation timestamps.
@@ -269,7 +271,7 @@ SQL errors, encoder details, and paths:
 | 409 | `revision_conflict` | revision mismatch or explicit create collision |
 | 409 | `idempotency_conflict` | scoped key reused with different input |
 | 410 | `record_deleted` | authorized read/write of a tombstoned record |
-| 413 | `payload_too_large` | HTTP body exceeds `6 * max_text_bytes + 65536` bytes |
+| 413 | `payload_too_large` | HTTP body exceeds `256 * max_tokens + 65536` bytes |
 | 422 | `validation_error` | malformed JSON/query, wrong types, missing/unknown fields |
 | 428 | `revision_required` | authorized existing mutation lacks a precondition |
 | 429 | `resource_limit` | all cached collection execution slots are pinned |

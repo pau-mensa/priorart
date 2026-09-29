@@ -1,7 +1,7 @@
-//! A pylate-onnx-export ColBERT artifact (the official `lightonai/LateOn-Code`
+//! A pylate-onnx-export ColBERT artifact (the official `lightonai/mLateOn`
 //! repository ships one) on ONNX Runtime's CPU provider, with the pylate
 //! conventions reproduced outside the graph: prefix token inserted after
-//! `[CLS]`, truncation to the configured lengths, padding masked out, input
+//! the leading special token, documents truncated to `PRIORART_MAX_TOKENS`, padding masked out, input
 //! stripped, and skiplist tokens dropped from documents only.
 
 use std::collections::HashSet;
@@ -14,7 +14,7 @@ use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;
 use serde::Deserialize;
-use tokenizers::{Tokenizer, TruncationParams};
+use tokenizers::{PostProcessor, Tokenizer, TruncationParams};
 
 use super::{Encoder, EncoderError};
 
@@ -72,6 +72,7 @@ impl OnnxEncoder {
         filename: &str,
         revision: &str,
         threads: Option<usize>,
+        max_tokens: usize,
     ) -> Result<Self, EncoderError> {
         let directory = resolve(model_id, filename, revision)?;
         let config: ExportConfig = serde_json::from_slice(
@@ -97,13 +98,32 @@ impl OnnxEncoder {
             tokenizer.with_padding(None);
             tokenizer
                 .with_truncation(Some(TruncationParams {
-                    max_length: length - usize::from(prefix.is_some()),
+                    max_length: length.saturating_sub(usize::from(prefix.is_some())),
                     ..TruncationParams::default()
                 }))
                 .map_err(|error| unavailable(model_id, error))?;
             Ok::<_, EncoderError>(tokenizer)
         };
-        let document_tokenizer = tokenizer(config.document_length, config.document_prefix_id)?;
+        if max_tokens > config.document_length {
+            return Err(unavailable(
+                model_id,
+                format!(
+                    "PRIORART_MAX_TOKENS={max_tokens} exceeds the model's document length {}",
+                    config.document_length
+                ),
+            ));
+        }
+        let document_tokenizer = tokenizer(max_tokens, config.document_prefix_id)?;
+        let reserved = document_tokenizer
+            .get_post_processor()
+            .map_or(0, |processor| processor.added_tokens(false))
+            + usize::from(config.document_prefix_id.is_some());
+        if max_tokens <= reserved {
+            return Err(unavailable(
+                model_id,
+                format!("PRIORART_MAX_TOKENS must exceed the {reserved} special tokens"),
+            ));
+        }
         // pylate resolves skiplist words with convert_tokens_to_ids, which maps
         // unknown words to [UNK].
         let unknown = document_tokenizer.token_to_id("[UNK]");
@@ -230,6 +250,32 @@ impl Encoder for OnnxEncoder {
     fn encode_documents(&self, texts: &[&str]) -> Result<Vec<TokenMatrix>, EncoderError> {
         self.encode(&self.document, texts)
     }
+
+    fn fit_document<'a>(&self, text: &'a str) -> Result<&'a str, EncoderError> {
+        fit(&self.document.tokenizer, text)
+    }
+}
+
+/// Offsets are relative to the stripped text that [`OnnxEncoder::encode`] tokenizes.
+fn fit<'a>(tokenizer: &Tokenizer, text: &'a str) -> Result<&'a str, EncoderError> {
+    let encoding = tokenizer.encode(text.trim(), true).map_err(failed)?;
+    if encoding.get_overflowing().is_empty() {
+        return Ok(text);
+    }
+    let start = text.len() - text.trim_start().len();
+    let end = encoding
+        .get_offsets()
+        .iter()
+        .zip(encoding.get_special_tokens_mask())
+        .filter(|(_, &special)| special == 0)
+        .map(|(&(_, end), _)| start + end)
+        .max()
+        .unwrap_or(start);
+    let end = (0..=end)
+        .rev()
+        .find(|&end| text.is_char_boundary(end))
+        .unwrap_or(0);
+    Ok(&text[..end])
 }
 
 #[derive(Debug, PartialEq)]
@@ -325,6 +371,35 @@ mod tests {
         assert_eq!(batch.attention, [1, 1, 1, 1, 1, 1, 1, 1, 1, 0]);
         assert_eq!(batch.keep[0], [true; 5]);
         assert_eq!(batch.keep[1], [true, true, false, true, false]);
+    }
+
+    #[test]
+    fn fit_cuts_after_the_last_kept_token() {
+        let mut tokenizer: Tokenizer = r#"{
+            "version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+            "normalizer": null, "decoder": null,
+            "pre_tokenizer": {"type": "WhitespaceSplit"},
+            "post_processor": {"type": "TemplateProcessing",
+                "single": [{"SpecialToken": {"id": "<bos>", "type_id": 0}},
+                           {"Sequence": {"id": "A", "type_id": 0}},
+                           {"SpecialToken": {"id": "<eos>", "type_id": 0}}],
+                "pair": [],
+                "special_tokens": {
+                    "<bos>": {"id": "<bos>", "ids": [0], "tokens": ["<bos>"]},
+                    "<eos>": {"id": "<eos>", "ids": [1], "tokens": ["<eos>"]}}},
+            "model": {"type": "WordLevel", "unk_token": "<unk>",
+                "vocab": {"<bos>": 0, "<eos>": 1, "<unk>": 2}}
+        }"#
+        .parse()
+        .unwrap();
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: 4,
+                ..TruncationParams::default()
+            }))
+            .unwrap();
+        assert_eq!(fit(&tokenizer, "  café au lait ").unwrap(), "  café au");
+        assert_eq!(fit(&tokenizer, " café au ").unwrap(), " café au ");
     }
 
     #[test]

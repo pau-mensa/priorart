@@ -106,7 +106,6 @@ impl Service {
                 .as_ref()
                 .is_some_and(|id| !is_record_id(id))
             || source.text.trim().is_empty()
-            || source.text.len() > self.settings.max_text_bytes
         {
             return invalid("invalid import revision");
         }
@@ -178,6 +177,10 @@ impl Service {
             policy::mutation(store, context, collection, &record, Operation::Update)?;
         }
         store.check_put_revision(collection, Some(&record), Some(expected))?;
+        let source = &TransferRecord {
+            text: self.cutoff(&source.text)?.to_owned(),
+            ..source.clone()
+        };
         let index = indexes.get(store, collection)?;
         let encoded = index.encode(&source.text);
         policy::collection(store, context, collection, Operation::Contribute)?;
