@@ -32,7 +32,7 @@ authorized reader can still distinguish a missing record from a deleted one.
 
 | Operation | Required policy |
 |---|---|
-| Get current or old revision; search with or without filters | Public visibility or explicit `read` |
+| Get current or old revision; list records; search with or without filters | Public visibility or explicit `read` |
 | Create record | Authenticated `contribute`; author is the requesting principal |
 | Update record | `update` plus original authorship, or `update` plus `moderate` |
 | Delete record | `delete` plus original authorship, or `delete` plus `moderate`; tombstones retain authorship |

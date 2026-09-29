@@ -126,8 +126,16 @@ pub struct Revision {
     pub text: Option<String>,
     pub metadata: Option<Metadata>,
     pub text_sha256: String,
+    pub truncated: bool,
     pub created_at: String,
     pub author_principal_id: Option<String>,
+}
+
+/// A live record's latest revision, with the record's own creation time.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordSummary {
+    pub created_at: String,
+    pub latest: Revision,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,7 +195,7 @@ fn scalar_eq(left: &Value, right: &Value) -> bool {
 }
 
 const REVISION_COLUMNS: &str = "r.collection_id, r.record_id, r.revision, r.text, r.metadata, \
-     r.text_sha256, r.created_at, rec.author_principal_id FROM revisions r JOIN records rec \
+     r.text_sha256, r.created_at, rec.author_principal_id, r.truncated FROM revisions r JOIN records rec \
      ON rec.collection_id = r.collection_id AND rec.id = r.record_id";
 
 fn revision_row(row: &Row<'_>) -> rusqlite::Result<Revision> {
@@ -200,6 +208,7 @@ fn revision_row(row: &Row<'_>) -> rusqlite::Result<Revision> {
         text_sha256: row.get(5)?,
         created_at: row.get(6)?,
         author_principal_id: row.get(7)?,
+        truncated: row.get(8)?,
     })
 }
 
@@ -358,8 +367,11 @@ impl Store {
         let result = put_in(
             &transaction,
             collection_id,
-            text,
-            metadata,
+            Content {
+                text,
+                truncated: false,
+                metadata,
+            },
             record_id,
             author_principal_id,
             expected_revision,
@@ -423,6 +435,37 @@ impl Store {
         let result = delete_in(&transaction, collection_id, record_id, expected_revision)?;
         transaction.commit()?;
         Ok(result)
+    }
+
+    /// Live records after `after` in ID order, optionally only one author's.
+    /// Keyset pagination on the immutable ID; text is read only when asked for.
+    pub fn records(
+        &self,
+        collection_id: &str,
+        author: Option<&str>,
+        after: &str,
+        limit: i64,
+        include_text: bool,
+    ) -> Result<Vec<RecordSummary>> {
+        let mut statement = self.connection.prepare(
+            "SELECT r.collection_id, r.record_id, r.revision, CASE WHEN ?5 THEN r.text END, \
+             r.metadata, r.text_sha256, r.created_at, rec.author_principal_id, r.truncated, \
+             rec.created_at FROM records rec JOIN revisions r \
+             ON r.collection_id = rec.collection_id AND r.record_id = rec.id \
+             WHERE rec.collection_id = ?1 AND rec.deleted_at IS NULL AND rec.id > ?3 \
+             AND (?2 IS NULL OR rec.author_principal_id = ?2) \
+             AND r.revision = (SELECT MAX(latest.revision) FROM revisions latest \
+             WHERE latest.collection_id = rec.collection_id AND latest.record_id = rec.id) \
+             ORDER BY rec.id LIMIT ?4",
+        )?;
+        let rows =
+            statement.query_map((collection_id, author, after, limit, include_text), |row| {
+                Ok(RecordSummary {
+                    created_at: row.get(9)?,
+                    latest: revision_row(row)?,
+                })
+            })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// The latest revision of every live record, ordered by record ID.
@@ -636,11 +679,17 @@ fn check_revision(
     }
 }
 
+/// What a new revision stores.
+pub(crate) struct Content<'a> {
+    pub text: &'a str,
+    pub truncated: bool,
+    pub metadata: Option<&'a Metadata>,
+}
+
 fn put_in(
     transaction: &Transaction<'_>,
     collection_id: &str,
-    text: &str,
-    metadata: Option<&Metadata>,
+    content: Content<'_>,
     record_id: Option<&str>,
     author_principal_id: &str,
     expected_revision: Option<i64>,
@@ -680,14 +729,15 @@ fn put_in(
     };
     transaction.execute(
         "INSERT INTO revisions (collection_id, record_id, revision, text, metadata, \
-             text_sha256, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             text_sha256, truncated, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         (
             collection_id,
             &record_id,
             revision,
-            text,
-            metadata.map(encode),
-            digest(text),
+            content.text,
+            content.metadata.map(encode),
+            digest(content.text),
+            content.truncated,
             &now,
         ),
     )?;

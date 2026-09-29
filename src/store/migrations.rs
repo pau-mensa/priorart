@@ -152,6 +152,7 @@ CREATE TABLE records (
     deleted_revision INTEGER,
     PRIMARY KEY (collection_id, id)
 );
+CREATE INDEX records_author ON records(collection_id, author_principal_id, id);
 CREATE TABLE revisions (
     collection_id TEXT NOT NULL,
     record_id TEXT NOT NULL,
@@ -159,6 +160,7 @@ CREATE TABLE revisions (
     text TEXT,
     metadata TEXT,
     text_sha256 TEXT NOT NULL,
+    truncated INTEGER NOT NULL DEFAULT 0 CHECK (truncated IN (0, 1)),
     created_at TEXT NOT NULL,
     PRIMARY KEY (collection_id, record_id, revision),
     FOREIGN KEY (collection_id, record_id) REFERENCES records(collection_id, id)

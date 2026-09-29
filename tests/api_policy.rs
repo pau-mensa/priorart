@@ -953,3 +953,83 @@ async fn collection_deletion_is_authorized_and_removes_discovery_and_content() {
         StatusCode::NOT_FOUND
     );
 }
+
+#[tokio::test]
+async fn own_records_follow_the_principal_across_key_rotation_and_revocation() {
+    let api = Api::start().await;
+    let records = format!("/v1/collections/{}/records", api.public);
+    let grants = [
+        Grant::new(&api.public, Op::Read),
+        Grant::new(&api.public, Op::Contribute),
+        Grant::new(&api.public, Op::Update),
+    ];
+    let issued = api
+        .store
+        .issue_local_credential(&api.bob, &grants, None)
+        .unwrap();
+    let lookup = issued.info.id.clone();
+    let bob_public = issued.into_secret();
+    let (status, created) = api
+        .request(
+            Method::POST,
+            &records,
+            Some(&bob_public),
+            Some(json!({"id": "bobs", "text": "bob public note", "publish": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created["revision"], 1);
+
+    let ids = |body: &Value| -> Vec<String> {
+        body["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let mine = format!("{records}?author=me");
+    assert_eq!(ids(&api.get(&mine, Some(&api.alice_key)).await.1), ["same"]);
+    assert_eq!(ids(&api.get(&mine, Some(&bob_public)).await.1), ["bobs"]);
+    assert_eq!(ids(&api.get(&records, None).await.1), ["bobs", "same"]);
+    assert_eq!(api.get(&mine, None).await.0, StatusCode::BAD_REQUEST);
+    let private = format!("/v1/collections/{}/records?author=me", api.a);
+    assert_eq!(api.get(&private, None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        api.get(&private, Some(&api.bob_key)).await.0,
+        StatusCode::NOT_FOUND
+    );
+
+    let rotated = api
+        .store
+        .rotate_local_credential(&lookup)
+        .unwrap()
+        .into_secret();
+    assert_eq!(
+        api.get(&mine, Some(&bob_public)).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(ids(&api.get(&mine, Some(&rotated)).await.1), ["bobs"]);
+    for credential in api.store.local_credentials(&api.bob).unwrap() {
+        api.store.revoke_local_credential(&credential.id).unwrap();
+    }
+    assert_eq!(
+        api.get(&mine, Some(&rotated)).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let reissued = api
+        .store
+        .issue_local_credential(&api.bob, &grants, None)
+        .unwrap()
+        .into_secret();
+    assert_eq!(ids(&api.get(&mine, Some(&reissued)).await.1), ["bobs"]);
+    let (status, _) = api
+        .request(
+            Method::POST,
+            &records,
+            Some(&reissued),
+            Some(json!({"id": "bobs", "text": "edited", "expected_revision": 1, "publish": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+}

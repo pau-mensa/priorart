@@ -20,7 +20,7 @@ use crate::encoder::{load_encoder, Encoder, EncoderError};
 use crate::excerpt::{excerpt, DEFAULT_WIDTH};
 use crate::index::{CollectionIndexManager, IndexError};
 use crate::policy::{self, PolicyError};
-use crate::store::{Metadata, Revision, Store, StoreError, Visibility};
+use crate::store::{Metadata, RecordSummary, Revision, Store, StoreError, Visibility};
 
 mod transfer;
 pub use transfer::ImportOptions;
@@ -534,6 +534,32 @@ impl Service {
             .map(|id| inspect_collection(&store, context, id))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         policy::validate(&store, context)?;
+        Ok(result)
+    }
+
+    /// Live records of a readable collection in ID order. `mine` keeps only the
+    /// caller principal's records, so it needs an identity; keys are irrelevant.
+    pub fn records(
+        &self,
+        context: &RequestContext,
+        collection_id: &str,
+        mine: bool,
+        after: &str,
+        limit: i64,
+        include_text: bool,
+    ) -> Result<Vec<RecordSummary>> {
+        let store = self.connect()?;
+        policy::collection(&store, context, collection_id, Operation::Read)?;
+        if !(1..=MAX_LIMIT).contains(&limit) || (!after.is_empty() && !is_record_id(after)) {
+            return invalid("invalid record pagination");
+        }
+        let author = match (mine, context.principal_id()) {
+            (false, _) => None,
+            (true, Some(principal)) => Some(principal),
+            (true, None) => return invalid("author=me requires a credential"),
+        };
+        let result = store.records(collection_id, author, after, limit, include_text)?;
+        policy::collection(&store, context, collection_id, Operation::Read)?;
         Ok(result)
     }
 

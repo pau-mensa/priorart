@@ -286,6 +286,64 @@ async fn text_beyond_the_token_cutoff_is_truncated() {
 }
 
 #[tokio::test]
+async fn records_are_listed_in_id_order_without_tombstones() {
+    let api = Api::with_max_tokens(4).await;
+    let records = "/v1/collections/local/records";
+    for (id, text) in [
+        ("c", "three"),
+        ("a", "one two three four five"),
+        ("b", "two"),
+    ] {
+        let (status, _) = api
+            .post(
+                records,
+                json!({"id": id, "text": text, "metadata": {"k": id}}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+    assert_eq!(
+        api.delete(&format!("{records}/b?expected_revision=1"))
+            .await,
+        StatusCode::NO_CONTENT
+    );
+
+    let (status, page) = api.get(&format!("{records}?limit=1")).await;
+    assert_eq!(status, StatusCode::OK);
+    let first = &page["records"][0];
+    assert_eq!(page["records"].as_array().unwrap().len(), 1);
+    assert_eq!(first["id"], "a");
+    assert_eq!(first["truncated"], true);
+    assert_eq!(first["metadata"], json!({"k": "a"}));
+    assert_eq!(first["created_at"], first["updated_at"]);
+    assert!(first.get("text").is_none());
+    let (_, page) = api
+        .get(&format!("{records}?limit=1&after=a&author=me&include=text"))
+        .await;
+    assert_eq!(page["records"][0]["id"], "c");
+    assert_eq!(page["records"][0]["text"], "three");
+    assert_eq!(page["records"][0]["truncated"], false);
+    let (_, page) = api.get(&format!("{records}?after=c")).await;
+    assert_eq!(page["records"], json!([]));
+    let (_, record) = api.get(&format!("{records}/a")).await;
+    assert_eq!(record["truncated"], true);
+
+    for query in [
+        "author=you",
+        "include=metadata",
+        "limit=0",
+        "limit=101",
+        "after=%20",
+    ] {
+        assert_eq!(
+            api.get(&format!("{records}?{query}")).await.0,
+            StatusCode::BAD_REQUEST,
+            "{query}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn credential_administration_has_no_remote_endpoint() {
     let api = Api::start().await;
     for path in [

@@ -251,6 +251,16 @@ struct PutRequest {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RecordsQuery {
+    #[serde(default)]
+    after: String,
+    #[serde(default = "default_page_size")]
+    limit: i64,
+    author: Option<String>,
+    include: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RevisionQuery {
     revision: Option<i64>,
 }
@@ -295,7 +305,10 @@ pub fn router(service: Arc<Service>) -> Router {
             get(collection).delete(delete_collection),
         )
         .route("/v1/collections/{collection}/diagnostics", get(diagnostics))
-        .route("/v1/collections/{collection}/records", post(put_record))
+        .route(
+            "/v1/collections/{collection}/records",
+            get(list_records).post(put_record),
+        )
         .route(
             "/v1/collections/{collection}/records/{id}",
             get(get_record).delete(delete_record),
@@ -419,6 +432,51 @@ async fn put_record(
         ),
     ))
 }
+async fn list_records(
+    State(service): State<Arc<Service>>,
+    Extension(context): Extension<RequestContext>,
+    path: Result<Path<String>, PathRejection>,
+    query: Result<Query<RecordsQuery>, QueryRejection>,
+) -> ApiResult<Json<Value>> {
+    let Path(collection) = path?;
+    identifier(&collection)?;
+    let Query(query) = query?;
+    let mine = match query.author.as_deref() {
+        None => false,
+        Some("me") => true,
+        Some(_) => return Err(ApiError::invalid()),
+    };
+    let include_text = match query.include.as_deref() {
+        None => false,
+        Some("text") => true,
+        Some(_) => return Err(ApiError::invalid()),
+    };
+    let response_collection = collection.clone();
+    let rows = blocking(&service, move |s| {
+        s.records(
+            &context,
+            &collection,
+            mine,
+            &query.after,
+            query.limit,
+            include_text,
+        )
+    })
+    .await?;
+    let records: Vec<Value> = rows
+        .into_iter()
+        .map(|row| {
+            let mut record = json!({"id": row.latest.record_id, "revision": row.latest.revision, "created_at": row.created_at, "updated_at": row.latest.created_at, "metadata": row.latest.metadata, "truncated": row.latest.truncated});
+            if include_text {
+                record["text"] = json!(row.latest.text);
+            }
+            record
+        })
+        .collect();
+    Ok(Json(
+        json!({"collection_id": response_collection, "records": records}),
+    ))
+}
 async fn get_record(
     State(service): State<Arc<Service>>,
     Extension(context): Extension<RequestContext>,
@@ -435,7 +493,7 @@ async fn get_record(
     })
     .await?;
     Ok(Json(
-        json!({"collection_id": row.collection_id, "id": row.record_id, "revision": row.revision, "text": row.text, "metadata": row.metadata, "created_at": row.created_at}),
+        json!({"collection_id": row.collection_id, "id": row.record_id, "revision": row.revision, "text": row.text, "metadata": row.metadata, "truncated": row.truncated, "created_at": row.created_at}),
     ))
 }
 async fn delete_record(

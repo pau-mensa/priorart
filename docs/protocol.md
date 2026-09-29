@@ -117,8 +117,24 @@ idempotency remains step 13.
 ## Read and delete
 
 `GET /v1/collections/{collection}/records/{id}?revision=N` returns
-`{"collection_id","id","revision","text","metadata","created_at"}`.
+`{"collection_id","id","revision","text","metadata","truncated","created_at"}`.
 Omitting `revision` selects the latest; supplied revisions must be positive.
+
+`GET /v1/collections/{collection}/records?author=me&limit=50&after=ID&include=text`
+lists live records of a readable collection in record ID order, latest revision
+each; tombstones are excluded. Every parameter is optional:
+
+- `author=me` keeps only records authored by the caller's principal. Authorship
+  belongs to the principal, so it survives key rotation, revocation, and
+  re-issuance. Without a credential it returns `400`; local mode uses the local
+  principal.
+- `limit` is 1–100 (default 50). `after` is the last ID of the previous page;
+  pages are keyed by immutable IDs, so concurrent writes neither repeat nor skip
+  records that existed on both requests.
+- `include=text` adds each record's text; it is omitted by default.
+
+Returns `{"collection_id","records":[{"id","revision","created_at","updated_at","metadata","truncated"}]}`,
+where `created_at` is the record's first revision and `updated_at` its latest.
 
 `DELETE /v1/collections/{collection}/records/{id}?expected_revision=N` requires
 `delete` plus authorship or `moderate`. An authorized existing target requires a

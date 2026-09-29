@@ -729,3 +729,39 @@ fn revision_preconditions_are_atomic_across_connections() {
         Err(StoreError::RevisionConflict)
     ));
 }
+
+#[test]
+fn record_pages_are_keyed_by_id_and_filter_by_author() {
+    let (_directory, store) = open();
+    let other = store.create_principal().unwrap();
+    for id in ["a", "c", "e"] {
+        put(&store, LOCAL, id, Some(id));
+    }
+    store
+        .put(LOCAL, "theirs", None, Some("d"), &other, None)
+        .unwrap();
+    let ids = |rows: Vec<RecordSummary>| -> Vec<String> {
+        rows.into_iter().map(|row| row.latest.record_id).collect()
+    };
+    let first = store.records(LOCAL, None, "", 2, false).unwrap();
+    assert!(first.iter().all(|row| row.latest.text.is_none()));
+    assert_eq!(ids(first), ["a", "c"]);
+    put(&store, LOCAL, "b", Some("b"));
+    put(&store, LOCAL, "a updated", Some("a"));
+    store.delete(LOCAL, "e", Some(1)).unwrap();
+    assert_eq!(
+        ids(store.records(LOCAL, None, "c", 2, false).unwrap()),
+        ["d"]
+    );
+    let mine = store
+        .records(LOCAL, Some(LOCAL_PRINCIPAL_ID), "", 10, true)
+        .unwrap();
+    assert_eq!(mine[0].latest.revision, 2);
+    assert_eq!(mine[0].latest.text.as_deref(), Some("a updated"));
+    assert_ne!(mine[0].created_at, mine[0].latest.created_at);
+    assert_eq!(ids(mine), ["a", "b", "c"]);
+    assert_eq!(
+        ids(store.records(LOCAL, Some(&other), "", 10, false).unwrap()),
+        ["d"]
+    );
+}

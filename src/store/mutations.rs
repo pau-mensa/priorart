@@ -38,8 +38,11 @@ impl Store {
             let record = put_in(
                 transaction,
                 intent.collection,
-                text,
-                metadata,
+                Content {
+                    text,
+                    truncated,
+                    metadata,
+                },
                 record,
                 intent.principal,
                 expected,

@@ -87,14 +87,18 @@ impl Store {
         record: &str,
         expected: i64,
         source: &TransferRecord,
+        truncated: bool,
         source_digest: &str,
     ) -> Result<mutations::Mutation<(String, i64)>> {
         self.commit_mutation(intent, |transaction| {
             let created = put_in(
                 transaction,
                 intent.collection,
-                &source.text,
-                source.metadata.as_ref(),
+                Content {
+                    text: &source.text,
+                    truncated,
+                    metadata: source.metadata.as_ref(),
+                },
                 Some(record),
                 intent.principal,
                 Some(expected),

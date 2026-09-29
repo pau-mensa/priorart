@@ -177,8 +177,10 @@ impl Service {
             policy::mutation(store, context, collection, &record, Operation::Update)?;
         }
         store.check_put_revision(collection, Some(&record), Some(expected))?;
+        let fitted = self.cutoff(&source.text)?;
+        let truncated = fitted.len() < source.text.len();
         let source = &TransferRecord {
-            text: self.cutoff(&source.text)?.to_owned(),
+            text: fitted.to_owned(),
             ..source.clone()
         };
         let index = indexes.get(store, collection)?;
@@ -188,7 +190,14 @@ impl Service {
             policy::mutation(store, context, collection, &record, Operation::Update)?;
         }
         let encoded = encoded?;
-        let committed = store.commit_import(&intent, &record, expected, source, &source_digest)?;
+        let committed = store.commit_import(
+            &intent,
+            &record,
+            expected,
+            source,
+            truncated,
+            &source_digest,
+        )?;
         crate::fault::check("after_record_commit").map_err(IndexError::from)?;
         let result = index.upsert(store, &record, committed.value.1, &source.text, encoded);
         policy::validate(store, context)?;
