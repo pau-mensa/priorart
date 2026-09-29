@@ -21,12 +21,8 @@ const ALL: &[Op] = &[
     Op::Contribute,
     Op::Update,
     Op::Delete,
-    Op::Report,
-    Op::FeedbackRead,
-    Op::ReportPublish,
     Op::Moderate,
     Op::Admin,
-    Op::Delegate,
 ];
 
 struct Fixture {
@@ -48,15 +44,13 @@ impl Fixture {
         let store = Store::open(dir.path().join(DATABASE_FILE)).unwrap();
         let alice = store.create_principal().unwrap();
         let bob = store.create_principal().unwrap();
-        let aa = store.create_account(&alice).unwrap();
-        let ba = store.create_account(&bob).unwrap();
         let a = store
-            .create_collection(&aa, Visibility::Restricted)
+            .create_collection(&alice, Visibility::Restricted)
             .unwrap();
         let b = store
-            .create_collection(&ba, Visibility::Restricted)
+            .create_collection(&bob, Visibility::Restricted)
             .unwrap();
-        let public = store.create_collection(&aa, Visibility::Public).unwrap();
+        let public = store.create_collection(&alice, Visibility::Public).unwrap();
         let alice_grants: Vec<_> = [&a, &public]
             .iter()
             .flat_map(|id| ALL.iter().map(|op| Grant::new(*id, *op)))
@@ -125,10 +119,10 @@ impl Fixture {
     fn bob(&self) -> RequestContext {
         self.service.authenticate(&self.bob_key).unwrap()
     }
-    fn delegated(&self, principal: &str, collection: &str, ops: &[Op]) -> String {
+    fn limited(&self, principal: &str, collection: &str, ops: &[Op]) -> String {
         let grants: Vec<_> = ops.iter().map(|op| Grant::new(collection, *op)).collect();
         self.store
-            .delegate_credential_to(&self.alice(), principal, &grants, None)
+            .issue_local_credential(principal, &grants, None)
             .unwrap()
             .into_secret()
     }
@@ -155,7 +149,7 @@ fn unauthenticated<T: std::fmt::Debug>(result: Result<T, ServiceError>) {
 }
 
 #[test]
-fn unrelated_accounts_cannot_read_mutate_report_or_inspect_forbidden_scope() {
+fn unrelated_principals_cannot_read_mutate_or_inspect_forbidden_scope() {
     let f = Fixture::new(None);
     let tags: Metadata = json!({"tag": "shared"}).as_object().unwrap().clone();
     let context = f.bob();
@@ -191,24 +185,6 @@ fn unrelated_accounts_cannot_read_mutate_report_or_inspect_forbidden_scope() {
                 )),
                 expected
             );
-            assert_eq!(
-                unavailable(f.service.report(
-                    &context,
-                    collection,
-                    record,
-                    "report",
-                    priorart::service::ReportOptions {
-                        revision: Some(1),
-                        search_id: None,
-                        idempotency_key: None
-                    }
-                )),
-                expected
-            );
-            assert_eq!(
-                unavailable(f.service.reports(&context, collection, record)),
-                expected
-            );
         }
         assert_eq!(
             unavailable(
@@ -234,9 +210,9 @@ fn unrelated_accounts_cannot_read_mutate_report_or_inspect_forbidden_scope() {
 }
 
 #[test]
-fn read_scope_includes_old_revisions_but_not_mutations_feedback_or_diagnostics() {
+fn read_scope_includes_old_revisions_but_not_mutations_or_diagnostics() {
     let f = Fixture::new(None);
-    let key = f.delegated(&f.bob, &f.a, &[Op::Read]);
+    let key = f.limited(&f.alice, &f.a, &[Op::Read]);
     f.service
         .put(
             &f.alice(),
@@ -283,24 +259,12 @@ fn read_scope_includes_old_revisions_but_not_mutations_feedback_or_diagnostics()
             idempotency_key: None,
         },
     ));
-    unavailable(f.service.report(
-        &reader,
-        &f.a,
-        "same",
-        "report",
-        priorart::service::ReportOptions {
-            revision: None,
-            search_id: None,
-            idempotency_key: None,
-        },
-    ));
-    unavailable(f.service.reports(&reader, &f.a, "same"));
     unavailable(f.service.health(&reader, &f.a));
     unavailable(f.service.get(&reader, &f.b, "same", None));
 }
 
 #[test]
-fn anonymous_public_reads_never_log_and_mutations_require_credentials() {
+fn anonymous_public_reads_succeed_and_mutations_require_credentials() {
     let f = Fixture::new(None);
     let anonymous = RequestContext::anonymous();
     assert_eq!(
@@ -315,12 +279,6 @@ fn anonymous_public_reads_never_log_and_mutations_require_credentials() {
         .search(&anonymous, &f.public, "sentinel", None, 10)
         .unwrap();
     assert_eq!(outcome.hits.len(), 1);
-    assert!(outcome.search_id.is_none());
-    let count: i64 = rusqlite::Connection::open(f.store.path())
-        .unwrap()
-        .query_row("SELECT count(*) FROM searches", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(count, 0);
     for context in [&anonymous, &f.bob()] {
         unavailable(f.service.put(
             context,
@@ -343,18 +301,6 @@ fn anonymous_public_reads_never_log_and_mutations_require_credentials() {
                 idempotency_key: None,
             },
         ));
-        unavailable(f.service.report(
-            context,
-            &f.public,
-            "same",
-            "report",
-            priorart::service::ReportOptions {
-                revision: Some(1),
-                search_id: None,
-                idempotency_key: None,
-            },
-        ));
-        unavailable(f.service.reports(context, &f.public, "same"));
         unavailable(f.service.health(context, &f.public));
     }
     unavailable(f.service.get(&anonymous, &f.a, "same", None));
@@ -363,7 +309,7 @@ fn anonymous_public_reads_never_log_and_mutations_require_credentials() {
 #[test]
 fn public_authorship_publication_and_moderation_are_explicit() {
     let f = Fixture::new(None);
-    let contributor = f.delegated(&f.bob, &f.public, &[Op::Contribute, Op::Update, Op::Delete]);
+    let contributor = f.limited(&f.bob, &f.public, &[Op::Contribute, Op::Update, Op::Delete]);
     let author = f.context(&contributor);
     assert!(matches!(
         f.service.put(
@@ -433,7 +379,7 @@ fn public_authorship_publication_and_moderation_are_explicit() {
             idempotency_key: None,
         },
     ));
-    let owner_limited = f.delegated(&f.alice, &f.public, &[Op::Update, Op::Delete, Op::Admin]);
+    let owner_limited = f.limited(&f.alice, &f.public, &[Op::Update, Op::Delete, Op::Admin]);
     let owner_limited = f.context(&owner_limited);
     unavailable(f.service.put(
         &owner_limited,
@@ -521,7 +467,7 @@ fn public_authorship_publication_and_moderation_are_explicit() {
 #[test]
 fn contribute_does_not_grant_update_even_to_the_original_author() {
     let f = Fixture::new(None);
-    let key = f.delegated(&f.bob, &f.a, &[Op::Contribute]);
+    let key = f.limited(&f.alice, &f.a, &[Op::Contribute]);
     let writer = f.context(&key);
     f.service
         .put(
@@ -554,91 +500,9 @@ fn contribute_does_not_grant_update_even_to_the_original_author() {
 }
 
 #[test]
-fn reports_and_attached_receipts_belong_to_the_requesting_principal() {
-    let f = Fixture::new(None);
-    let key = f.delegated(&f.bob, &f.public, &[Op::Report, Op::FeedbackRead]);
-    let alice = f.alice();
-    let bob = f.context(&key);
-    let receipt = f
-        .service
-        .search(&alice, &f.public, "sentinel", None, 10)
-        .unwrap()
-        .search_id
-        .unwrap();
-    f.service
-        .report(
-            &alice,
-            &f.public,
-            "same",
-            "Alice private feedback",
-            priorart::service::ReportOptions {
-                revision: Some(1),
-                search_id: Some(&receipt),
-                idempotency_key: None,
-            },
-        )
-        .unwrap();
-    f.service
-        .report(
-            &bob,
-            &f.public,
-            "same",
-            "Bob private feedback",
-            priorart::service::ReportOptions {
-                revision: Some(1),
-                search_id: None,
-                idempotency_key: None,
-            },
-        )
-        .unwrap();
-    let alice_reports = f.service.reports(&alice, &f.public, "same").unwrap();
-    let bob_reports = f.service.reports(&bob, &f.public, "same").unwrap();
-    assert_eq!(alice_reports.len(), 1);
-    assert_eq!(bob_reports.len(), 1);
-    assert_eq!(bob_reports[0].text, "Bob private feedback");
-    assert_eq!(alice_reports[0].text, "Alice private feedback");
-    for id in [&receipt, "unknown-receipt"] {
-        let error = f
-            .service
-            .report(
-                &bob,
-                &f.public,
-                "same",
-                "attack",
-                priorart::service::ReportOptions {
-                    revision: Some(1),
-                    search_id: Some(id),
-                    idempotency_key: None,
-                },
-            )
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            ServiceError::Store(priorart::store::StoreError::SearchNotFound { .. })
-        ));
-    }
-    unavailable(
-        f.service
-            .reports(&RequestContext::anonymous(), &f.public, "same"),
-    );
-    f.service
-        .delete(
-            &alice,
-            &f.public,
-            "same",
-            priorart::service::DeleteOptions {
-                expected_revision: Some(1),
-                idempotency_key: None,
-            },
-        )
-        .unwrap();
-    assert!(f.service.reports(&bob, &f.public, "same").is_err());
-}
-
-#[test]
 fn revoked_and_reduced_credentials_cannot_reuse_loaded_indexes_or_public_read_access() {
     let f = Fixture::new(None);
-    let key = f.delegated(&f.bob, &f.a, &[Op::Read]);
+    let key = f.limited(&f.alice, &f.a, &[Op::Read]);
     let old = f.context(&key);
     f.service.search(&old, &f.a, "sentinel", None, 10).unwrap();
     let id = &old.credential().unwrap().id;
@@ -767,11 +631,6 @@ fn revocation_during_encoding_blocks_search_results_and_record_commits() {
         ));
         if query {
             unauthenticated(f.service.search(&context, &f.a, "sentinel", None, 10));
-            let count: i64 = rusqlite::Connection::open(f.store.path())
-                .unwrap()
-                .query_row("SELECT count(*) FROM searches", [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(count, 0);
         } else {
             unauthenticated(f.service.put(
                 &context,
@@ -826,18 +685,6 @@ fn expired_credentials_fail_even_for_public_data() {
             idempotency_key: None,
         },
     ));
-    unauthenticated(f.service.report(
-        &context,
-        &f.public,
-        "same",
-        "feedback",
-        priorart::service::ReportOptions {
-            revision: None,
-            search_id: None,
-            idempotency_key: None,
-        },
-    ));
-    unauthenticated(f.service.reports(&context, &f.public, "same"));
     unauthenticated(f.service.health(&context, &f.public));
 }
 
@@ -880,249 +727,4 @@ fn revocation_during_recovery_blocks_responses_but_does_not_undo_committed_delet
             ));
         }
     }
-}
-
-#[test]
-fn receipts_and_publication_preserve_requester_privacy() {
-    let f = Fixture::new(None);
-    let alice = f.alice();
-    let key = f.delegated(
-        &f.bob,
-        &f.public,
-        &[Op::Report, Op::FeedbackRead, Op::ReportPublish],
-    );
-    let bob = f.context(&key);
-    let search = f
-        .service
-        .search(&bob, &f.public, "sentinel", None, 10)
-        .unwrap();
-    let receipt = search.search_id.unwrap();
-    assert_eq!(
-        f.service
-            .search_receipt(&bob, &f.public, &receipt)
-            .unwrap()
-            .hits
-            .len(),
-        1
-    );
-    unavailable(f.service.search_receipt(&alice, &f.public, &receipt));
-    unavailable(f.service.search_receipt(&alice, &f.public, "guessed"));
-    unavailable(
-        f.service
-            .search_receipt(&RequestContext::anonymous(), &f.public, &receipt),
-    );
-    let report = f
-        .service
-        .report(
-            &bob,
-            &f.public,
-            "same",
-            "private project details",
-            priorart::service::ReportOptions {
-                revision: Some(1),
-                search_id: Some(&receipt),
-                idempotency_key: None,
-            },
-        )
-        .unwrap();
-    unavailable(
-        f.service
-            .publish_report(&alice, &f.public, &report.value, "stolen", None),
-    );
-    assert!(f
-        .service
-        .reports(&alice, &f.public, "same")
-        .unwrap()
-        .is_empty());
-    let limited = f.context(&f.delegated(&f.bob, &f.public, &[Op::Report]));
-    unavailable(
-        f.service
-            .publish_report(&limited, &f.public, &report.value, "no grant", None),
-    );
-    unavailable(f.service.search_receipt(&limited, &f.public, &receipt));
-    unauthenticated(f.service.search_receipt(&bob, &f.public, &receipt));
-    unauthenticated(f.service.publish_report(
-        &bob,
-        &f.public,
-        &report.value,
-        "stale context",
-        None,
-    ));
-    let bob = f.context(&key);
-    let anonymous = RequestContext::anonymous();
-    assert!(f
-        .service
-        .published_reports(&anonymous, &f.public, "same")
-        .unwrap()
-        .is_empty());
-    let published = f
-        .service
-        .publish_report(
-            &bob,
-            &f.public,
-            &report.value,
-            "selected public text",
-            Some("publish-once"),
-        )
-        .unwrap();
-    assert_eq!(
-        published,
-        f.service
-            .publish_report(
-                &bob,
-                &f.public,
-                &report.value,
-                "selected public text",
-                Some("publish-once")
-            )
-            .unwrap()
-    );
-    let rows = f
-        .service
-        .published_reports(&anonymous, &f.public, "same")
-        .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_ne!(rows[0].id, report.value);
-    let encoded = serde_json::to_string(&rows).unwrap();
-    for private in [
-        &receipt,
-        &report.value,
-        "private project details",
-        "search_id",
-        "reporter_principal_id",
-    ] {
-        assert!(!encoded.contains(private));
-    }
-    let private = f
-        .service
-        .report(
-            &alice,
-            &f.a,
-            "same",
-            "private",
-            priorart::service::ReportOptions {
-                revision: Some(1),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    unavailable(
-        f.service
-            .publish_report(&alice, &f.a, &private.value, "no", None),
-    );
-    f.service
-        .delete(
-            &alice,
-            &f.public,
-            "same",
-            priorart::service::DeleteOptions {
-                expected_revision: Some(1),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    assert!(f
-        .service
-        .published_reports(&anonymous, &f.public, "same")
-        .is_err());
-    assert!(f
-        .service
-        .publish_report(
-            &bob,
-            &f.public,
-            &report.value,
-            "selected public text",
-            Some("publish-once")
-        )
-        .is_err());
-}
-
-#[test]
-fn receipt_evidence_requires_the_exact_returned_revision() {
-    let f = Fixture::new(None);
-    let alice = f.alice();
-    assert!(matches!(
-        f.service.report(
-            &alice,
-            &f.public,
-            "same",
-            "missing revision",
-            Default::default()
-        ),
-        Err(ServiceError::InvalidInput(_))
-    ));
-
-    let receipt = f
-        .service
-        .search(&alice, &f.public, "sentinel", None, 10)
-        .unwrap()
-        .search_id
-        .unwrap();
-    f.service
-        .put(
-            &alice,
-            &f.public,
-            "new revision",
-            None,
-            Some("same"),
-            WriteOptions {
-                expected_revision: Some(1),
-                publish: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    assert!(f
-        .service
-        .report(
-            &alice,
-            &f.public,
-            "same",
-            "wrong revision",
-            priorart::service::ReportOptions {
-                revision: Some(2),
-                search_id: Some(&receipt),
-                ..Default::default()
-            }
-        )
-        .is_err());
-    f.service
-        .report(
-            &alice,
-            &f.public,
-            "same",
-            "old exact revision",
-            priorart::service::ReportOptions {
-                revision: Some(1),
-                search_id: Some(&receipt),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    let empty = f
-        .service
-        .search(
-            &alice,
-            &f.public,
-            "sentinel",
-            Some(json!({"absent": true}).as_object().unwrap()),
-            10,
-        )
-        .unwrap()
-        .search_id
-        .unwrap();
-    assert!(f
-        .service
-        .report(
-            &alice,
-            &f.public,
-            "same",
-            "not returned",
-            priorart::service::ReportOptions {
-                revision: Some(2),
-                search_id: Some(&empty),
-                ..Default::default()
-            }
-        )
-        .is_err());
 }

@@ -3,12 +3,11 @@
 A self-hostable text store for experiences written by coding agents: what
 failed, what changed, how the result was checked. An agent stores raw text.
 Another agent, stuck on a problem, searches with raw text describing what it
-sees and what it has tried. Either can report in plain language what happened
-after reusing a record.
+sees and what it has tried.
 
 The bet is that retrieving a relevant experience early reduces the tokens,
 latency, and failed attempts an agent spends per completed task. The public
-protocol is deliberately generic: put, get, search, delete, report. Everything
+protocol is deliberately generic: put, get, search, delete. Everything
 retrieval-specific stays behind the server and is replaceable without a
 protocol change.
 
@@ -19,8 +18,6 @@ protocol change.
   schema.
 - **Raw text queries.** Describe the current problem, context, observations,
   and failed attempts; get ranked references with query-aware excerpts.
-- **Linked feedback.** Report the outcome of reusing a record in ordinary
-  language, tied to the record, its revision, and the search that surfaced it.
 - **Late-interaction retrieval** with [lateweave](https://github.com/pau-mensa/lateweave)
   and [LateOn-Code](https://huggingface.co/lightonai/LateOn-Code) on ONNX
   Runtime (no torch): exact MaxSim over the whole corpus while it is small,
@@ -69,12 +66,8 @@ curl -s localhost:8000/v1/search -H 'content-type: application/json' -d '{
   "text": "multi-GPU training hangs at the end of the first epoch, no error, GPU util drops to zero",
   "limit": 3
 }'
-# {"search_id":"…","hits":[{"id":"3f9c…","revision":1,"score":…,"excerpt":"…"}],…}
+# {"collections":["local"],"hits":[{"id":"3f9c…","revision":1,"score":…,"excerpt":"…"}],…}
 
-curl -s localhost:8000/v1/collections/local/reports -H 'content-type: application/json' -d '{
-  "record_id": "3f9c…", "revision": 1, "search_id": "…",
-  "text": "Same cause here (torchrun, 4xA100, torch 2.8). Removing the exit fixed it."
-}'
 ```
 
 The full wire specification is in [docs/protocol.md](docs/protocol.md).
@@ -83,9 +76,8 @@ The full wire specification is in [docs/protocol.md](docs/protocol.md).
 
 `priorart mcp` is a stdio MCP server that forwards to a running `priorart
 serve`. It exposes `search_experiences`, `get_experience`,
-`contribute_experience`, `report_outcome`, and `delete_experience`, with tool
-descriptions that tell the agent what to put in a query and what a useful
-contribution or outcome report contains.
+`contribute_experience`, and `delete_experience`, with tool descriptions that
+tell the agent what to put in a query and what a useful contribution contains.
 
 ```bash
 claude mcp add --transport stdio --env PRIORART_URL=http://127.0.0.1:8000 priorart \
@@ -127,9 +119,9 @@ session must go through the one server.
 
 ## Local credentials
 
-`priorart admin issue --grant local:read` bootstraps an opaque agent credential
-for the local principal and prints its secret once. Local commands also list,
-rotate, revoke, and replace grants. See [credential administration](docs/credentials.md).
+`priorart admin issue --grant local:read` issues an opaque agent credential for
+the local principal and prints its secret once. Local commands also create
+principals and collections, and list, rotate, revoke, and replace grants. See [credential administration](docs/credentials.md).
 The Rust service enforces [collection and object policy](docs/policy.md) on explicit
 request contexts. Start with `PRIORART_MODE=authenticated priorart serve` to require
 header credentials for restricted content and mutations. Public reads can be anonymous.
@@ -156,16 +148,10 @@ For database upgrades and recovery behavior, see [storage versions](docs/storage
 - Record mutations use a durable journal and atomic index-generation activation.
   HTTP retry keys avoid duplicate mutations after lost responses or recovery.
   Staging currently copies vector files, adding disk I/O proportional to index size.
-  Deletion purges associated feedback and all affected index generations, then
-  rebuilds surviving records. Backups and physical storage erasure are separate.
-- Authenticated/local searches keep requester-private receipts without queries or
-  filters; anonymous public searches persist nothing. Reports default to private;
-  explicit publication creates a separate public copy. Retention is still pending.
-- Reports are stored and returned, not scored. Voting is not correctness.
+  Deletion purges all affected index generations, then rebuilds surviving records. Backups and physical storage erasure are separate.
+- Searches persist nothing: no query, filter, or result list.
 
 Collection revisions can be streamed through the [export/import API](docs/protocol.md#streaming-export-and-import).
-[Feedback deletion and resumable retention jobs](docs/protocol.md#feedback-deletion-and-retention)
-provide explicit lifecycle controls; no automatic retention policy is enabled.
 Imports require explicit destination visibility and assign new authorship; retries
 resume within a batch without duplicating revisions.
 

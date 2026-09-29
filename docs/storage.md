@@ -15,31 +15,16 @@ are independent of the HTTP protocol version.
 
 | Stored state | Startup behavior |
 |---|---|
-| Empty database | Create the current schema transactionally |
+| Empty database | Create the current schema (`v0.9.0`) transactionally |
 | No `schema_version`, any existing schema | Reject; priorart only initializes empty databases |
-| `v0.2.0` | Apply credential, mutation, feedback, lifecycle, transfer, and retention migrations |
-| `v0.3.0` | Apply mutation, feedback, lifecycle, transfer, and retention migrations |
-| `v0.4.0` | Apply feedback, lifecycle, transfer, and retention migrations |
-| `v0.5.0` | Apply lifecycle, transfer, and retention migrations |
-| `v0.6.0` | Add content generations, private import provenance, and retention jobs |
-| `v0.7.0` | Add publication authorship and retention jobs |
-| `v0.8.0` | Open without rerunning migrations |
+| `v0.9.0` | Open without rerunning migrations |
 | A tag this build does not know | Reject, naming that release as the one to use |
 | Nonzero `PRAGMA user_version` | Reject as a Python implementation directory; use `v0.1.0` |
 
-`v0.2.0` is the collection-scoped layout. It bootstraps principal
-`local-principal`, account `local-account` owned by it, and collection `local`
-owned by that account with visibility `restricted`. Data directories written by
-the Python implementation (release `v0.1.0`, which versioned its schema with
-`PRAGMA user_version`) are not adopted.
-
-Schema `v0.3.0` adds credential verifiers, scoped grants, and authentication versions.
-Schema `v0.4.0` adds durable, scoped mutation receipts without rewriting content.
-Schema `v0.5.0` drops search text, filters, timings, and hit scores while preserving
-receipt IDs, owners, timestamps, and returned revision links. It adds a separate
-published-report table without private source or receipt links. Dropping columns
-is logical removal; old pages, journals, and backups may retain previous values.
-See [local credential administration](credentials.md) for lifecycle and context semantics.
+`v0.9.0` is the first schema; earlier development schemas are not adopted. It
+bootstraps principal `local-principal` and collection `local`, owned by that
+principal with visibility `restricted`. See [local credential administration](credentials.md)
+for key lifecycle and context semantics.
 
 HTTP v1 accepts header credentials and explicit collection scopes under
 [context and collection policy](policy.md). Local and authenticated modes are
@@ -49,24 +34,20 @@ MCP currently targets `local`. Keep the server behind a trusted local boundary.
 
 ## Collection identities and references
 
-The trusted `Store` API creates principals, accounts with an owner principal, and
-collections with an owner account. Their IDs are server-generated. New collections
-default to `restricted`; visibility is `public` or `restricted` and is immutable in
-SQLite. These low-level methods do not authenticate callers, grant permissions, or
-establish billing authority.
+The trusted `Store` API creates principals and collections owned by a principal.
+Their IDs are server-generated. New collections default to `restricted`; visibility
+is `public` or `restricted` and is immutable in SQLite. These low-level methods do
+not authenticate callers or grant permissions.
 
 Record identity is `(collection_id, record_id)`; revision identity adds `revision`.
 The same client-chosen record ID may exist independently in several collections.
-Every content and index-mirror method takes the collection explicitly, and logged
-search hits carry no collection of their own: they belong to the search's
-collection. Record authorship is separate from collection ownership and is not
+Every content and index-mirror method takes the collection explicitly. Record authorship is separate from collection ownership and is not
 changed by an update. Writes/deletes compare an expected revision inside their
 immediate SQLite transaction; stale updates and explicit create collisions fail
 without appending a revision. This does not make independent index writers safe.
 
-Composite primary and foreign keys scope revisions, reports, search hits, and index
-mirror entries to their collection and exact target revision. Report revisions remain
-nullable in storage for existing rows; new service reports require an exact revision. Index state is keyed by collection and key; internal vector IDs are unique
+Composite primary and foreign keys scope revisions and index mirror entries to
+their collection and exact target revision. Index state is keyed by collection and key; internal vector IDs are unique
 within a collection only. The trusted index API accepts an explicit existing
 collection; it does not provide authorization. Service policy authorizes before
 index loading or recovery. HTTP selects explicit collections; the bundled MCP client selects `local`.
@@ -102,20 +83,18 @@ and are unsupported. Stop the server before schema upgrades or direct maintenanc
 
 ## Journal and idempotency
 
-Every service put/delete/report has a durable mutation ID. The same immediate
+Every service put/delete has a durable mutation ID. The same immediate
 SQLite transaction applies revision preconditions, commits the content change,
 and inserts the mutation receipt. SQLite connections explicitly use `synchronous=FULL`.
 Receipts contain scope, operation, required authority, creation time, digests of
 optional idempotency keys and payloads, and the minimal result (IDs/revision).
-They do not duplicate record/report text, metadata, credentials, or raw keys.
+They do not duplicate record text, metadata, credentials, or raw keys.
 
-Record mutations begin in `committed` state; reports are immediately `applied`
-because they have no derived retrieval state. Record mutations become `applied`
-only after a complete index generation is activated or validated against the
+Mutations begin in `committed` state and become `applied` only after a complete index generation is activated or validated against the
 current live records. Recovery reconciles all committed mutations in that
 collection to its latest state. It does not replay an old record payload over a
 newer update or deletion. Applied receipts remain available for idempotent retries.
-Content purge and explicit retention jobs scrub affected receipts as described below.
+Content purge scrubs affected receipts as described below.
 
 A matching idempotency retry reauthenticates, checks current original-operation
 permission and target availability, recovers the index if needed, and returns the
@@ -160,17 +139,16 @@ versions remain later retrieval work.
 
 ## Purge and restore
 
-Record deletion commits the tombstone, removal of all revisions/checksums,
-associated private/published reports, receipt-result links, and a durable purge
-job in one SQLite transaction. Other receipt results are preserved. The remaining
+Record deletion commits the tombstone, removal of all revisions/checksums, and a
+durable purge job in one SQLite transaction. The remaining
 record tombstone contains collection/record IDs, author principal, deletion time,
 and last revision for authorization and retry preconditions; its creation time is
 cleared. Deleted IDs cannot be reused.
 
-Affected mutation receipts without retry keys are removed. Keyed create/update/
-report receipts become markers containing no payload digest or result, so delayed
-retries cannot recreate auto-ID records or feedback. Delete receipts retain only
-non-content retry evidence. No billing evidence exists at this stage.
+Affected mutation receipts without retry keys are removed. Keyed create/update
+receipts become markers containing no payload digest or result, so delayed
+retries cannot recreate auto-ID records. Delete receipts retain only
+non-content retry evidence.
 
 After commit, the collection's cached index is dropped and its entire index
 storage directory is removed and synced. Recovery acknowledges the job only after
@@ -187,7 +165,6 @@ rolls back; an interruption after commit leaves the scope unavailable. Startup
 resumes cleanup before serving, even when no caller retains a grant. Deleting
 `local` does not bootstrap a replacement.
 
-Schema `v0.6.0` applies the same purge to records already tombstoned in the database.
 An index manifest carries the collection's purge version. An older restored index
 cannot match a newer deletion boundary and is removed before rebuilding. Deleted
 collection directories are also removed on startup. The authoritative database,
@@ -209,8 +186,8 @@ storage-level erasure must be handled separately.
 
 ## Content transfers
 
-Schema `v0.7.0` adds a per-collection content generation, incremented transactionally
-by revision changes, plus `import_provenance` and `import_targets`. Export uses indexed keyset reads of
+Each collection has a content generation, incremented transactionally by revision
+changes. Export uses indexed keyset reads of
 one revision at a time; each read checks the original generation and current
 access. It holds no database snapshot or collection lock while waiting for a
 client. A changed generation aborts the export rather than mixing states.
@@ -230,8 +207,8 @@ contains no text, metadata, raw batch key, or raw source identifiers; collection
 purge removes it. Each row has a derived retry key in the `put` mutation namespace
 (`import:` followed by a digest); clients should reserve that key prefix for
 imports. Raw batch keys and uploaded files are not stored. Index recovery and
-purged-key markers apply exactly as for ordinary writes. Transfers are not an
-account/database restore format and do not carry old grants or tombstones.
+purged-key markers apply exactly as for ordinary writes. Transfers are not a
+database restore format and do not carry old grants or tombstones.
 
 ## Operating an upgrade
 
@@ -261,52 +238,3 @@ decisions. Server ownership is separately enforced by the directory lock.
 Migrations receive the open transaction and must not issue `BEGIN`, `COMMIT`, or
 `ROLLBACK`, nor write files outside SQLite. Add tests for data preservation,
 repeated startup, and rollback when a later migration in the batch fails.
-
-
-## Retention jobs
-
-Schema `v0.8.0` adds durable collection-scoped retention jobs and private publication
-ownership. Migration derives existing publication authors from their committed
-publication mutation receipts and fails transactionally if ownership cannot be
-established. New publications store ownership in the same transaction as their
-content. The ownership table cascades on publication deletion and is never included
-in public responses or exports. Private source reports and published copies have
-independent lifetimes.
-
-The [retention API](protocol.md#feedback-deletion-and-retention) uses explicit,
-fixed cutoffs with no default expiry policy. Each batch commits content removal,
-its durable cursor/count, mutation replay barriers, and any index purge marker
-atomically. Revision scans advance by creation time, record ID, and revision;
-latest revisions are preserved without rescanning them in every batch. Indexed
-age queries and a partial mutation index exclude already scrubbed key markers.
-There is no database transaction held between batch requests. Authority is checked
-on every execution; revocation pauses future runs until an authorized admin resumes.
-
-Receipt deletion detaches reports before removing foreign-key targets. Historical
-revision removal erases associated feedback and import provenance, removes receipt
-hits, and strips affected mutation results. Revision cleanup also uses the durable
-index purge path, including its generation marker, so restored stale index files
-cannot expose expired history. Index cleanup completes on startup or on the next
-run/access; retrieval rebuilds from surviving current revisions. Committed indexing
-work must be reconciled before mutation receipt retention can expire it.
-
-Minimal keyed mutation markers retain operation ID, collection/principal scope,
-operation, key digest, original authority, timestamp, and applied state; payload
-digest and result are cleared and the target record link is removed. Unkeyed
-receipts are deleted. Retention job metadata (including the last scanned revision
-identifier) remains until collection deletion, as do existing record/collection
-tombstones and import target mappings. These are operational identifiers, not
-content or billing records. No query text, feedback text, or credentials are kept
-in jobs. Finished jobs are not automatically deleted or scheduled again.
-
-A batch bounds primary candidates, not the number of their dependent rows or the
-cost of pending index recovery. Large feedback fan-out can lengthen a SQLite write
-transaction; revision cleanup can make the next search rebuild its index. These
-limits must be considered when scheduling maintenance alongside serving traffic.
-
-As with record deletion, live retention does not erase backups, exports, WALs,
-free pages, or filesystem snapshots. After restoring an older database, replay all
-intervening feedback deletions and retention policies as well as record/collection
-deletions before serving. Restoring an old job cursor alone cannot establish what
-was removed after that backup. Maintain the external deletion history needed for
-restore, or discard backups under the deployment's documented retention policy.

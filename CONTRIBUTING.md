@@ -22,7 +22,7 @@ cargo test --release --test real_encoder -- --ignored
 
 | Module | Responsibility |
 |---|---|
-| `store` | SQLite: records, revisions, reports, searches, index mirror |
+| `store` | SQLite: principals, collections, records, revisions, credentials, index mirror |
 | `store::migrations` | transactional schema versions |
 | `index` | vector store, lexical index, corpus manifest, recovery |
 | `gather` | exhaustive and BM25 candidate generators |

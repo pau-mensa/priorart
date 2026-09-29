@@ -199,60 +199,6 @@ fn filters_match_latest_metadata() {
 }
 
 #[test]
-fn reports_round_trip_and_are_purged_with_the_record() {
-    let (_directory, store) = open();
-    put(&store, LOCAL, "x", Some("rec"));
-    let hit = SearchHit {
-        record_id: "rec".into(),
-        revision: 1,
-    };
-    let search = store
-        .create_search_receipt(LOCAL, &[hit], LOCAL_PRINCIPAL_ID)
-        .unwrap();
-    assert!(store.has_search(LOCAL, &search).unwrap());
-    assert!(!store.has_search(LOCAL, "nope").unwrap());
-    let report = store
-        .add_report(
-            LOCAL,
-            "rec",
-            Some(1),
-            Some(&search),
-            "worked",
-            LOCAL_PRINCIPAL_ID,
-        )
-        .unwrap();
-    let reports = store.reports_for(LOCAL, "rec").unwrap();
-    assert_eq!(reports.len(), 1);
-    assert_eq!(reports[0].id, report);
-    assert_eq!(reports[0].search_id.as_deref(), Some(search.as_str()));
-    assert_eq!(reports[0].revision, Some(1));
-    assert_eq!(reports[0].text, "worked");
-    assert!(matches!(
-        store.add_report(LOCAL, "nope", None, None, "x", LOCAL_PRINCIPAL_ID),
-        Err(StoreError::RecordNotFound { .. })
-    ));
-    assert!(matches!(
-        store.add_report(LOCAL, "rec", Some(9), None, "x", LOCAL_PRINCIPAL_ID),
-        Err(StoreError::RecordNotFound {
-            revision: Some(9),
-            ..
-        })
-    ));
-    assert!(matches!(
-        store.add_report(LOCAL, "rec", None, Some("bogus"), "x", LOCAL_PRINCIPAL_ID),
-        Err(StoreError::SearchNotFound { .. })
-    ));
-    store.delete(LOCAL, "rec", Some(1)).unwrap();
-    assert!(store.reports_for(LOCAL, "rec").unwrap().is_empty());
-    assert!(store
-        .search_receipt(LOCAL, &search, LOCAL_PRINCIPAL_ID)
-        .unwrap()
-        .unwrap()
-        .hits
-        .is_empty());
-}
-
-#[test]
 fn index_mirror_round_trips() {
     let (_directory, store) = open();
     for record in ["a", "b"] {
@@ -345,13 +291,11 @@ fn scoped() -> Scoped {
     let (directory, store) = open();
     let alice = store.create_principal().unwrap();
     let bob = store.create_principal().unwrap();
-    let account_a = store.create_account(&alice).unwrap();
-    let account_b = store.create_account(&bob).unwrap();
     let a = store
-        .create_collection(&account_a, Visibility::Restricted)
+        .create_collection(&alice, Visibility::Restricted)
         .unwrap();
     let b = store
-        .create_collection(&account_b, Visibility::Restricted)
+        .create_collection(&bob, Visibility::Restricted)
         .unwrap();
     Scoped {
         _directory: directory,
@@ -397,13 +341,11 @@ fn identity_ownership_and_defaults() {
         Visibility::Restricted
     );
     assert_eq!(
-        store.get_collection(LOCAL).unwrap().owner_account_id,
-        LOCAL_ACCOUNT_ID
+        store.get_collection(LOCAL).unwrap().owner_principal_id,
+        LOCAL_PRINCIPAL_ID
     );
-    assert_ne!(
-        store.get_collection(&a).unwrap().owner_account_id,
-        store.get_collection(&b).unwrap().owner_account_id
-    );
+    assert_eq!(store.get_collection(&a).unwrap().owner_principal_id, alice);
+    assert_eq!(store.get_collection(&b).unwrap().owner_principal_id, bob);
     assert!(matches!(
         store.get_collection("missing"),
         Err(StoreError::CollectionNotFound(_))
@@ -433,7 +375,7 @@ fn identity_ownership_and_defaults() {
 #[test]
 fn visibility_and_ownership_constraints() {
     let Scoped { store, a, .. } = scoped();
-    let owner = store.get_collection(&a).unwrap().owner_account_id;
+    let owner = store.get_collection(&a).unwrap().owner_principal_id;
     assert!(is_constraint(store.connection.execute(
         "UPDATE collections SET visibility = 'public' WHERE id = ?1",
         [&a],
@@ -441,7 +383,6 @@ fn visibility_and_ownership_constraints() {
     assert!(store_constraint(
         store.create_collection("missing", Visibility::Restricted)
     ));
-    assert!(store_constraint(store.create_account("missing")));
     assert!("invalid".parse::<Visibility>().is_err());
     let public = store.create_collection(&owner, Visibility::Public).unwrap();
     assert_eq!(
@@ -455,7 +396,7 @@ fn visibility_and_ownership_constraints() {
 }
 
 #[test]
-fn reads_deletes_reports_and_mirrors_are_scoped() {
+fn reads_deletes_and_mirrors_are_scoped() {
     let Scoped {
         store,
         a,
@@ -472,9 +413,6 @@ fn reads_deletes_reports_and_mirrors_are_scoped() {
         store
             .replace_index_documents(scope, &[("same", 1)], Some(scope))
             .unwrap();
-        store
-            .add_report(scope, "same", Some(1), None, scope, &alice)
-            .unwrap();
     }
     assert!(matches!(
         store.get(&a, "only-b", None),
@@ -488,11 +426,6 @@ fn reads_deletes_reports_and_mirrors_are_scoped() {
         store.matching_record_ids(&a, &filters).unwrap(),
         HashSet::from(["same".to_owned()])
     );
-    let reports = store.reports_for(&a, "same").unwrap();
-    assert_eq!(
-        (reports[0].collection_id.as_str(), reports[0].text.as_str()),
-        (a.as_str(), a.as_str())
-    );
     store.delete(&a, "same", Some(1)).unwrap();
     store.replace_index_documents(&a, &[], None).unwrap();
     assert!(store.live_documents(&a).unwrap().is_empty());
@@ -503,10 +436,6 @@ fn reads_deletes_reports_and_mirrors_are_scoped() {
     assert_eq!(store.index_documents(&b).unwrap().len(), 1);
     assert_eq!(store.index_encoder(&b).unwrap(), Some(b.clone()));
     assert_eq!(store.index_encoder(&a).unwrap(), None);
-    assert!(matches!(
-        store.add_report(&a, "same", Some(2), None, "wrong revision", &alice),
-        Err(StoreError::RecordNotFound { .. })
-    ));
 }
 
 #[test]
@@ -523,22 +452,11 @@ fn cross_collection_references_fail_in_the_database() {
     put_as(&store, &b, &bob, "text", "same");
     put_as(&store, &b, &bob, "text", "same");
     put_as(&store, &b, &bob, "text", "only-b");
-    let search = store.create_search_receipt(&b, &[], &bob).unwrap();
     let connection = &store.connection;
     assert!(is_constraint(connection.execute(
         "INSERT INTO revisions (collection_id, record_id, revision, text_sha256, created_at) \
          VALUES (?1, 'only-b', 1, 'hash', 'now')",
         [&a],
-    )));
-    assert!(is_constraint(connection.execute(
-        "INSERT INTO reports (collection_id, id, record_id, revision, text, created_at) \
-         VALUES (?1, 'bad-revision', 'same', 2, 'text', 'now')",
-        [&a],
-    )));
-    assert!(is_constraint(connection.execute(
-        "INSERT INTO reports (collection_id, id, record_id, search_id, text, created_at) \
-         VALUES (?1, 'bad-search', 'same', ?2, 'text', 'now')",
-        [&a, &search],
     )));
     store
         .replace_index_documents(&a, &[("same", 1)], Some("old"))
@@ -550,28 +468,6 @@ fn cross_collection_references_fail_in_the_database() {
     )));
     assert_eq!(store.index_documents(&a).unwrap().len(), 1);
     assert_eq!(store.index_encoder(&a).unwrap().as_deref(), Some("old"));
-    let foreign = SearchHit {
-        record_id: "same".into(),
-        revision: 2,
-    };
-    assert!(store_constraint(store.create_search_receipt(
-        &a,
-        &[foreign],
-        &alice
-    )));
-    let count: i64 = connection
-        .query_row(
-            "SELECT count(*) FROM searches WHERE collection_id = ?1",
-            [&a],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(count, 0);
-    assert!(!store.has_search(&a, &search).unwrap());
-    assert!(is_constraint(connection.execute(
-        "INSERT INTO search_hits VALUES (?1, ?2, 0, 'same', 1)",
-        [&a, &search],
-    )));
 }
 
 fn user_version(connection: &Connection) -> i64 {

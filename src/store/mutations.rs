@@ -33,7 +33,7 @@ impl Store {
         record: Option<&str>,
         expected: Option<i64>,
     ) -> Result<Mutation<(String, i64)>> {
-        self.commit_mutation(intent, false, |transaction| {
+        self.commit_mutation(intent, |transaction| {
             let record = put_in(
                 transaction,
                 intent.collection,
@@ -56,59 +56,15 @@ impl Store {
         record: &str,
         expected: Option<i64>,
     ) -> Result<Mutation<()>> {
-        self.commit_mutation(intent, false, |transaction| {
+        self.commit_mutation(intent, |transaction| {
             delete_in(transaction, intent.collection, record, expected)?;
             Ok(((), record.to_owned()))
-        })
-    }
-
-    pub(crate) fn commit_report(
-        &self,
-        intent: &Intent<'_>,
-        record: &str,
-        revision: Option<i64>,
-        search: Option<&str>,
-        text: &str,
-    ) -> Result<Mutation<String>> {
-        self.commit_mutation(intent, true, |transaction| {
-            let id = add_report_in(
-                transaction,
-                intent.collection,
-                record,
-                revision,
-                search,
-                text,
-                intent.principal,
-            )?;
-            Ok((id, record.to_owned()))
-        })
-    }
-
-    pub(crate) fn commit_publication(
-        &self,
-        intent: &Intent<'_>,
-        record: &str,
-        revision: i64,
-        text: &str,
-    ) -> Result<Mutation<String>> {
-        self.commit_mutation(intent, true, |transaction| {
-            let id = new_id();
-            transaction.execute(
-                "INSERT INTO published_reports VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                (intent.collection, &id, record, revision, text, now()),
-            )?;
-            transaction.execute(
-                "INSERT INTO publication_authors VALUES (?1, ?2, ?3)",
-                (intent.collection, &id, intent.principal),
-            )?;
-            Ok((id, record.to_owned()))
         })
     }
 
     pub(super) fn commit_mutation<T: Serialize + DeserializeOwned>(
         &self,
         intent: &Intent<'_>,
-        applied: bool,
         change: impl FnOnce(&Transaction<'_>) -> Result<(T, String)>,
     ) -> Result<Mutation<T>> {
         let transaction = self.write()?;
@@ -128,7 +84,7 @@ impl Store {
                 intent.payload,
                 intent.authority,
                 serde_json::to_string(&value).map_err(|_| StoreError::Journal)?,
-                if applied { "applied" } else { "committed" },
+                "committed",
                 now(),
                 target_record
             ],

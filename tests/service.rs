@@ -77,7 +77,6 @@ fn put_and_search() {
     let outcome = service
         .search(&CALLER, LOCAL, "worker never reached barrier", None, 10)
         .unwrap();
-    assert!(!outcome.search_id.as_ref().unwrap().is_empty());
     let hit = &outcome.hits[0];
     assert_eq!((hit.id.as_str(), hit.revision), ("nccl", 1));
     assert_eq!(hit.collection_id, LOCAL_COLLECTION_ID);
@@ -279,7 +278,7 @@ fn lexical_only_mode() {
 }
 
 #[test]
-fn an_empty_corpus_still_creates_a_receipt() {
+fn an_empty_corpus_returns_no_hits() {
     let directory = tempfile::tempdir().unwrap();
     let service = Service::new(settings(&directory), fake()).unwrap();
     let outcome = service
@@ -288,74 +287,6 @@ fn an_empty_corpus_still_creates_a_receipt() {
     assert!(outcome.hits.is_empty());
     assert!(outcome.timings.is_empty());
     assert_eq!(outcome.gatherer, "none");
-    assert!(!outcome.search_id.as_ref().unwrap().is_empty());
-}
-
-#[test]
-fn reports() {
-    let (_directory, service) = seeded();
-    let outcome = service
-        .search(&CALLER, LOCAL, "cuda illegal address", None, 10)
-        .unwrap();
-    let report = service
-        .report(
-            &CALLER,
-            LOCAL,
-            "cuda",
-            "applied the padding fix, tests pass",
-            priorart::service::ReportOptions {
-                revision: Some(1),
-                search_id: outcome.search_id.as_deref(),
-                idempotency_key: None,
-            },
-        )
-        .unwrap();
-    let reports = service.reports(&CALLER, LOCAL, "cuda").unwrap();
-    assert_eq!(reports.len(), 1);
-    assert_eq!(reports[0].id, report.value);
-    assert_eq!(
-        reports[0].search_id.as_deref(),
-        outcome.search_id.as_deref()
-    );
-    assert!(matches!(
-        service.report(
-            &CALLER,
-            LOCAL,
-            "cuda",
-            "x",
-            priorart::service::ReportOptions {
-                revision: Some(1),
-                search_id: Some("bogus"),
-                idempotency_key: None
-            }
-        ),
-        Err(ServiceError::Store(StoreError::SearchNotFound { .. }))
-    ));
-    assert!(matches!(
-        service.report(
-            &CALLER,
-            LOCAL,
-            "missing",
-            "x",
-            priorart::service::ReportOptions {
-                revision: Some(1),
-                search_id: None,
-                idempotency_key: None
-            }
-        ),
-        Err(ServiceError::Store(StoreError::RecordNotFound { .. }))
-    ));
-    assert!(invalid(service.report(
-        &CALLER,
-        LOCAL,
-        "cuda",
-        "   ",
-        priorart::service::ReportOptions {
-            revision: Some(1),
-            search_id: None,
-            idempotency_key: None
-        }
-    )));
 }
 
 #[test]
@@ -477,9 +408,8 @@ fn reopening_keeps_data() {
 fn the_local_service_never_reads_other_collections() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path().join("priorart.sqlite")).unwrap();
-    let account = store.create_account(LOCAL_PRINCIPAL_ID).unwrap();
     let other = store
-        .create_collection(&account, Visibility::Restricted)
+        .create_collection(LOCAL_PRINCIPAL_ID, Visibility::Restricted)
         .unwrap();
     store
         .put(

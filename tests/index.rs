@@ -321,9 +321,8 @@ fn lexical_scores_after_writes_match_a_reopened_index() {
 }
 
 fn collection(store: &Store) -> String {
-    let account = store.create_account(LOCAL_PRINCIPAL_ID).unwrap();
     store
-        .create_collection(&account, Visibility::Restricted)
+        .create_collection(LOCAL_PRINCIPAL_ID, Visibility::Restricted)
         .unwrap()
 }
 

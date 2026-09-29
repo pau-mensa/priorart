@@ -28,15 +28,13 @@ impl Fixture {
         let store = Store::open(dir.path().join(DATABASE_FILE)).unwrap();
         let alice = store.create_principal().unwrap();
         let bob = store.create_principal().unwrap();
-        let aa = store.create_account(&alice).unwrap();
-        let ba = store.create_account(&bob).unwrap();
         let source = store
-            .create_collection(&aa, Visibility::Restricted)
+            .create_collection(&alice, Visibility::Restricted)
             .unwrap();
         let destination = store
-            .create_collection(&ba, Visibility::Restricted)
+            .create_collection(&bob, Visibility::Restricted)
             .unwrap();
-        let public = store.create_collection(&ba, Visibility::Public).unwrap();
+        let public = store.create_collection(&bob, Visibility::Public).unwrap();
         let permissions = [
             Op::Read,
             Op::Export,
@@ -142,21 +140,8 @@ fn options() -> ImportOptions<'static> {
 fn export_is_scoped_generation_checked_and_never_loads_an_encoder() {
     let f = Fixture::new();
     f.encoder.set_failing(true);
-    f.store
-        .add_report(
-            &f.source,
-            "record",
-            Some(1),
-            None,
-            "private report sentinel",
-            &f.alice,
-        )
-        .unwrap();
     let rows = f.records();
     assert_eq!(rows.len(), 2);
-    assert!(!serde_json::to_string(&rows)
-        .unwrap()
-        .contains("private report sentinel"));
     assert_eq!(rows[0].revision, 1);
     assert_eq!(rows[1].revision, 2);
     assert_eq!(

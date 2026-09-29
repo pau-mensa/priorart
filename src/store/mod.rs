@@ -5,12 +5,8 @@
 //! requests must go through the policy-enforcing Service.
 
 mod credentials;
-mod feedback;
 mod lifecycle;
-mod retention;
-pub use retention::{FeedbackKind, RetentionJob, RetentionKind};
 mod transfer;
-pub use feedback::{PublishedReport, SearchReceipt};
 pub use transfer::{ExportCursor, TransferRecord};
 pub mod migrations;
 pub mod mutations;
@@ -32,7 +28,6 @@ use time::OffsetDateTime;
 pub use migrations::{SchemaError, SCHEMA_VERSION};
 
 pub const LOCAL_COLLECTION_ID: &str = "local";
-pub const LOCAL_ACCOUNT_ID: &str = "local-account";
 pub const LOCAL_PRINCIPAL_ID: &str = "local-principal";
 
 pub type Metadata = Map<String, Value>;
@@ -61,11 +56,6 @@ pub enum StoreError {
     RecordDeleted {
         collection_id: String,
         record_id: String,
-    },
-    #[error("no search {search_id} in collection {collection_id}")]
-    SearchNotFound {
-        collection_id: String,
-        search_id: String,
     },
     #[error("no collection {0}")]
     CollectionNotFound(String),
@@ -116,7 +106,7 @@ impl FromStr for Visibility {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Collection {
     pub id: String,
-    pub owner_account_id: String,
+    pub owner_principal_id: String,
     pub visibility: Visibility,
     pub created_at: String,
 }
@@ -138,25 +128,6 @@ pub struct Revision {
     pub text_sha256: String,
     pub created_at: String,
     pub author_principal_id: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Report {
-    pub collection_id: String,
-    pub id: String,
-    pub record_id: String,
-    pub revision: Option<i64>,
-    pub search_id: Option<String>,
-    pub text: String,
-    pub created_at: String,
-    pub reporter_principal_id: Option<String>,
-}
-
-/// One receipt result, scoped to its search collection.
-#[derive(Clone, Debug, PartialEq, serde::Serialize)]
-pub struct SearchHit {
-    pub record_id: String,
-    pub revision: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -285,24 +256,15 @@ impl Store {
         Ok(id)
     }
 
-    pub fn create_account(&self, owner_principal_id: &str) -> Result<String> {
-        let id = new_id();
-        self.connection.execute(
-            "INSERT INTO accounts VALUES (?1, ?2, ?3)",
-            (&id, owner_principal_id, now()),
-        )?;
-        Ok(id)
-    }
-
     pub fn create_collection(
         &self,
-        owner_account_id: &str,
+        owner_principal_id: &str,
         visibility: Visibility,
     ) -> Result<String> {
         let id = new_id();
         self.connection.execute(
-            "INSERT INTO collections (id, owner_account_id, visibility, created_at) VALUES (?1, ?2, ?3, ?4)",
-            (&id, owner_account_id, visibility.as_str(), now()),
+            "INSERT INTO collections (id, owner_principal_id, visibility, created_at) VALUES (?1, ?2, ?3, ?4)",
+            (&id, owner_principal_id, visibility.as_str(), now()),
         )?;
         Ok(id)
     }
@@ -310,13 +272,13 @@ impl Store {
     pub fn get_collection(&self, collection_id: &str) -> Result<Collection> {
         self.connection
             .query_row(
-                "SELECT id, owner_account_id, visibility, created_at FROM collections WHERE id = ?1",
+                "SELECT id, owner_principal_id, visibility, created_at FROM collections WHERE id = ?1",
                 [collection_id],
                 |row| {
                     let visibility: String = row.get(2)?;
                     Ok(Collection {
                         id: row.get(0)?,
-                        owner_account_id: row.get(1)?,
+                        owner_principal_id: row.get(1)?,
                         visibility: visibility.parse().map_err(|error: String| {
                             rusqlite::Error::FromSqlConversionFailure(
                                 2,
@@ -449,19 +411,7 @@ impl Store {
             .optional()?)
     }
 
-    pub fn search_owned_by(
-        &self,
-        collection_id: &str,
-        search_id: &str,
-        principal: &str,
-    ) -> Result<bool> {
-        Ok(self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM searches WHERE collection_id = ?1 AND id = ?2 AND requester_principal_id = ?3)",
-            (collection_id, search_id, principal), |row| row.get(0),
-        )?)
-    }
-
-    /// Purges content and associated feedback, retaining a minimal tombstone.
+    /// Purges content and derived state, retaining a minimal tombstone.
     /// Returns `false` when it was already deleted.
     pub fn delete(
         &self,
@@ -507,124 +457,6 @@ impl Store {
             })
             .map(|document| document.record_id)
             .collect())
-    }
-
-    // Reports and searches.
-
-    pub fn add_report(
-        &self,
-        collection_id: &str,
-        record_id: &str,
-        revision: Option<i64>,
-        search_id: Option<&str>,
-        text: &str,
-        reporter_principal_id: &str,
-    ) -> Result<String> {
-        let transaction = self.write()?;
-        let result = add_report_in(
-            &transaction,
-            collection_id,
-            record_id,
-            revision,
-            search_id,
-            text,
-            reporter_principal_id,
-        )?;
-        transaction.commit()?;
-        Ok(result)
-    }
-
-    /// Reports on a record in creation order.
-    pub fn reports_for(&self, collection_id: &str, record_id: &str) -> Result<Vec<Report>> {
-        if record_state(&self.connection, collection_id, record_id)? == RecordState::Missing {
-            return Err(record_not_found(collection_id, record_id, None));
-        }
-        let mut statement = self.connection.prepare(
-            "SELECT collection_id, id, record_id, revision, search_id, text, created_at, \
-             reporter_principal_id FROM reports WHERE collection_id = ?1 AND record_id = ?2 \
-             ORDER BY created_at, id",
-        )?;
-        let rows = statement.query_map((collection_id, record_id), |row| {
-            Ok(Report {
-                collection_id: row.get(0)?,
-                id: row.get(1)?,
-                record_id: row.get(2)?,
-                revision: row.get(3)?,
-                search_id: row.get(4)?,
-                text: row.get(5)?,
-                created_at: row.get(6)?,
-                reporter_principal_id: row.get(7)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
-
-    /// Only this requester's reports; other reporters' text is never loaded.
-    pub fn reports_for_principal(
-        &self,
-        collection_id: &str,
-        record_id: &str,
-        principal: &str,
-    ) -> Result<Vec<Report>> {
-        if record_state(&self.connection, collection_id, record_id)? == RecordState::Missing {
-            return Err(record_not_found(collection_id, record_id, None));
-        }
-        let mut statement = self.connection.prepare(
-            "SELECT collection_id, id, record_id, revision, search_id, text, created_at, \
-             reporter_principal_id FROM reports WHERE collection_id = ?1 AND record_id = ?2 \
-             AND reporter_principal_id = ?3 ORDER BY created_at, id",
-        )?;
-        let rows = statement.query_map((collection_id, record_id, principal), |row| {
-            Ok(Report {
-                collection_id: row.get(0)?,
-                id: row.get(1)?,
-                record_id: row.get(2)?,
-                revision: row.get(3)?,
-                search_id: row.get(4)?,
-                text: row.get(5)?,
-                created_at: row.get(6)?,
-                reporter_principal_id: row.get(7)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
-
-    pub fn create_search_receipt(
-        &self,
-        collection_id: &str,
-        hits: &[SearchHit],
-        requester_principal_id: &str,
-    ) -> Result<String> {
-        let id = new_id();
-        let transaction = self.write()?;
-        transaction.execute(
-            "INSERT INTO searches (collection_id, id, requester_principal_id, created_at) VALUES (?1, ?2, ?3, ?4)",
-            (
-                collection_id,
-                &id,
-                requester_principal_id,
-                now(),
-            ),
-        )?;
-        {
-            let mut insert =
-                transaction.prepare("INSERT INTO search_hits VALUES (?1, ?2, ?3, ?4, ?5)")?;
-            for (position, hit) in hits.iter().enumerate() {
-                insert.execute((
-                    collection_id,
-                    &id,
-                    position as i64,
-                    &hit.record_id,
-                    hit.revision,
-                ))?;
-            }
-        }
-        transaction.commit()?;
-        Ok(id)
-    }
-
-    pub fn has_search(&self, collection_id: &str, search_id: &str) -> Result<bool> {
-        search_exists(&self.connection, collection_id, search_id)
     }
 
     // Index mirror.
@@ -754,17 +586,6 @@ fn record_state(
         Some(Some(_)) => RecordState::Deleted,
         Some(None) => RecordState::Live,
     })
-}
-
-fn search_exists(connection: &Connection, collection_id: &str, search_id: &str) -> Result<bool> {
-    Ok(connection
-        .query_row(
-            "SELECT 1 FROM searches WHERE collection_id = ?1 AND id = ?2",
-            (collection_id, search_id),
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some())
 }
 
 fn record_not_found(collection_id: &str, record_id: &str, revision: Option<i64>) -> StoreError {
@@ -912,69 +733,4 @@ fn delete_in(
     )?;
     lifecycle::purge_record_content(transaction, collection_id, record_id)?;
     Ok(true)
-}
-
-fn add_report_in(
-    transaction: &Transaction<'_>,
-    collection_id: &str,
-    record_id: &str,
-    revision: Option<i64>,
-    search_id: Option<&str>,
-    text: &str,
-    reporter_principal_id: &str,
-) -> Result<String> {
-    let id = new_id();
-    if record_state(transaction, collection_id, record_id)? == RecordState::Missing {
-        return Err(record_not_found(collection_id, record_id, None));
-    }
-    if let Some(revision) = revision {
-        let exists = transaction
-            .query_row(
-                "SELECT 1 FROM revisions \
-                     WHERE collection_id = ?1 AND record_id = ?2 AND revision = ?3",
-                (collection_id, record_id, revision),
-                |_| Ok(()),
-            )
-            .optional()?;
-        if exists.is_none() {
-            return Err(record_not_found(collection_id, record_id, Some(revision)));
-        }
-    }
-    if let Some(search_id) = search_id {
-        let matches: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM searches s JOIN search_hits h
-             ON h.collection_id = s.collection_id AND h.search_id = s.id
-             WHERE s.collection_id = ?1 AND s.id = ?2 AND s.requester_principal_id = ?3
-             AND h.record_id = ?4 AND h.revision = ?5)",
-            (
-                collection_id,
-                search_id,
-                reporter_principal_id,
-                record_id,
-                revision,
-            ),
-            |row| row.get(0),
-        )?;
-        if !matches {
-            return Err(StoreError::SearchNotFound {
-                collection_id: collection_id.to_owned(),
-                search_id: search_id.to_owned(),
-            });
-        }
-    }
-    transaction.execute(
-        "INSERT INTO reports (collection_id, id, reporter_principal_id, record_id, revision, \
-             search_id, text, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        (
-            collection_id,
-            &id,
-            reporter_principal_id,
-            record_id,
-            revision,
-            search_id,
-            text,
-            now(),
-        ),
-    )?;
-    Ok(id)
 }

@@ -20,9 +20,8 @@ use crate::encoder::{load_encoder, Encoder, EncoderError};
 use crate::excerpt::{excerpt, DEFAULT_WIDTH};
 use crate::index::{CollectionIndexManager, IndexError};
 use crate::policy::{self, PolicyError};
-use crate::store::{Metadata, Report, Revision, SearchHit, Store, StoreError, Visibility};
+use crate::store::{Metadata, Revision, Store, StoreError, Visibility};
 
-mod retention;
 mod transfer;
 pub use transfer::ImportOptions;
 
@@ -90,7 +89,6 @@ pub struct Hit {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchOutcome {
-    pub search_id: Option<String>,
     pub hits: Vec<Hit>,
     /// Empty when there was nothing to search.
     pub timings: BTreeMap<String, f64>,
@@ -121,13 +119,6 @@ pub struct WriteOptions<'a> {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DeleteOptions<'a> {
     pub expected_revision: Option<i64>,
-    pub idempotency_key: Option<&'a str>,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ReportOptions<'a> {
-    pub revision: Option<i64>,
-    pub search_id: Option<&'a str>,
     pub idempotency_key: Option<&'a str>,
 }
 
@@ -502,185 +493,12 @@ impl Service {
                 });
             }
         }
-        let logged: Vec<SearchHit> = hits
-            .iter()
-            .map(|hit| SearchHit {
-                record_id: hit.id.clone(),
-                revision: hit.revision,
-            })
-            .collect();
-        policy::collection(store, context, collection_id, Operation::Read)?;
-        let search_id = context
-            .principal_id()
-            .map(|principal| store.create_search_receipt(collection_id, &logged, principal))
-            .transpose()?;
         policy::collection(store, context, collection_id, Operation::Read)?;
         Ok(SearchOutcome {
-            search_id,
             hits,
             timings,
             gatherer,
         })
-    }
-
-    pub fn report(
-        &self,
-        context: &RequestContext,
-        collection_id: &str,
-        record_id: &str,
-        text: &str,
-        options: ReportOptions<'_>,
-    ) -> Result<Mutation<String>> {
-        let handle = self.state(context, collection_id, Operation::Report)?;
-        let state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
-        let store = &state.store;
-        policy::collection(store, context, collection_id, Operation::Report)?;
-        policy::collection(store, context, collection_id, Operation::Read)?;
-        if text.trim().is_empty() {
-            return invalid("report text must be a non-empty string");
-        }
-        if text.len() > 65_536 {
-            return invalid("report is too large");
-        }
-        let principal = context
-            .principal_id()
-            .expect("report policy requires a principal");
-        let intent = intent(
-            context,
-            collection_id,
-            "report",
-            options.idempotency_key,
-            json!([record_id, text, options.revision, options.search_id]),
-            "report",
-        )?;
-        let revision = options.revision.filter(|r| *r > 0).ok_or_else(|| {
-            ServiceError::InvalidInput("an exact positive report revision is required".into())
-        })?;
-        let target = store.get(collection_id, record_id, Some(revision))?;
-        if let Some(search_id) = options.search_id {
-            if !store
-                .search_receipt(collection_id, search_id, principal)?
-                .is_some_and(|receipt| {
-                    receipt
-                        .hits
-                        .iter()
-                        .any(|hit| hit.record_id == record_id && hit.revision == revision)
-                })
-            {
-                return Err(StoreError::SearchNotFound {
-                    collection_id: collection_id.to_owned(),
-                    search_id: search_id.to_owned(),
-                }
-                .into());
-            }
-        }
-        if let Some((result, _)) = store.replay::<String>(&intent)? {
-            policy::validate(store, context)?;
-            return Ok(result);
-        }
-        policy::collection(store, context, collection_id, Operation::Report)?;
-        policy::collection(store, context, collection_id, Operation::Read)?;
-        let id = store.commit_report(
-            &intent,
-            record_id,
-            Some(target.revision),
-            options.search_id,
-            text,
-        )?;
-        policy::validate(store, context)?;
-        Ok(id)
-    }
-
-    pub fn reports(
-        &self,
-        context: &RequestContext,
-        collection_id: &str,
-        record_id: &str,
-    ) -> Result<Vec<Report>> {
-        let handle = self.state(context, collection_id, Operation::FeedbackRead)?;
-        let state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
-        let store = &state.store;
-        policy::collection(store, context, collection_id, Operation::FeedbackRead)?;
-        policy::collection(store, context, collection_id, Operation::Read)?;
-        // A tombstone does not expose reports that may quote deleted content.
-        store.get(collection_id, record_id, None)?;
-        let principal = context
-            .principal_id()
-            .expect("feedback policy requires a principal");
-        let reports = store.reports_for_principal(collection_id, record_id, principal)?;
-        policy::collection(store, context, collection_id, Operation::FeedbackRead)?;
-        policy::collection(store, context, collection_id, Operation::Read)?;
-        Ok(reports)
-    }
-
-    pub fn search_receipt(
-        &self,
-        context: &RequestContext,
-        collection: &str,
-        id: &str,
-    ) -> Result<crate::store::SearchReceipt> {
-        let store = self.connect()?;
-        policy::collection(&store, context, collection, Operation::FeedbackRead)?;
-        policy::collection(&store, context, collection, Operation::Read)?;
-        let principal = context.principal_id().ok_or(PolicyError::Unavailable)?;
-        let receipt = store
-            .search_receipt(collection, id, principal)?
-            .ok_or(PolicyError::Unavailable)?;
-        policy::validate(&store, context)?;
-        Ok(receipt)
-    }
-
-    pub fn publish_report(
-        &self,
-        context: &RequestContext,
-        collection: &str,
-        report: &str,
-        text: &str,
-        idempotency_key: Option<&str>,
-    ) -> Result<Mutation<String>> {
-        let handle = self.state(context, collection, Operation::ReportPublish)?;
-        let state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
-        let store = &state.store;
-        policy::collection(store, context, collection, Operation::ReportPublish)?;
-        let target = policy::collection(store, context, collection, Operation::Read)?;
-        if target.visibility != Visibility::Public {
-            return Err(PolicyError::Unavailable.into());
-        }
-        let principal = context.principal_id().ok_or(PolicyError::Unavailable)?;
-        let (record, revision) = store
-            .own_report_target(collection, report, principal)?
-            .ok_or(PolicyError::Unavailable)?;
-        store.get(collection, &record, Some(revision))?;
-        if text.trim().is_empty() || text.len() > 65_536 {
-            return invalid("publication text must be non-empty and at most 65536 bytes");
-        }
-        let intent = intent(
-            context,
-            collection,
-            "report",
-            idempotency_key,
-            json!(["publish", report, text]),
-            "report_publish",
-        )?;
-        let result = store.commit_publication(&intent, &record, revision, text)?;
-        policy::validate(store, context)?;
-        Ok(result)
-    }
-
-    pub fn published_reports(
-        &self,
-        context: &RequestContext,
-        collection: &str,
-        record: &str,
-    ) -> Result<Vec<crate::store::PublishedReport>> {
-        let handle = self.state(context, collection, Operation::Read)?;
-        let state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
-        let store = &state.store;
-        policy::collection(store, context, collection, Operation::Read)?;
-        store.get(collection, record, None)?;
-        let reports = store.published_reports(collection, record)?;
-        policy::validate(store, context)?;
-        Ok(reports)
     }
 
     pub fn collection(

@@ -9,7 +9,6 @@ use serde::Serialize;
 use crate::store::{StoreError, LOCAL_PRINCIPAL_ID};
 
 pub const MAX_GRANTS: usize = 64;
-pub const MAX_CREDENTIAL_DEPTH: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
@@ -35,14 +34,9 @@ pub enum Operation {
     Contribute,
     Update,
     Delete,
-    Report,
-    FeedbackRead,
-    FeedbackDelete,
-    ReportPublish,
     Moderate,
     Export,
     Admin,
-    Delegate,
 }
 
 impl Operation {
@@ -52,14 +46,9 @@ impl Operation {
             Self::Contribute => "contribute",
             Self::Update => "update",
             Self::Delete => "delete",
-            Self::Report => "report",
-            Self::FeedbackRead => "feedback_read",
-            Self::FeedbackDelete => "feedback_delete",
-            Self::ReportPublish => "report_publish",
             Self::Moderate => "moderate",
             Self::Export => "export",
             Self::Admin => "admin",
-            Self::Delegate => "delegate",
         }
     }
 }
@@ -72,14 +61,9 @@ impl FromStr for Operation {
             "contribute" => Ok(Self::Contribute),
             "update" => Ok(Self::Update),
             "delete" => Ok(Self::Delete),
-            "report" => Ok(Self::Report),
-            "feedback_read" => Ok(Self::FeedbackRead),
-            "feedback_delete" => Ok(Self::FeedbackDelete),
-            "report_publish" => Ok(Self::ReportPublish),
             "moderate" => Ok(Self::Moderate),
             "export" => Ok(Self::Export),
             "admin" => Ok(Self::Admin),
-            "delegate" => Ok(Self::Delegate),
             _ => Err(AuthError::InvalidInput("unknown credential operation")),
         }
     }
@@ -120,7 +104,6 @@ impl FromStr for Grant {
 pub struct CredentialInfo {
     pub id: String,
     pub principal_id: String,
-    pub parent_id: Option<String>,
     pub created_at: i64,
     pub expires_at: Option<i64>,
     pub revoked_at: Option<i64>,

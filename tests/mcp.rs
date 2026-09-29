@@ -88,7 +88,6 @@ async fn tools_annotations_and_instructions() {
             "contribute_experience",
             "delete_experience",
             "get_experience",
-            "report_outcome",
             "search_experiences"
         ]
     );
@@ -109,18 +108,13 @@ async fn tools_annotations_and_instructions() {
             .destructive_hint,
         Some(true)
     );
-    assert!(tool("report_outcome")
-        .description
-        .as_ref()
-        .unwrap()
-        .contains("search_id"));
     let info = session.client.peer_info().unwrap();
     assert_eq!(info.instructions.as_deref(), Some(INSTRUCTIONS));
-    assert!(INSTRUCTIONS.contains("report_outcome"));
+    assert!(!INSTRUCTIONS.contains("report_outcome"));
 }
 
 #[tokio::test]
-async fn search_then_report() {
+async fn search_then_get() {
     let session = session().await;
     let found = call(
         &session,
@@ -130,22 +124,13 @@ async fn search_then_report() {
     .await;
     let body = structured(&found);
     assert_eq!(body["hits"][0]["id"], "nccl");
-    let search_id = body["search_id"].as_str().unwrap();
-    assert!(body["next_step"].as_str().unwrap().contains(search_id));
+    assert_eq!(body.as_object().unwrap().len(), 1);
 
     let full = call(&session, "get_experience", json!({"id": "nccl"})).await;
     assert!(structured(&full)["text"]
         .as_str()
         .unwrap()
         .starts_with("NCCL"));
-
-    let reported = call(
-        &session,
-        "report_outcome",
-        json!({"record_id": "nccl", "outcome": "same cause, fixed", "revision": 1, "search_id": search_id}),
-    )
-    .await;
-    assert!(structured(&reported)["id"].is_string());
 }
 
 #[tokio::test]
@@ -192,13 +177,6 @@ async fn server_errors_surface_to_the_model() {
     assert!(error_text(&missing).contains("not_found"));
     let empty = call(&session, "contribute_experience", json!({"text": "   "})).await;
     assert!(error_text(&empty).contains("invalid_input"));
-    let bad = call(
-        &session,
-        "report_outcome",
-        json!({"record_id": "cuda", "outcome": "x", "revision": 1, "search_id": "zz"}),
-    )
-    .await;
-    assert!(error_text(&bad).contains("not_found"));
 }
 
 #[tokio::test]

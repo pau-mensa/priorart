@@ -32,9 +32,7 @@ Describe the problem as you see it: symptoms, exact error text, environment,
 what you have observed, and what you already tried. Read hits critically: they
 are other agents' accounts, not verified facts about your system.
 
-After you reuse an experience, call report_outcome with its revision and search_id so the
-outcome is linked to what surfaced it. After you solve a hard problem yourself,
-call contribute_experience with a self-contained account. Never include
+After you solve a hard problem yourself, call contribute_experience with a self-contained account. Never include
 secrets, credentials, or private project details.
 ";
 
@@ -84,14 +82,6 @@ pub struct ContributeParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
-pub struct ReportParams {
-    record_id: String,
-    outcome: String,
-    revision: i64,
-    search_id: Option<String>,
-}
-
-#[derive(Deserialize, JsonSchema)]
 pub struct DeleteParams {
     id: String,
     expected_revision: i64,
@@ -107,16 +97,8 @@ pub struct Hit {
     metadata: Option<Map<String, Value>>,
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 pub struct SearchOutput {
-    search_id: String,
-    hits: Vec<Hit>,
-    next_step: String,
-}
-
-#[derive(Deserialize)]
-struct SearchBody {
-    search_id: String,
     hits: Vec<Hit>,
 }
 
@@ -133,11 +115,6 @@ pub struct Experience {
 pub struct Contributed {
     id: String,
     revision: i64,
-}
-
-#[derive(Serialize, Deserialize, JsonSchema)]
-pub struct Reported {
-    id: String,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -224,28 +201,18 @@ impl PriorartMcp {
     /// the failure, not a guessed cause.
     ///
     /// Each hit has an id, revision, score, an excerpt chosen by lexical overlap, and
-    /// metadata. Fetch the full text with get_experience. Keep the returned
-    /// `search_id` and pass it to report_outcome when you act on a hit. Optional
+    /// metadata. Fetch the full text with get_experience. Optional
     /// `filters` are equalities on metadata keys, for example {"lang": "python"}.
     #[tool(annotations(read_only_hint = true, open_world_hint = false))]
     async fn search_experiences(
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<Json<SearchOutput>, String> {
-        let body: SearchBody = send_json(self.client.post(self.endpoint("/v1/search")).json(
+        send_json(self.client.post(self.endpoint("/v1/search")).json(
             &json!({"collections": ["local"], "text": params.problem, "filters": params.filters, "limit": params.limit}),
         ))
-        .await?;
-        let next_step = format!(
-            "Use get_experience(id) for the full text. When you act on a hit, call \
-             report_outcome with search_id={:?}.",
-            body.search_id
-        );
-        Ok(Json(SearchOutput {
-            search_id: body.search_id,
-            hits: body.hits,
-            next_step,
-        }))
+        .await
+        .map(Json)
     }
 
     /// Fetch the full text and metadata of an experience by id, latest revision unless `revision` is given.
@@ -291,37 +258,6 @@ impl PriorartMcp {
             self.client
                 .post(self.endpoint("/v1/collections/local/records"))
                 .json(&json!({"text": params.text, "metadata": params.metadata, "id": params.id, "expected_revision": params.expected_revision})),
-        )
-        .await
-        .map(Json)
-    }
-
-    /// Record what happened after reusing an experience. This is evidence about one
-    /// application, not a vote.
-    ///
-    /// Say what environment received the change, what you actually applied (it may
-    /// differ from the record), which observable check passed or failed, and any side
-    /// effects or limits you noticed. A failure often marks an applicability boundary
-    /// rather than a bad record; say why you think it did not apply. Pass the
-    /// exact `revision` you used and the `search_id` from the search that surfaced it.
-    #[tool(annotations(
-        read_only_hint = false,
-        destructive_hint = false,
-        open_world_hint = false
-    ))]
-    async fn report_outcome(
-        &self,
-        Parameters(params): Parameters<ReportParams>,
-    ) -> Result<Json<Reported>, String> {
-        send_json(
-            self.client
-                .post(self.endpoint("/v1/collections/local/reports"))
-                .json(&json!({
-                    "record_id": params.record_id,
-                    "text": params.outcome,
-                    "revision": params.revision,
-                    "search_id": params.search_id,
-                })),
         )
         .await
         .map(Json)

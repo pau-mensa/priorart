@@ -140,31 +140,7 @@ async fn record_lifecycle() {
 }
 
 #[tokio::test]
-async fn reports_reject_a_nonexistent_revision() {
-    let api = Api::start().await;
-    api.post(
-        "/v1/collections/local/records",
-        json!({"id": "record", "text": "local content"}),
-    )
-    .await;
-    let (status, body) = api
-        .post(
-            "/v1/collections/local/reports",
-            json!({"record_id": "record", "revision": 99, "text": "feedback"}),
-        )
-        .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(body["error"]["code"], "not_found");
-    assert_eq!(
-        api.get("/v1/collections/local/records/record/reports")
-            .await
-            .1,
-        json!({"reports": []})
-    );
-}
-
-#[tokio::test]
-async fn search_and_report() {
+async fn search_returns_qualified_hits_without_receipts() {
     let api = Api::start().await;
     api.post(
         "/v1/collections/local/records",
@@ -205,27 +181,14 @@ async fn search_and_report() {
             "score_semantics"
         ]
     );
-    let search_id = found["search_id"].as_str().unwrap();
-
-    let (status, reported) = api
-        .post(
-            "/v1/collections/local/reports",
-            json!({"record_id": "b", "text": "worked", "revision": 1, "search_id": search_id}),
-        )
-        .await;
-    assert_eq!(status, StatusCode::CREATED);
-    let listed = api.get("/v1/collections/local/records/b/reports").await.1;
-    assert_eq!(listed["reports"][0]["id"], reported["id"]);
-    assert_eq!(listed["reports"][0]["search_id"], search_id);
-
-    let (status, bad) = api
-        .post(
-            "/v1/collections/local/reports",
-            json!({"record_id": "b", "text": "x", "revision": 1, "search_id": "nope"}),
-        )
-        .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(bad["error"]["code"], "not_found");
+    let mut top: Vec<&str> = found
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    top.sort();
+    assert_eq!(top, ["collections", "hits"]);
 }
 
 #[tokio::test]
@@ -339,7 +302,7 @@ async fn local_authority_never_overrides_a_supplied_bad_key_or_leaves_local_scop
             .unwrap();
     let other = store
         .create_collection(
-            priorart::store::LOCAL_ACCOUNT_ID,
+            priorart::store::LOCAL_PRINCIPAL_ID,
             priorart::store::Visibility::Public,
         )
         .unwrap();

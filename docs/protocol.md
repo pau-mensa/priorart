@@ -43,22 +43,22 @@ readiness; it does not load or validate every collection's index.
 Only readable or explicitly administered collections are selected, before applying
 the page limit (1–100). Results are sorted by ID; use the last returned ID as
 `after` to get the next page. Anonymous callers see public collections; local
-contexts see only `local`. No account identity or global count is returned.
+contexts see only `local`. No owner identity or global count is returned.
 
 `GET /v1/collections/{collection}` returns that collection's summary under the same
 policy. `GET /v1/collections/{collection}/diagnostics` requires `admin` and returns
 `{"status":"ok","document_count":N}` for that collection only. Admin alone does
-not grant access to records, searches, or private reports.
+not grant access to records or searches.
 
 Collection creation is trusted local administration, not a collection-level grant:
 
 ```bash
-priorart admin create-collection                    # restricted, local account
+priorart admin create-collection                    # restricted, owned by local-principal
 priorart admin create-collection --visibility public
 ```
 
-Visibility is immutable. There is no remote account provisioning, credential
-management, collection deletion, or export endpoint in this step.
+Visibility is immutable. Principal, collection, and credential provisioning are
+local administration only; see [credentials](credentials.md).
 
 ## Create or update a record
 
@@ -91,19 +91,19 @@ idempotency key as described below.
 
 ## Mutation retries
 
-Put, delete, and report accept one optional `Idempotency-Key` header (1–128 ASCII
+Put and delete accept one optional `Idempotency-Key` header (1–128 ASCII
 letters/digits or `._:-`). Use a fresh key per intended mutation and retain it across
 retries. Keys are scoped to the authenticated principal, collection, and operation.
 Reusing a scoped key with different input returns `409 idempotency_conflict`.
 Input fingerprints include the submitted ID, text, metadata, publication intent,
-revision precondition, and receipt reference as applicable. JSON object key order
+and revision precondition as applicable. JSON object key order
 is irrelevant; omitted optional fields and explicit null normalize alike.
 
 Every successful mutation returns `Mutation-Id: <opaque ID>`, including `204`
 deletes. With a matching key, a retry returns the original result and mutation ID,
 even if the original response was lost. Authentication and current original-operation
 authority are still required. Create retries need contribute/authorship, not an
-update grant; revoked credentials fail. A put/report replay on a deleted target is
+update grant; revoked credentials fail. A put replay on a deleted target is
 rejected. Purged keyed mutations retain a key marker without the content digest
 or result; retrying that key returns `410 mutation_purged`. Replaying an older successful update never replaces a later revision.
 
@@ -125,15 +125,14 @@ positive current revision, compared inside the deletion transaction. Missing
 preconditions return `428`; stale ones return `409`. Returns `204`, including a
 repeat deletion with the same last revision. Tombstones reserve IDs. An authorized
 read of a deleted record returns `410`; unknown or forbidden targets return `404`.
-Deletion purges all revisions and hashes, private/published reports on the record,
-and its links from search receipts. It removes every generation of the affected
+Deletion purges all revisions and hashes. It removes every generation of the affected
 collection index and rebuilds from surviving records before returning success.
-Receipt IDs and links to other records remain. Record IDs cannot be reused.
+Record IDs cannot be reused.
 A failed rebuild can return an error after deletion commits; the tombstone is
 already authoritative, and retries resume recovery.
 
 `DELETE /v1/collections/{collection}` requires `admin`. It purges collection
-records, reports, receipts, mutation receipts, index state/files, and grants.
+records, mutation receipts, index state/files, and grants.
 Returns `204`; a repeated request returns the same `404` as any unavailable
 collection. Credentials lose only grants for the deleted collection; existing
 contexts carrying changed grants become stale and must authenticate again.
@@ -155,7 +154,7 @@ residual byte on storage media. See [purge and restore rules](storage.md#purge-a
 Returns:
 
 ```json
-{"collections": ["local"], "search_id": "…",
+{"collections": ["local"],
  "hits": [{"collection_id": "local", "id": "…", "revision": 2, "score": 12.3,
            "score_semantics": "int8-reconstructed-approximate-full-maxsim",
            "excerpt": "…", "metadata": {"lang": "python"}}]}
@@ -174,66 +173,14 @@ inside the authorized collection and matches latest metadata.
 Hits bind excerpts/metadata to the exact qualified revision. `score_semantics`
 identifies the scoring recipe; scores from different recipes are not interchangeable.
 Pipeline timing, encoder paths, and global counts are not part of this response.
-Anonymous public searches return `search_id:null` and persist nothing.
-Authenticated/local searches persist only the requesting principal, opaque ID,
-authorized collection, ordered returned record/revision links, and creation time.
-Queries, filters, excerpts, scores, and timings are not persisted. Diagnostic query
-retention is not supported.
-
-`GET /v1/collections/{collection}/searches/{id}` requires the owning principal,
-`feedback_read`, and current read access to the collection. It returns
-`{"collection_id","id","created_at","hits":[{"record_id","revision"}]}`.
-Unknown and other principals' receipts return the same unavailable response.
-Collection ownership grants no access to visitors' receipts.
-
-## Feedback
-
-`POST /v1/collections/{collection}/reports`
-
-```json
-{"record_id": "…", "revision": 2, "search_id": "…", "text": "What happened…"}
-```
-
-Returns `201 {"collection_id":"…","id":"…"}`. A positive, readable, live target
-revision is required. Text must be nonempty and at most 65536 UTF-8 bytes.
-`search_id` is optional; if supplied it must belong to the requester in the same
-collection and contain the exact reported record/revision. Both `report` and
-target read access are required. Reports on deleted targets are rejected.
-
-`GET /v1/collections/{collection}/records/{id}/reports` requires `feedback_read`
-and target read access. Returns `{"reports":[{"collection_id","id","record_id",
-"revision","search_id","text","created_at"}]}` in creation order, containing
-only the requester's private reports. Public visibility, ownership, or moderation
-does not expose another principal's feedback. Deleted targets expose no reports.
-
-`POST /v1/collections/{collection}/reports/{id}/publish` with `{"text":"selected text"}`
-creates a separate public copy. Only the private report's author with
-`report_publish` and current target read access may publish, and the target must
-be public and live. Selected text is required (nonempty, at most 65536 UTF-8 bytes);
-review it for private details before publishing. The response is
-`201 {"collection_id","id"}` with a new public ID and `Mutation-Id` header.
-`Idempotency-Key` is supported and shares the report operation's key namespace.
-Retries recheck authorship, permissions, and the live target.
-
-`GET /v1/collections/{collection}/records/{id}/published-reports` requires target
-read access, including anonymous access to public targets. It returns
-`{"reports":[{"collection_id","id","record_id","revision","text","created_at"}]}`.
-Copies contain no private report ID, receipt link, reporter identity, or search
-scope. Private reports remain private after publication.
-
-Schema `v0.5.0` removes query/filter/timing/score columns from existing search
-logs, preserving receipt IDs and revision links. This is a logical migration,
-not physical erasure of old database pages, journals, or backups. Record and
-collection deletion purge associated feedback and index generations.
-
+Searches persist nothing: no query, filter, result list, or receipt.
 
 ## Streaming export and import
 
 `GET /v1/collections/{collection}/export?limit=50` requires `export` and current
 read access, even on a public collection. It streams `application/x-ndjson` with
 `Cache-Control: no-store`. Records are ordered by `(record_id, revision)` and
-include every retained revision of live records. Deleted records, reports,
-receipts, credentials, grants, indexes, and private import provenance are excluded.
+include every retained revision of live records. Deleted records, credentials, grants, indexes, and private import provenance are excluded.
 Export does not load or run the encoder.
 
 Each revision is a separate line:
@@ -300,8 +247,8 @@ from curl's exit status. Transfers do not persist bearer credentials or upload
 files, and do not include any billing check.
 
 Imports retain ordinary per-revision write-through indexing cost. Exports are
-content transfers, not database backups: they do not preserve tombstones,
-authority, or private feedback. Use the [restore rules](storage.md#purge-and-restore)
+content transfers, not database backups: they do not preserve tombstones
+or authority. Use the [restore rules](storage.md#purge-and-restore)
 for recovery of an existing service.
 
 ## Errors and health
@@ -335,81 +282,6 @@ rate limiter or hosted admission system.
 ## Local MCP workflow
 
 The bundled MCP client uses explicit `local` routes and search scope. Corrections
-and deletes require `expected_revision`; reports require `revision`. It currently
+and deletes require `expected_revision`. It currently
 supports the default local server only. Configurable credentials, collection
 selection, and authenticated MCP workflows remain step 13.
-
-
-## Feedback deletion and retention
-
-`DELETE /v1/collections/{collection}/searches/{id}` removes the caller's receipt
-and its hit links. Reports survive with their receipt link cleared.
-`DELETE /v1/collections/{collection}/reports/{id}` removes the caller's private
-report. `DELETE /v1/collections/{collection}/published-reports/{id}` removes a
-public copy owned by the caller, or one moderated by a caller with `moderate`.
-All three require `feedback_delete` on the collection. Read permission is not
-required to remove one's own feedback. Collection ownership and moderation do
-not authorize deleting someone else's private report or receipt through these
-routes. Success is `204`; missing, previously deleted, and forbidden IDs return
-`404`. The deletion is atomic and needs no idempotency key.
-
-Publications are independent copies: deleting a private source report leaves its
-publications in place. Delete those separately by their public IDs. Removing a
-report or publication also removes its unkeyed mutation receipt and scrubs its
-keyed receipt to a minimal replay barrier; a delayed retry cannot recreate it.
-The record itself is unchanged.
-
-Retention is disabled by default. Administrators explicitly choose a scope,
-category, and cutoff; there is no built-in timer or billing-triggered deletion.
-An operator can schedule the following calls with an external scheduler. Requests
-use the normal authentication headers; persisted jobs contain no credentials.
-
-`POST /v1/collections/{collection}/retention-jobs` requires `admin` and accepts:
-
-```json
-{"id":"receipts-2026-09","kind":"receipts","before_unix":1788220800}
-```
-
-The caller chooses a job ID using the normal identifier rules. `before_unix` is
-an integer UTC Unix timestamp from the epoch through the current time. Only rows
-strictly older than that fixed cutoff qualify. Repeating the same ID and inputs
-returns the existing job; changing its kind or cutoff returns `409`.
-Creation returns `201` and does not delete anything.
-
-`GET /v1/collections/{collection}/retention-jobs/{id}` inspects the job.
-`POST /v1/collections/{collection}/retention-jobs/{id}/run` executes one batch.
-Both require current `admin` authority. Job responses contain
-`collection_id`, `id`, `kind`, the normalized UTC `cutoff`, cumulative `processed`
-(primary rows removed or mutation receipts scrubbed), and `complete`.
-Run until `complete` is true; a batch can advance without removing anything.
-A retry after a lost response continues from committed progress. Completed jobs
-are inert; a later policy run needs a new ID. Missing/forbidden jobs return `404`.
-
-| Kind | Effect |
-|---|---|
-| `revisions` | Examine at most 100 old revisions per batch, preserving each live record's latest revision; remove qualifying history and its reports, public copies, receipt hits, import provenance, and affected mutation results |
-| `receipts` | Remove up to 100 receipts and their hits; detach links from surviving private reports |
-| `reports` | Remove up to 100 private reports/public copies, by each copy's own creation time, with their mutation results |
-| `mutations` | Reconcile pending record/index work before expiring up to 100 applied mutation receipts; unkeyed receipts disappear, keyed ones retain replay barriers |
-
-Revision jobs persist a cursor, including progress past preserved latest rows.
-Rows passed by that cursor are reconsidered only by a new job, even if a later
-write makes a preserved revision historical. Dependencies are removed atomically
-with their primary row; a large number of attached reports/hits can make a batch
-cost more than its primary-row limit suggests. SQLite serializes these write
-transactions. Each request releases the collection lock after its batch.
-
-Revision cleanup invalidates exports and purges all stored index generations and
-loaded index state for the collection. File cleanup resumes after interruption;
-a job does not report complete while that cleanup is pending. The next retrieval
-rebuilds the latest index, which can incur encoding cost. Receipt/report retention
-requires no index rebuild. Pending committed mutations are recovered, never
-abandoned by age before their content becomes searchable.
-
-Job IDs, kinds, cutoffs, cursors, counts, and completion flags remain until
-collection deletion. Record/collection tombstones, minimal keyed mutation markers,
-and import target mappings are not aged out: removing them could allow delayed
-retries or stale artifacts to recreate deleted content. Retention never removes
-the last live revision or changes visibility. No billing evidence exists at this
-stage; future accounting retention must remain separate from content retention.
-See [storage and restore rules](storage.md#retention-jobs) for backup limits.

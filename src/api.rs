@@ -19,11 +19,10 @@ use crate::{
     auth::{AuthError, RequestContext},
     config::ServerMode,
     policy::PolicyError,
-    service::{is_record_id, DeleteOptions, ReportOptions, Service, ServiceError, WriteOptions},
+    service::{is_record_id, DeleteOptions, Service, ServiceError, WriteOptions},
     store::{Collection, Metadata, StoreError},
 };
 
-mod retention;
 mod transfer;
 
 pub struct ApiError(StatusCode, &'static str, &'static str);
@@ -83,9 +82,7 @@ impl From<ServiceError> for ApiError {
             }
             ServiceError::Policy(PolicyError::Unavailable)
             | ServiceError::Store(
-                StoreError::RecordNotFound { .. }
-                | StoreError::SearchNotFound { .. }
-                | StoreError::CollectionNotFound(_),
+                StoreError::RecordNotFound { .. } | StoreError::CollectionNotFound(_),
             ) => Self::not_found(),
             ServiceError::InvalidInput(_) => Self::invalid(),
             ServiceError::Store(StoreError::MutationPurged) => Self(
@@ -288,15 +285,6 @@ struct SearchRequest {
     #[serde(default = "default_limit")]
     limit: i64,
 }
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReportRequest {
-    record_id: String,
-    text: String,
-    revision: i64,
-    search_id: Option<String>,
-}
-
 pub fn router(service: Arc<Service>) -> Router {
     let limit = service
         .settings()
@@ -315,43 +303,6 @@ pub fn router(service: Arc<Service>) -> Router {
         .route(
             "/v1/collections/{collection}/records/{id}",
             get(get_record).delete(delete_record),
-        )
-        .route(
-            "/v1/collections/{collection}/records/{id}/reports",
-            get(list_reports),
-        )
-        .route("/v1/collections/{collection}/reports", post(report))
-        .route(
-            "/v1/collections/{collection}/reports/{id}/publish",
-            post(publish_report),
-        )
-        .route(
-            "/v1/collections/{collection}/records/{id}/published-reports",
-            get(published_reports),
-        )
-        .route(
-            "/v1/collections/{collection}/searches/{id}",
-            get(search_receipt).delete(retention::delete_receipt),
-        )
-        .route(
-            "/v1/collections/{collection}/reports/{id}",
-            axum::routing::delete(retention::delete_report),
-        )
-        .route(
-            "/v1/collections/{collection}/published-reports/{id}",
-            axum::routing::delete(retention::delete_publication),
-        )
-        .route(
-            "/v1/collections/{collection}/retention-jobs",
-            post(retention::create),
-        )
-        .route(
-            "/v1/collections/{collection}/retention-jobs/{id}",
-            get(retention::inspect),
-        )
-        .route(
-            "/v1/collections/{collection}/retention-jobs/{id}/run",
-            post(retention::run),
         )
         .route("/v1/collections/{collection}/export", get(transfer::export))
         .route(
@@ -542,128 +493,9 @@ async fn search(
     })
     .await?;
     Ok(Json(
-        json!({"collections": body.collections, "search_id": outcome.search_id, "hits": outcome.hits}),
+        json!({"collections": body.collections, "hits": outcome.hits}),
     ))
 }
-async fn report(
-    State(service): State<Arc<Service>>,
-    Extension(context): Extension<RequestContext>,
-    Extension(key): Extension<IdempotencyKey>,
-    path: Result<Path<String>, PathRejection>,
-    query: Result<Query<EmptyQuery>, QueryRejection>,
-    body: Result<Json<ReportRequest>, JsonRejection>,
-) -> ApiResult<(StatusCode, [(&'static str, String); 1], Json<Value>)> {
-    query?;
-    let Path(collection) = path?;
-    identifier(&collection)?;
-    let Json(body) = body?;
-    identifier(&body.record_id)?;
-    positive(Some(body.revision))?;
-    if let Some(id) = &body.search_id {
-        identifier(id)?;
-    }
-    let response_collection = collection.clone();
-    let result = blocking(&service, move |s| {
-        s.report(
-            &context,
-            &collection,
-            &body.record_id,
-            &body.text,
-            ReportOptions {
-                revision: Some(body.revision),
-                search_id: body.search_id.as_deref(),
-                idempotency_key: key.0.as_deref(),
-            },
-        )
-    })
-    .await?;
-    let id = result.value;
-    Ok((
-        StatusCode::CREATED,
-        [("mutation-id", result.mutation_id)],
-        Json(json!({"collection_id": response_collection, "id": id})),
-    ))
-}
-async fn list_reports(
-    State(service): State<Arc<Service>>,
-    Extension(context): Extension<RequestContext>,
-    path: Result<Path<(String, String)>, PathRejection>,
-    query: Result<Query<EmptyQuery>, QueryRejection>,
-) -> ApiResult<Json<Value>> {
-    query?;
-    let Path((collection, id)) = path?;
-    identifier(&collection)?;
-    identifier(&id)?;
-    let rows = blocking(&service, move |s| s.reports(&context, &collection, &id)).await?;
-    let rows: Vec<_> = rows.into_iter().map(|r| json!({"collection_id": r.collection_id, "id": r.id, "record_id": r.record_id, "revision": r.revision, "search_id": r.search_id, "text": r.text, "created_at": r.created_at})).collect();
-    Ok(Json(json!({"reports": rows})))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PublicationRequest {
-    text: String,
-}
-
-async fn publish_report(
-    State(service): State<Arc<Service>>,
-    Extension(context): Extension<RequestContext>,
-    Extension(key): Extension<IdempotencyKey>,
-    path: Result<Path<(String, String)>, PathRejection>,
-    query: Result<Query<EmptyQuery>, QueryRejection>,
-    body: Result<Json<PublicationRequest>, JsonRejection>,
-) -> ApiResult<(StatusCode, [(&'static str, String); 1], Json<Value>)> {
-    query?;
-    let Path((collection, id)) = path?;
-    identifier(&collection)?;
-    identifier(&id)?;
-    let Json(body) = body?;
-    let response_collection = collection.clone();
-    let result = blocking(&service, move |s| {
-        s.publish_report(&context, &collection, &id, &body.text, key.0.as_deref())
-    })
-    .await?;
-    Ok((
-        StatusCode::CREATED,
-        [("mutation-id", result.mutation_id)],
-        Json(json!({"collection_id": response_collection, "id": result.value})),
-    ))
-}
-
-async fn published_reports(
-    State(service): State<Arc<Service>>,
-    Extension(context): Extension<RequestContext>,
-    path: Result<Path<(String, String)>, PathRejection>,
-    query: Result<Query<EmptyQuery>, QueryRejection>,
-) -> ApiResult<Json<Value>> {
-    query?;
-    let Path((collection, id)) = path?;
-    identifier(&collection)?;
-    identifier(&id)?;
-    let rows = blocking(&service, move |s| {
-        s.published_reports(&context, &collection, &id)
-    })
-    .await?;
-    Ok(Json(json!({"reports": rows})))
-}
-
-async fn search_receipt(
-    State(service): State<Arc<Service>>,
-    Extension(context): Extension<RequestContext>,
-    path: Result<Path<(String, String)>, PathRejection>,
-    query: Result<Query<EmptyQuery>, QueryRejection>,
-) -> ApiResult<Json<Value>> {
-    query?;
-    let Path((collection, id)) = path?;
-    identifier(&collection)?;
-    identifier(&id)?;
-    let receipt = blocking(&service, move |s| {
-        s.search_receipt(&context, &collection, &id)
-    })
-    .await?;
-    Ok(Json(json!(receipt)))
-}
-
 async fn delete_collection(
     State(service): State<Arc<Service>>,
     Extension(context): Extension<RequestContext>,

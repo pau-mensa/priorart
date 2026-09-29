@@ -42,14 +42,16 @@ enum Command {
 
 #[derive(Subcommand)]
 enum AdminCommand {
+    /// Create a principal that can own collections, author records, and hold credentials
+    CreatePrincipal,
     /// Provision a collection through trusted local administration.
     CreateCollection {
-        #[arg(long, default_value = priorart::store::LOCAL_ACCOUNT_ID)]
-        account: String,
+        #[arg(long, default_value = LOCAL_PRINCIPAL_ID)]
+        owner: String,
         #[arg(long, default_value = "restricted")]
         visibility: priorart::store::Visibility,
     },
-    /// Bootstrap a credential for an existing owner principal. Prints its secret once.
+    /// Issue a credential for an existing principal. Prints its secret once.
     Issue {
         #[arg(long, default_value = LOCAL_PRINCIPAL_ID)]
         principal: String,
@@ -65,17 +67,17 @@ enum AdminCommand {
         #[arg(long, default_value = LOCAL_PRINCIPAL_ID)]
         principal: String,
     },
-    /// Replace a credential and revoke its old delegation tree; prints the new secret once
+    /// Replace a credential and revoke the old one; prints the new secret once
     Rotate {
         #[arg(long)]
         credential_id: String,
     },
-    /// Permanently revoke a credential and its descendants
+    /// Permanently revoke a credential
     Revoke {
         #[arg(long)]
         credential_id: String,
     },
-    /// Replace explicit grants and revoke descendants; no --grant removes all permissions
+    /// Replace explicit grants; no --grant removes all permissions
     SetGrants {
         #[arg(long)]
         credential_id: String,
@@ -89,11 +91,9 @@ fn administer(command: AdminCommand) -> Result<(), AnyError> {
     // No encoder, HTTP listener, or remote provisioning is involved.
     let store = Store::open(settings.data_dir.join(DATABASE_FILE))?;
     match command {
-        AdminCommand::CreateCollection {
-            account,
-            visibility,
-        } => {
-            println!("{}", store.create_collection(&account, visibility)?);
+        AdminCommand::CreatePrincipal => println!("{}", store.create_principal()?),
+        AdminCommand::CreateCollection { owner, visibility } => {
+            println!("{}", store.create_collection(&owner, visibility)?);
         }
         AdminCommand::Issue {
             principal,

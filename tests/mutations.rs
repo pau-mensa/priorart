@@ -5,7 +5,7 @@ use priorart::{
     config::Settings,
     encoder::{Encoder, EncoderError},
     service::{DeleteOptions, Service, ServiceError, WriteOptions, DATABASE_FILE},
-    store::{Store, Visibility, LOCAL_ACCOUNT_ID, LOCAL_PRINCIPAL_ID},
+    store::{Store, Visibility, LOCAL_PRINCIPAL_ID},
 };
 use std::{
     sync::{mpsc, Arc, Condvar, Mutex},
@@ -99,10 +99,10 @@ fn collections_run_independently_while_same_collection_mutations_wait() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path().join(DATABASE_FILE)).unwrap();
         let a = store
-            .create_collection(LOCAL_ACCOUNT_ID, Visibility::Restricted)
+            .create_collection(LOCAL_PRINCIPAL_ID, Visibility::Restricted)
             .unwrap();
         let b = store
-            .create_collection(LOCAL_ACCOUNT_ID, Visibility::Restricted)
+            .create_collection(LOCAL_PRINCIPAL_ID, Visibility::Restricted)
             .unwrap();
         let grants: Vec<_> = [&a, &b]
             .into_iter()

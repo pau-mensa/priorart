@@ -5,7 +5,7 @@ pub(super) fn purge_record_content(
     collection: &str,
     record: &str,
 ) -> Result<()> {
-    let targets = "collection_id = ?1 AND operation != 'delete' AND target_record_id = ?2";
+    let targets = "collection_id = ?1 AND operation = 'put' AND target_record_id = ?2";
     transaction.execute(
         &format!("DELETE FROM mutations WHERE idempotency_digest IS NULL AND {targets}"),
         (collection, record),
@@ -15,13 +15,7 @@ pub(super) fn purge_record_content(
         &format!("UPDATE mutations SET payload_digest = '', result = 'null', state = 'applied', target_record_id = NULL WHERE {targets}"),
         (collection, record),
     )?;
-    for table in [
-        "reports",
-        "published_reports",
-        "search_hits",
-        "index_documents",
-        "revisions",
-    ] {
+    for table in ["index_documents", "revisions"] {
         transaction.execute(
             &format!("DELETE FROM {table} WHERE collection_id = ?1 AND record_id = ?2"),
             (collection, record),
@@ -92,13 +86,8 @@ impl Store {
             [collection],
         )?;
         for table in [
-            "retention_jobs",
             "credential_grants",
             "mutations",
-            "reports",
-            "published_reports",
-            "search_hits",
-            "searches",
             "index_documents",
             "index_state",
             "revisions",

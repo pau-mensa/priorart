@@ -4,7 +4,7 @@ use priorart::{
     auth::{Grant, Operation as Op, RequestContext},
     config::Settings,
     index::collection_index_path,
-    service::{DeleteOptions, ReportOptions, Service, WriteOptions, DATABASE_FILE},
+    service::{DeleteOptions, Service, WriteOptions, DATABASE_FILE},
     store::{Store, StoreError, Visibility, LOCAL_COLLECTION_ID as LOCAL},
 };
 use std::{path::Path, sync::Arc};
@@ -41,7 +41,7 @@ fn count(connection: &rusqlite::Connection, table: &str, collection: &str) -> i6
 }
 
 #[test]
-fn record_purge_erases_feedback_and_old_generations_without_recreating_on_retry() {
+fn record_purge_erases_old_generations_without_recreating_on_retry() {
     let dir = tempfile::tempdir().unwrap();
     let service = service(dir.path());
     let caller = RequestContext::local();
@@ -64,24 +64,14 @@ fn record_purge_erases_feedback_and_old_generations_without_recreating_on_retry(
             Default::default(),
         )
         .unwrap();
-    let receipt = service
-        .search(&caller, LOCAL, "secret", None, 10)
-        .unwrap()
-        .search_id
-        .unwrap();
-    service
-        .report(
-            &caller,
-            LOCAL,
-            &record,
-            "quotes secret text",
-            ReportOptions {
-                revision: Some(1),
-                search_id: Some(&receipt),
-                idempotency_key: Some("private-report"),
-            },
-        )
-        .unwrap();
+    assert_eq!(
+        service
+            .search(&caller, LOCAL, "secret", None, 10)
+            .unwrap()
+            .hits
+            .len(),
+        2
+    );
     let path = collection_index_path(dir.path(), LOCAL);
     let previous: Vec<_> = std::fs::read_dir(&path)
         .unwrap()
@@ -101,18 +91,7 @@ fn record_purge_erases_feedback_and_old_generations_without_recreating_on_retry(
         assert!(!path.join(name).exists());
     }
     let db = rusqlite::Connection::open(dir.path().join(DATABASE_FILE)).unwrap();
-    for table in ["reports", "published_reports"] {
-        assert_eq!(count(&db, table, LOCAL), 0);
-    }
     assert_eq!(count(&db, "revisions", LOCAL), 1);
-    assert_eq!(
-        service
-            .search_receipt(&caller, LOCAL, &receipt)
-            .unwrap()
-            .hits
-            .len(),
-        1
-    );
     let cleared: i64 = db
         .query_row(
             "SELECT count(*) FROM mutations WHERE payload_digest = '' AND result = 'null'",
@@ -120,7 +99,7 @@ fn record_purge_erases_feedback_and_old_generations_without_recreating_on_retry(
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(cleared, 2);
+    assert_eq!(cleared, 1);
     assert!(service
         .put(
             &caller,
@@ -147,25 +126,15 @@ fn collection_purge_revokes_only_its_grants_and_never_recreates_local() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join(DATABASE_FILE)).unwrap();
     let principal = store.create_principal().unwrap();
-    let account = store.create_account(&principal).unwrap();
     let public = store
-        .create_collection(&account, Visibility::Public)
+        .create_collection(&principal, Visibility::Public)
         .unwrap();
     let other = store
-        .create_collection(&account, Visibility::Restricted)
+        .create_collection(&principal, Visibility::Restricted)
         .unwrap();
     let grants: Vec<_> = [&public, &other]
         .into_iter()
-        .flat_map(|c| {
-            [
-                Op::Read,
-                Op::Contribute,
-                Op::Admin,
-                Op::Report,
-                Op::ReportPublish,
-            ]
-            .map(|op| Grant::new(c, op))
-        })
+        .flat_map(|c| [Op::Read, Op::Contribute, Op::Admin].map(|op| Grant::new(c, op)))
         .collect();
     let key = store
         .issue_local_credential(&principal, &grants, None)
@@ -196,21 +165,6 @@ fn collection_purge_revokes_only_its_grants_and_never_recreates_local() {
             },
         )
         .unwrap();
-    let report = service
-        .report(
-            &caller,
-            &public,
-            "same",
-            "private text",
-            ReportOptions {
-                revision: Some(1),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    service
-        .publish_report(&caller, &public, &report.value, "published text", None)
-        .unwrap();
     assert!(service
         .delete_collection(&RequestContext::anonymous(), &public)
         .is_err());
@@ -222,10 +176,6 @@ fn collection_purge_revokes_only_its_grants_and_never_recreates_local() {
     for table in [
         "records",
         "revisions",
-        "reports",
-        "published_reports",
-        "searches",
-        "search_hits",
         "index_documents",
         "index_state",
         "credential_grants",
@@ -251,8 +201,8 @@ fn collection_purge_revokes_only_its_grants_and_never_recreates_local() {
     assert!(service.search(&fresh, &public, "public", None, 10).is_err());
     assert!(db
         .execute(
-            "INSERT INTO collections (id, owner_account_id, visibility, created_at) VALUES (?1, ?2, 'public', 'now')",
-            (&public, &account)
+            "INSERT INTO collections (id, owner_principal_id, visibility, created_at) VALUES (?1, ?2, 'public', 'now')",
+            (&public, &principal)
         )
         .is_err());
     service

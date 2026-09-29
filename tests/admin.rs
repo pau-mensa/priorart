@@ -113,8 +113,8 @@ fn local_collection_provisioning_defaults_to_restricted() {
         let collection = store.get_collection(id.trim()).unwrap();
         assert_eq!(collection.visibility.as_str(), visibility);
         assert_eq!(
-            collection.owner_account_id,
-            priorart::store::LOCAL_ACCOUNT_ID
+            collection.owner_principal_id,
+            priorart::store::LOCAL_PRINCIPAL_ID
         );
     }
     assert!(!admin(
@@ -123,4 +123,43 @@ fn local_collection_provisioning_defaults_to_restricted() {
     )
     .status
     .success());
+}
+
+#[test]
+fn created_principals_own_collections_and_hold_their_credentials() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = admin(&directory, &["create-principal"]);
+    assert!(output.status.success());
+    let principal = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+    let output = admin(&directory, &["create-collection", "--owner", &principal]);
+    assert!(output.status.success());
+    let collection = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+    let store = Store::open(directory.path().join(DATABASE_FILE)).unwrap();
+    assert_eq!(
+        store
+            .get_collection(&collection)
+            .unwrap()
+            .owner_principal_id,
+        principal
+    );
+    let grant = format!("{collection}:admin");
+    let issued = admin(
+        &directory,
+        &["issue", "--principal", &principal, "--grant", &grant],
+    );
+    assert!(issued.status.success());
+    let value: Value = serde_json::from_slice(&issued.stdout).unwrap();
+    let context = store
+        .authenticate(value["secret"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(context.principal_id(), Some(principal.as_str()));
+    // The default local principal does not own the new restricted collection.
+    assert!(!admin(&directory, &["issue", "--grant", &grant])
+        .status
+        .success());
+    assert!(
+        !admin(&directory, &["create-collection", "--owner", "missing"])
+            .status
+            .success()
+    );
 }

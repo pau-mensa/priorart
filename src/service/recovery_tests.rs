@@ -176,18 +176,6 @@ fn purge_interruptions_resume_on_restart() {
                     Default::default(),
                 )
                 .unwrap();
-            service
-                .report(
-                    &CALLER,
-                    LOCAL,
-                    "record",
-                    "quotes secret",
-                    ReportOptions {
-                        revision: Some(1),
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
             crate::fault::set(Some(phase));
             let result = if collection_delete {
                 service.delete_collection(&CALLER, LOCAL)
@@ -220,8 +208,6 @@ fn purge_interruptions_resume_on_restart() {
                     .unwrap()
                     .hits
                     .is_empty());
-                let store = service.connect().unwrap();
-                assert!(store.reports_for(LOCAL, "record").unwrap().is_empty());
                 service
                     .delete(
                         &CALLER,
@@ -316,141 +302,4 @@ fn interrupted_import_recovers_content_and_provenance_together() {
             9
         );
     }
-}
-
-#[test]
-fn retention_batches_roll_back_or_resume_with_index_cleanup() {
-    use crate::store::RetentionKind;
-    for phase in [
-        "before_retention_commit",
-        "after_retention_commit",
-        "after_purge_files",
-    ] {
-        let directory = tempfile::tempdir().unwrap();
-        let service = Service::new(settings(directory.path()), None).unwrap();
-        service
-            .put(
-                &CALLER,
-                LOCAL,
-                "old",
-                None,
-                Some("record"),
-                Default::default(),
-            )
-            .unwrap();
-        service
-            .put(
-                &CALLER,
-                LOCAL,
-                "current",
-                None,
-                Some("record"),
-                WriteOptions {
-                    expected_revision: Some(1),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        let db = rusqlite::Connection::open(directory.path().join(DATABASE_FILE)).unwrap();
-        db.execute(
-            "UPDATE revisions SET created_at = '2000-01-01T00:00:00.000000Z'",
-            [],
-        )
-        .unwrap();
-        service
-            .create_retention_job(
-                &CALLER,
-                LOCAL,
-                "job",
-                RetentionKind::Revisions,
-                1_000_000_000,
-            )
-            .unwrap();
-        crate::fault::set(Some(phase));
-        assert!(service.run_retention_batch(&CALLER, LOCAL, "job").is_err());
-        crate::fault::set(None);
-        assert!(
-            !service
-                .retention_job(&CALLER, LOCAL, "job")
-                .unwrap()
-                .complete
-        );
-        let remaining: i64 = db
-            .query_row("SELECT count(*) FROM revisions", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            remaining,
-            if phase == "before_retention_commit" {
-                2
-            } else {
-                1
-            }
-        );
-        drop(service);
-        let service = Service::new(settings(directory.path()), None).unwrap();
-        let job = service.run_retention_batch(&CALLER, LOCAL, "job").unwrap();
-        assert!(job.complete);
-        assert_eq!(job.processed, 1);
-        assert_eq!(
-            service
-                .search(&CALLER, LOCAL, "current", None, 10)
-                .unwrap()
-                .hits[0]
-                .revision,
-            2
-        );
-        assert!(service.get(&CALLER, LOCAL, "record", Some(1)).is_err());
-    }
-}
-
-#[test]
-fn mutation_retention_reconciles_abandoned_commits_before_expiry() {
-    use crate::store::RetentionKind;
-    let directory = tempfile::tempdir().unwrap();
-    let service = Service::new(settings(directory.path()), None).unwrap();
-    crate::fault::set(Some("after_record_commit"));
-    assert!(service
-        .put(
-            &CALLER,
-            LOCAL,
-            "committed content",
-            None,
-            Some("record"),
-            WriteOptions {
-                idempotency_key: Some("key"),
-                ..Default::default()
-            }
-        )
-        .is_err());
-    crate::fault::set(None);
-    let db = rusqlite::Connection::open(directory.path().join(DATABASE_FILE)).unwrap();
-    db.execute(
-        "UPDATE mutations SET created_at = '2000-01-01T00:00:00.000000Z'",
-        [],
-    )
-    .unwrap();
-    service
-        .create_retention_job(
-            &CALLER,
-            LOCAL,
-            "job",
-            RetentionKind::Mutations,
-            1_000_000_000,
-        )
-        .unwrap();
-    let job = service.run_retention_batch(&CALLER, LOCAL, "job").unwrap();
-    assert!(job.complete);
-    assert_eq!(job.processed, 1);
-    assert_eq!(
-        service
-            .search(&CALLER, LOCAL, "committed", None, 10)
-            .unwrap()
-            .hits
-            .len(),
-        1
-    );
-    let state: String = db
-        .query_row("SELECT state FROM mutations", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(state, "applied");
 }

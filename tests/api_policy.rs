@@ -16,12 +16,8 @@ const ALL: &[Op] = &[
     Op::Contribute,
     Op::Update,
     Op::Delete,
-    Op::Report,
-    Op::FeedbackRead,
-    Op::ReportPublish,
     Op::Moderate,
     Op::Admin,
-    Op::Delegate,
 ];
 struct Api {
     dir: TempDir,
@@ -43,15 +39,13 @@ impl Api {
         let store = Store::open(dir.path().join(DATABASE_FILE)).unwrap();
         let alice = store.create_principal().unwrap();
         let bob = store.create_principal().unwrap();
-        let aa = store.create_account(&alice).unwrap();
-        let ba = store.create_account(&bob).unwrap();
         let a = store
-            .create_collection(&aa, Visibility::Restricted)
+            .create_collection(&alice, Visibility::Restricted)
             .unwrap();
         let b = store
-            .create_collection(&ba, Visibility::Restricted)
+            .create_collection(&bob, Visibility::Restricted)
             .unwrap();
-        let public = store.create_collection(&aa, Visibility::Public).unwrap();
+        let public = store.create_collection(&alice, Visibility::Public).unwrap();
         let grants: Vec<_> = [&a, &public]
             .into_iter()
             .flat_map(|c| ALL.iter().map(move |op| Grant::new(c, *op)))
@@ -150,10 +144,9 @@ impl Api {
     fn records(&self, collection: &str) -> String {
         format!("/v1/collections/{collection}/records")
     }
-    fn delegate(&self, grants: Vec<Grant>) -> String {
-        let context = self.store.authenticate(&self.alice_key).unwrap();
+    fn issue(&self, principal: &str, grants: Vec<Grant>) -> String {
         self.store
-            .delegate_credential_to(&context, &self.bob, &grants, None)
+            .issue_local_credential(principal, &grants, None)
             .unwrap()
             .into_secret()
     }
@@ -173,14 +166,6 @@ async fn scope_is_required_and_forbidden_objects_are_indistinguishable() {
             assert_eq!(
                 api.get(
                     &format!("{}/{record}", api.records(collection)),
-                    Some(&api.alice_key)
-                )
-                .await,
-                hidden
-            );
-            assert_eq!(
-                api.get(
-                    &format!("{}/{record}/reports", api.records(collection)),
                     Some(&api.alice_key)
                 )
                 .await,
@@ -322,7 +307,7 @@ async fn public_reads_do_not_downgrade_bad_credentials() {
         )
         .await;
     assert_eq!(search.0, StatusCode::OK);
-    assert!(search.1["search_id"].is_null());
+    assert!(search.1.get("search_id").is_none());
 }
 
 #[tokio::test]
@@ -334,7 +319,7 @@ async fn collection_discovery_and_diagnostics_respect_independent_grants() {
     assert!(rows
         .iter()
         .all(|r| r["id"] == api.a || r["id"] == api.public));
-    assert!(rows.iter().all(|r| r.get("owner_account_id").is_none()));
+    assert!(rows.iter().all(|r| r.get("owner_principal_id").is_none()));
     let anonymous = api.get("/v1/collections", None).await.1;
     assert_eq!(anonymous["collections"].as_array().unwrap().len(), 1);
     assert_eq!(anonymous["collections"][0]["id"], api.public);
@@ -354,11 +339,11 @@ async fn collection_discovery_and_diagnostics_respect_independent_grants() {
         first["collections"][0]["id"],
         second["collections"][0]["id"]
     );
-    let reader = api.delegate(vec![Grant::new(&api.a, Op::Read)]);
+    let reader = api.issue(&api.alice, vec![Grant::new(&api.a, Op::Read)]);
     let path = format!("/v1/collections/{}/diagnostics", api.a);
     assert_eq!(api.get(&path, Some(&reader)).await.0, StatusCode::NOT_FOUND);
     assert_eq!(api.encoder.calls(), 0);
-    let admin = api.delegate(vec![Grant::new(&api.a, Op::Admin)]);
+    let admin = api.issue(&api.alice, vec![Grant::new(&api.a, Op::Admin)]);
     assert_eq!(
         api.get(&format!("/v1/collections/{}", api.a), Some(&admin))
             .await
@@ -378,16 +363,17 @@ async fn collection_discovery_and_diagnostics_respect_independent_grants() {
 }
 
 #[tokio::test]
-async fn publication_authorship_and_private_feedback_are_enforced() {
+async fn public_publication_intent_and_authorship_are_enforced() {
     let api = Api::start().await;
-    let bob_public = api.delegate(vec![
-        Grant::new(&api.public, Op::Read),
-        Grant::new(&api.public, Op::Contribute),
-        Grant::new(&api.public, Op::Update),
-        Grant::new(&api.public, Op::Delete),
-        Grant::new(&api.public, Op::Report),
-        Grant::new(&api.public, Op::FeedbackRead),
-    ]);
+    let bob_public = api.issue(
+        &api.bob,
+        vec![
+            Grant::new(&api.public, Op::Read),
+            Grant::new(&api.public, Op::Contribute),
+            Grant::new(&api.public, Op::Update),
+            Grant::new(&api.public, Op::Delete),
+        ],
+    );
     let records = api.records(&api.public);
     assert_eq!(
         api.post(
@@ -428,42 +414,6 @@ async fn publication_authorship_and_private_feedback_are_enforced() {
         )
         .await
         .0,
-        StatusCode::NOT_FOUND
-    );
-    let reports = format!("/v1/collections/{}/reports", api.public);
-    let search = api
-        .post(
-            "/v1/search",
-            Some(&api.alice_key),
-            json!({"collections": [api.public], "text": "sentinel"}),
-        )
-        .await
-        .1;
-    assert_eq!(api.post(&reports, Some(&bob_public), json!({"record_id": "same", "revision": 1, "text": "stolen receipt", "search_id": search["search_id"]})).await.0, StatusCode::NOT_FOUND);
-    for (key, text) in [
-        (&api.alice_key, "alice private feedback"),
-        (&bob_public, "bob private feedback"),
-    ] {
-        assert_eq!(
-            api.post(
-                &reports,
-                Some(key),
-                json!({"record_id": "same", "revision": 1, "text": text})
-            )
-            .await
-            .0,
-            StatusCode::CREATED
-        );
-    }
-    let listed = api
-        .get(&format!("{records}/same/reports"), Some(&bob_public))
-        .await
-        .1;
-    assert_eq!(listed["reports"].as_array().unwrap().len(), 1);
-    assert_eq!(listed["reports"][0]["text"], "bob private feedback");
-    assert!(!listed.to_string().contains("alice private"));
-    assert_eq!(
-        api.get(&format!("{records}/same/reports"), None).await.0,
         StatusCode::NOT_FOUND
     );
 }
@@ -588,17 +538,6 @@ async fn input_limits_and_errors_do_not_reflect_payloads_or_credentials() {
             "/v1/search",
             Some(&api.alice_key),
             json!({"collections": [api.a], "text": "x".repeat(16_385)})
-        )
-        .await
-        .0,
-        StatusCode::BAD_REQUEST
-    );
-    let reports = format!("/v1/collections/{}/reports", api.a);
-    assert_eq!(
-        api.post(
-            &reports,
-            Some(&api.alice_key),
-            json!({"record_id": "same", "revision": 1, "text": "x".repeat(65_537)})
         )
         .await
         .0,
@@ -798,40 +737,6 @@ async fn concurrent_retries_return_one_mutation_and_conflicting_payloads_fail() 
         .await,
         updated
     );
-    let reports = format!("/v1/collections/{}/reports", api.a);
-    let report = json!({"record_id": id, "revision": 2, "text": "private feedback sentinel"});
-    let reported = keyed(
-        &api,
-        Method::POST,
-        &reports,
-        &api.alice_key,
-        "create-once",
-        Some(report.clone()),
-    )
-    .await;
-    assert_eq!(reported.0, StatusCode::CREATED);
-    assert_ne!(reported.2, left.2); // operation scope
-    assert_eq!(
-        keyed(
-            &api,
-            Method::POST,
-            &reports,
-            &api.alice_key,
-            "create-once",
-            Some(report)
-        )
-        .await,
-        reported
-    );
-    assert_eq!(
-        api.get(&format!("{records}/{id}/reports"), Some(&api.alice_key))
-            .await
-            .1["reports"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
     let path = format!("{records}/{id}?expected_revision=2");
     let deleted = keyed(
         &api,
@@ -870,12 +775,7 @@ async fn concurrent_retries_return_one_mutation_and_conflicting_payloads_fail() 
     );
     let connection = rusqlite::Connection::open(api.dir.path().join(DATABASE_FILE)).unwrap();
     let journal: String = connection.query_row("SELECT group_concat(idempotency_digest || payload_digest || result || state) FROM mutations", [], |r| r.get(0)).unwrap();
-    for secret in [
-        "private mutation sentinel",
-        "private feedback sentinel",
-        "create-once",
-        &api.alice_key,
-    ] {
+    for secret in ["private mutation sentinel", "create-once", &api.alice_key] {
         assert!(!journal.contains(secret));
     }
     let pending: i64 = connection
@@ -891,9 +791,9 @@ async fn concurrent_retries_return_one_mutation_and_conflicting_payloads_fail() 
 #[tokio::test]
 async fn idempotency_is_principal_and_collection_scoped_and_rechecks_authority() {
     let api = Api::start().await;
-    let writer = api.delegate(vec![Grant::new(&api.a, Op::Contribute)]);
-    let records = api.records(&api.a);
-    let body = json!({"text": "private contribution"});
+    let writer = api.issue(&api.bob, vec![Grant::new(&api.public, Op::Contribute)]);
+    let records = api.records(&api.public);
+    let body = json!({"text": "public contribution", "publish": true});
     let created = keyed(
         &api,
         Method::POST,
@@ -938,17 +838,17 @@ async fn idempotency_is_principal_and_collection_scoped_and_rechecks_authority()
     .await;
     assert_eq!(bob.0, StatusCode::CREATED);
     assert_ne!(bob.2, created.2);
-    let public = keyed(
+    let restricted = keyed(
         &api,
         Method::POST,
-        &api.records(&api.public),
+        &api.records(&api.a),
         &api.alice_key,
         "same-key",
-        Some(json!({"text": "public copy", "publish": true})),
+        Some(json!({"text": "restricted copy"})),
     )
     .await;
-    assert_eq!(public.0, StatusCode::CREATED);
-    assert_ne!(public.2, alice.2); // same principal and operation, different collection
+    assert_eq!(restricted.0, StatusCode::CREATED);
+    assert_ne!(restricted.2, alice.2); // same principal and operation, different collection
     let context = api.store.authenticate(&writer).unwrap();
     api.store
         .revoke_local_credential(&context.credential().unwrap().id)
@@ -990,50 +890,6 @@ async fn idempotency_is_principal_and_collection_scoped_and_rechecks_authority()
         .0,
         StatusCode::BAD_REQUEST
     );
-}
-
-#[tokio::test]
-async fn private_receipts_and_explicit_public_report_copies() {
-    let api = Api::start().await;
-    let root = format!("/v1/collections/{}", api.public);
-    let search = api
-        .post(
-            "/v1/search",
-            Some(&api.alice_key),
-            json!({"collections": [api.public], "text": "sentinel"}),
-        )
-        .await
-        .1;
-    let receipt = format!("{root}/searches/{}", search["search_id"].as_str().unwrap());
-    assert_eq!(
-        api.get(&receipt, Some(&api.alice_key)).await.0,
-        StatusCode::OK
-    );
-    assert_eq!(
-        api.get(&receipt, Some(&api.bob_key)).await,
-        api.get(&format!("{root}/searches/guessed"), Some(&api.bob_key))
-            .await
-    );
-    let report = api.post(&format!("{root}/reports"), Some(&api.alice_key), json!({"record_id": "same", "revision": 1, "text": "private details", "search_id": search["search_id"]})).await;
-    assert_eq!(report.0, StatusCode::CREATED);
-    let public = format!("{root}/records/same/published-reports");
-    assert_eq!(api.get(&public, None).await.1, json!({"reports": []}));
-    let published = api
-        .post(
-            &format!(
-                "{root}/reports/{}/publish",
-                report.1["id"].as_str().unwrap()
-            ),
-            Some(&api.alice_key),
-            json!({"text": "selected text"}),
-        )
-        .await;
-    assert_eq!(published.0, StatusCode::CREATED);
-    let rows = api.get(&public, None).await;
-    assert_eq!(rows.0, StatusCode::OK);
-    assert_eq!(rows.1["reports"][0]["text"], "selected text");
-    assert!(rows.1["reports"][0].get("search_id").is_none());
-    assert!(!rows.1.to_string().contains("private details"));
 }
 
 #[tokio::test]

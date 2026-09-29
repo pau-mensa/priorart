@@ -89,7 +89,7 @@ impl Store {
         source: &TransferRecord,
         source_digest: &str,
     ) -> Result<mutations::Mutation<(String, i64)>> {
-        self.commit_mutation(intent, false, |transaction| {
+        self.commit_mutation(intent, |transaction| {
             let created = put_in(
                 transaction,
                 intent.collection,

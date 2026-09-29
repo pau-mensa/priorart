@@ -9,7 +9,7 @@ use time::OffsetDateTime;
 use super::{new_id, Store, StoreError};
 use crate::auth::{
     AuthError, CredentialInfo, Grant, IssuedCredential, Operation, RequestContext, Result,
-    MAX_CREDENTIAL_DEPTH, MAX_GRANTS,
+    MAX_GRANTS,
 };
 
 impl From<rusqlite::Error> for AuthError {
@@ -23,8 +23,8 @@ fn now() -> i64 {
 }
 
 impl Store {
-    /// Host-operator bootstrap only. Not a remote issuance API. Root grants must
-    /// name collections owned by this principal; billing authority is separate.
+    /// Host-operator issuance only. Grants must name collections owned by this
+    /// principal, or public collections for record operations.
     pub fn issue_local_credential(
         &self,
         principal: &str,
@@ -33,8 +33,8 @@ impl Store {
     ) -> Result<IssuedCredential> {
         let transaction = self.write()?;
         let grants = validate_grants(grants)?;
-        require_owned(&transaction, principal, &grants)?;
-        let issued = insert(&transaction, principal, None, grants, expires_at, now())?;
+        require_grantable(&transaction, principal, &grants)?;
+        let issued = insert(&transaction, principal, grants, expires_at, now())?;
         transaction.commit()?;
         Ok(issued)
     }
@@ -61,68 +61,20 @@ impl Store {
         if !matches || stored.is_none() {
             return Err(AuthError::Unauthenticated);
         }
-        let info = active(&transaction, id, now())?.0;
+        let info = active(&transaction, id, now())?;
         let context = context(&transaction, info)?;
         transaction.commit()?;
         Ok(context)
     }
 
-    /// Recheck current state (including ancestors) in a single read snapshot.
-    /// Stale contexts fail; callers must authenticate again to obtain new grants.
+    /// Recheck current state in a single read snapshot. Stale contexts fail;
+    /// callers must authenticate again to obtain new grants.
     pub fn validate_context(&self, request: &RequestContext) -> Result<()> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
         validate_context(&transaction, request, now())?;
         transaction.commit()?;
         Ok(())
-    }
-
-    /// Issue another agent key for the same principal.
-    pub fn delegate_credential(
-        &self,
-        issuer: &RequestContext,
-        grants: &[Grant],
-        expires_at: Option<i64>,
-    ) -> Result<IssuedCredential> {
-        let principal = issuer.principal_id().ok_or(AuthError::Unauthenticated)?;
-        self.delegate_credential_to(issuer, principal, grants, expires_at)
-    }
-
-    /// Delegate bounded authority to an existing principal, retaining the issuer
-    /// chain so loss of its authority also invalidates the recipient's key.
-    pub fn delegate_credential_to(
-        &self,
-        issuer: &RequestContext,
-        principal: &str,
-        grants: &[Grant],
-        expires_at: Option<i64>,
-    ) -> Result<IssuedCredential> {
-        let transaction = self.write()?;
-        let timestamp = now();
-        let (parent, depth) = validate_context(&transaction, issuer, timestamp)?;
-        let exists: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM principals WHERE id = ?1)",
-            [principal],
-            |r| r.get(0),
-        )?;
-        if !exists {
-            return Err(AuthError::Forbidden);
-        }
-        let grants = validate_grants(grants)?;
-        if grants.is_empty() || depth >= MAX_CREDENTIAL_DEPTH {
-            return Err(AuthError::Forbidden);
-        }
-        require_subset(&parent, &grants, expires_at)?;
-        let issued = insert(
-            &transaction,
-            principal,
-            Some(&parent.id),
-            grants,
-            expires_at,
-            timestamp,
-        )?;
-        transaction.commit()?;
-        Ok(issued)
     }
 
     /// Local inspection exposes no verifier or secret. Revoked records remain
@@ -142,52 +94,42 @@ impl Store {
         Ok(result)
     }
 
-    /// Immediately and permanently revoke the credential and its descendants.
+    /// Immediately and permanently revoke the credential.
     pub fn revoke_local_credential(&self, id: &str) -> Result<()> {
         let transaction = self.write()?;
         let credential = info(&transaction, id)?;
         if credential.revoked_at.is_none() {
-            revoke_tree(&transaction, id, now())?;
+            revoke(&transaction, &credential, now())?;
         }
         transaction.commit()?;
         Ok(())
     }
 
-    /// Rotation issues a fresh lookup ID and secret with exactly the same scope,
-    /// parent, and expiry, and revokes the old credential subtree atomically.
+    /// Rotation issues a fresh lookup ID and secret with exactly the same scope
+    /// and expiry, and revokes the old credential atomically.
     pub fn rotate_local_credential(&self, id: &str) -> Result<IssuedCredential> {
         let transaction = self.write()?;
         let timestamp = now();
-        let old = active(&transaction, id, timestamp)?.0;
+        let old = active(&transaction, id, timestamp)?;
         let issued = insert(
             &transaction,
             &old.principal_id,
-            old.parent_id.as_deref(),
-            old.grants,
+            old.grants.clone(),
             old.expires_at,
             timestamp,
         )?;
-        revoke_tree(&transaction, id, timestamp)?;
+        revoke(&transaction, &old, timestamp)?;
         transaction.commit()?;
         Ok(issued)
     }
 
-    /// Explicit local grant replacement increments versions and revokes existing
-    /// descendants. Empty grants disable all operations; there is no wildcard.
+    /// Explicit local grant replacement increments versions. Empty grants disable
+    /// all operations; there is no wildcard.
     pub fn replace_local_credential_grants(&self, id: &str, grants: &[Grant]) -> Result<()> {
         let transaction = self.write()?;
-        let timestamp = now();
-        let old = active(&transaction, id, timestamp)?.0;
+        let old = active(&transaction, id, now())?;
         let grants = validate_grants(grants)?;
-        if let Some(parent) = &old.parent_id {
-            require_subset(
-                &active(&transaction, parent, timestamp)?.0,
-                &grants,
-                old.expires_at,
-            )?;
-        } else {
-            require_owned(&transaction, &old.principal_id, &grants)?;
-        }
+        require_grantable(&transaction, &old.principal_id, &grants)?;
         transaction.execute(
             "DELETE FROM credential_grants WHERE credential_id = ?1",
             [id],
@@ -197,9 +139,6 @@ impl Store {
             "UPDATE credentials SET grant_version = grant_version + 1 WHERE id = ?1",
             [id],
         )?;
-        // Revoking descendants prevents authority from reappearing if the
-        // parent's grants are subsequently expanded again.
-        revoke_descendants(&transaction, id, timestamp, false)?;
         bump_principal(&transaction, &old.principal_id)?;
         transaction.commit()?;
         Ok(())
@@ -215,7 +154,13 @@ fn validate_grants(grants: &[Grant]) -> Result<BTreeSet<Grant>> {
     Ok(grants.iter().cloned().collect())
 }
 
-fn require_owned(connection: &Connection, principal: &str, grants: &BTreeSet<Grant>) -> Result<()> {
+/// Owners may hold any operation on their collections. Anyone may hold record
+/// operations on a public collection; authorship still limits updates and deletes.
+fn require_grantable(
+    connection: &Connection,
+    principal: &str,
+    grants: &BTreeSet<Grant>,
+) -> Result<()> {
     let exists: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM principals WHERE id = ?1)",
         [principal],
@@ -225,45 +170,29 @@ fn require_owned(connection: &Connection, principal: &str, grants: &BTreeSet<Gra
         return Err(AuthError::Forbidden);
     }
     for grant in grants {
-        let owns: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM collections c JOIN accounts a ON a.id = c.owner_account_id
-             WHERE c.id = ?1 AND a.owner_principal_id = ?2)",
-            (&grant.collection_id, principal),
+        let record_operation = matches!(
+            grant.operation,
+            Operation::Read | Operation::Contribute | Operation::Update | Operation::Delete
+        );
+        let allowed: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM collections WHERE id = ?1
+             AND (owner_principal_id = ?2 OR (?3 AND visibility = 'public')))",
+            (&grant.collection_id, principal, record_operation),
             |r| r.get(0),
         )?;
-        if !owns {
+        if !allowed {
             return Err(AuthError::Forbidden);
         }
     }
     Ok(())
 }
 
-fn require_subset(
-    parent: &CredentialInfo,
-    grants: &BTreeSet<Grant>,
-    expiry: Option<i64>,
-) -> Result<()> {
-    if parent
-        .expires_at
-        .is_some_and(|end| expiry.is_none_or(|child| child > end))
-        || grants.iter().any(|g| {
-            !parent.grants.contains(g)
-                || !parent
-                    .grants
-                    .contains(&Grant::new(&g.collection_id, Operation::Delegate))
-        })
-    {
-        return Err(AuthError::Forbidden);
-    }
-    Ok(())
-}
-
 fn info(connection: &Connection, id: &str) -> Result<CredentialInfo> {
     let mut info = connection.query_row(
-        "SELECT id, principal_id, parent_id, created_at, expires_at, revoked_at, grant_version FROM credentials WHERE id = ?1", [id],
+        "SELECT id, principal_id, created_at, expires_at, revoked_at, grant_version FROM credentials WHERE id = ?1", [id],
         |r| Ok(CredentialInfo {
-            id: r.get(0)?, principal_id: r.get(1)?, parent_id: r.get(2)?, created_at: r.get(3)?,
-            expires_at: r.get(4)?, revoked_at: r.get(5)?, grant_version: r.get(6)?, grants: BTreeSet::new(),
+            id: r.get(0)?, principal_id: r.get(1)?, created_at: r.get(2)?,
+            expires_at: r.get(3)?, revoked_at: r.get(4)?, grant_version: r.get(5)?, grants: BTreeSet::new(),
         }),
     ).optional()?.ok_or(AuthError::Unauthenticated)?;
     let mut statement = connection.prepare("SELECT collection_id, operation FROM credential_grants WHERE credential_id = ?1 ORDER BY collection_id, operation")?;
@@ -278,34 +207,19 @@ fn info(connection: &Connection, id: &str) -> Result<CredentialInfo> {
     Ok(info)
 }
 
-/// All ancestors must still authorize the complete child scope. Bounded traversal
-/// also fails closed on cycles or corrupted/deeper-than-supported hierarchies.
-fn active(connection: &Connection, id: &str, timestamp: i64) -> Result<(CredentialInfo, usize)> {
-    let leaf = info(connection, id)?;
-    let mut current = leaf.clone();
-    for depth in 1..=MAX_CREDENTIAL_DEPTH {
-        if current.revoked_at.is_some() || current.expires_at.is_some_and(|end| end <= timestamp) {
-            return Err(AuthError::Unauthenticated);
-        }
-        match current.parent_id.as_deref() {
-            None => {
-                require_owned(connection, &current.principal_id, &current.grants).map_err(
-                    |error| match error {
-                        AuthError::Forbidden => AuthError::Unauthenticated,
-                        other => other,
-                    },
-                )?;
-                return Ok((leaf, depth));
-            }
-            Some(parent_id) => {
-                let parent = info(connection, parent_id)?;
-                require_subset(&parent, &current.grants, current.expires_at)
-                    .map_err(|_| AuthError::Unauthenticated)?;
-                current = parent;
-            }
-        }
+fn active(connection: &Connection, id: &str, timestamp: i64) -> Result<CredentialInfo> {
+    let credential = info(connection, id)?;
+    if credential.revoked_at.is_some() || credential.expires_at.is_some_and(|end| end <= timestamp)
+    {
+        return Err(AuthError::Unauthenticated);
     }
-    Err(AuthError::Unauthenticated)
+    require_grantable(connection, &credential.principal_id, &credential.grants).map_err(
+        |error| match error {
+            AuthError::Forbidden => AuthError::Unauthenticated,
+            other => other,
+        },
+    )?;
+    Ok(credential)
 }
 
 fn context(connection: &Connection, credential: CredentialInfo) -> Result<RequestContext> {
@@ -325,23 +239,22 @@ fn validate_context(
     connection: &Connection,
     request: &RequestContext,
     timestamp: i64,
-) -> Result<(CredentialInfo, usize)> {
+) -> Result<()> {
     let id = &request
         .credential
         .as_ref()
         .ok_or(AuthError::Unauthenticated)?
         .id;
-    let (credential, depth) = active(connection, id, timestamp)?;
-    if context(connection, credential.clone())? != *request {
+    let credential = active(connection, id, timestamp)?;
+    if context(connection, credential)? != *request {
         return Err(AuthError::Unauthenticated);
     }
-    Ok((credential, depth))
+    Ok(())
 }
 
 fn insert(
     transaction: &Transaction<'_>,
     principal: &str,
-    parent: Option<&str>,
     grants: BTreeSet<Grant>,
     expires_at: Option<i64>,
     timestamp: i64,
@@ -362,12 +275,11 @@ fn insert(
             .collect::<String>()
     );
     transaction.execute(
-        "INSERT INTO credentials (id, principal_id, parent_id, verifier, created_at, expires_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO credentials (id, principal_id, verifier, created_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
         (
             &id,
             principal,
-            parent,
             verifier(&secret).as_slice(),
             timestamp,
             expires_at,
@@ -398,37 +310,12 @@ fn bump_principal(connection: &Connection, principal: &str) -> Result<()> {
     Ok(())
 }
 
-fn revoke_tree(connection: &Connection, id: &str, timestamp: i64) -> Result<()> {
-    revoke_descendants(connection, id, timestamp, true)
-}
-
-fn revoke_descendants(
-    connection: &Connection,
-    id: &str,
-    timestamp: i64,
-    include_root: bool,
-) -> Result<()> {
-    let mut statement = connection.prepare(
-        "WITH RECURSIVE descendants(id) AS (
-            SELECT id FROM credentials WHERE id = ?1
-            UNION ALL SELECT c.id FROM credentials c JOIN descendants d ON c.parent_id = d.id
-         ) SELECT c.id, c.principal_id FROM credentials c JOIN descendants d ON c.id = d.id
-         WHERE c.revoked_at IS NULL AND (?2 OR c.id != ?1)",
+fn revoke(connection: &Connection, credential: &CredentialInfo, timestamp: i64) -> Result<()> {
+    connection.execute(
+        "UPDATE credentials SET revoked_at = ?2, grant_version = grant_version + 1 WHERE id = ?1",
+        (&credential.id, timestamp),
     )?;
-    let revoked = statement
-        .query_map((id, include_root), |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut principals = BTreeSet::new();
-    for (id, principal) in revoked {
-        connection.execute("UPDATE credentials SET revoked_at = ?2, grant_version = grant_version + 1 WHERE id = ?1", (id, timestamp))?;
-        principals.insert(principal);
-    }
-    for principal in principals {
-        bump_principal(connection, &principal)?;
-    }
-    Ok(())
+    bump_principal(connection, &credential.principal_id)
 }
 
 fn verifier(bearer: &str) -> [u8; 32] {
