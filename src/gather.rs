@@ -1,10 +1,5 @@
-//! Candidate generators for the lateweave pipeline.
-//!
-//! [`ExhaustiveGatherer`] hands every eligible document to the reranker, which
-//! at small scale makes the search exact MaxSim over the corpus.
-//! [`LexicalGatherer`] is Lucene BM25 over the same documents, used once the
-//! corpus exceeds the gather limit or when there is no encoder. Both consume
-//! only query text and honour the subset.
+//! [`LexicalGatherer`]: Lucene BM25 as a lateweave candidate generator. It
+//! consumes only query text and honours the subset.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -16,51 +11,6 @@ use crate::analyzer::tokens;
 
 pub const LEXICAL_K1: f32 = 1.5;
 pub const LEXICAL_B: f32 = 0.75;
-
-pub struct ExhaustiveGatherer {
-    corpus: CorpusManifest,
-    requires: Requirements,
-}
-
-impl ExhaustiveGatherer {
-    pub fn new(corpus: CorpusManifest) -> Self {
-        Self {
-            corpus,
-            requires: Requirements::new(),
-        }
-    }
-}
-
-impl CandidateGenerator for ExhaustiveGatherer {
-    fn corpus(&self) -> &CorpusManifest {
-        &self.corpus
-    }
-
-    fn requires(&self) -> &Requirements {
-        &self.requires
-    }
-
-    fn score_semantics(&self) -> &str {
-        "exhaustive"
-    }
-
-    fn gather(&self, _: &Query, limit: usize, subset: Option<&[u64]>) -> Result<Vec<Candidate>> {
-        let ids: Box<dyn Iterator<Item = u64>> = match subset {
-            Some(subset) => Box::new(subset.iter().copied()),
-            None => Box::new(0..self.corpus.document_count()),
-        };
-        Ok(ids
-            .take(limit)
-            .enumerate()
-            .map(|(rank, document_id)| Candidate {
-                document_id,
-                gather_score: 0.0,
-                gather_rank: rank,
-                provenance: "exhaustive".to_owned(),
-            })
-            .collect())
-    }
-}
 
 /// Lucene-variant BM25: `idf = ln(1 + (N - df + 0.5) / (df + 0.5))` times
 /// `tf / (tf + k1 * (1 - b + b * dl / avgdl))`, summed over query terms
@@ -252,29 +202,6 @@ mod tests {
             .iter()
             .map(|candidate| candidate.document_id)
             .collect()
-    }
-
-    #[test]
-    fn exhaustive_returns_everything_in_order() {
-        let gatherer = ExhaustiveGatherer::new(corpus());
-        let all = gatherer.gather(&Query::new("anything"), 10, None).unwrap();
-        assert_eq!(ids(&all), [0, 1, 2]);
-        assert_eq!(
-            all.iter()
-                .map(|candidate| candidate.gather_rank)
-                .collect::<Vec<_>>(),
-            [0, 1, 2]
-        );
-        assert_eq!(
-            ids(&gatherer.gather(&Query::new("x"), 2, None).unwrap()),
-            [0, 1]
-        );
-        assert_eq!(
-            ids(&gatherer
-                .gather(&Query::new("x"), 10, Some(&[0, 2]))
-                .unwrap()),
-            [0, 2]
-        );
     }
 
     #[test]

@@ -198,86 +198,6 @@ fn filters_match_latest_metadata() {
     assert!(matching(json!({"missing": 1})).is_empty());
 }
 
-#[test]
-fn index_mirror_round_trips() {
-    let (_directory, store) = open();
-    for record in ["a", "b"] {
-        put(&store, LOCAL, "text", Some(record));
-        put(&store, LOCAL, "text", Some(record));
-    }
-    assert!(store.index_documents(LOCAL).unwrap().is_empty());
-    store
-        .replace_index_documents(LOCAL, &[("b", 1), ("a", 2)], Some("fake"))
-        .unwrap();
-    let entries = store.index_documents(LOCAL).unwrap();
-    assert_eq!(
-        entries,
-        [
-            IndexEntry {
-                internal_id: 0,
-                record_id: "b".into(),
-                revision: 1
-            },
-            IndexEntry {
-                internal_id: 1,
-                record_id: "a".into(),
-                revision: 2
-            },
-        ]
-    );
-    assert_eq!(store.index_encoder(LOCAL).unwrap().as_deref(), Some("fake"));
-    store.replace_index_documents(LOCAL, &[], None).unwrap();
-    assert!(store.index_documents(LOCAL).unwrap().is_empty());
-    assert_eq!(store.index_encoder(LOCAL).unwrap(), None);
-}
-
-#[test]
-fn index_mirror_updates_shift_later_ids() {
-    let (_directory, store) = open();
-    for record in ["a", "b", "c", "d"] {
-        put(&store, LOCAL, "text", Some(record));
-    }
-    put(&store, LOCAL, "text", Some("b"));
-    let rows = |store: &Store| {
-        store
-            .index_documents(LOCAL)
-            .unwrap()
-            .into_iter()
-            .map(|entry| (entry.internal_id, entry.record_id, entry.revision))
-            .collect::<Vec<_>>()
-    };
-    store
-        .replace_index_documents(LOCAL, &[("a", 1), ("b", 1), ("c", 1), ("d", 1)], None)
-        .unwrap();
-    store
-        .update_index_documents(LOCAL, Some(1), Some(("b", 2)), Some("fake"))
-        .unwrap();
-    assert_eq!(
-        rows(&store),
-        [
-            (0, "a".into(), 1),
-            (1, "c".into(), 1),
-            (2, "d".into(), 1),
-            (3, "b".into(), 2)
-        ]
-    );
-    assert_eq!(store.index_encoder(LOCAL).unwrap().as_deref(), Some("fake"));
-    store
-        .update_index_documents(LOCAL, Some(3), None, None)
-        .unwrap();
-    store
-        .update_index_documents(LOCAL, Some(0), None, None)
-        .unwrap();
-    assert_eq!(rows(&store), [(0, "c".into(), 1), (1, "d".into(), 1)]);
-    for _ in 0..2 {
-        store
-            .update_index_documents(LOCAL, Some(0), None, None)
-            .unwrap();
-    }
-    assert!(store.index_documents(LOCAL).unwrap().is_empty());
-    assert_eq!(store.index_encoder(LOCAL).unwrap(), None);
-}
-
 struct Scoped {
     _directory: TempDir,
     store: Store,
@@ -396,7 +316,7 @@ fn visibility_and_ownership_constraints() {
 }
 
 #[test]
-fn reads_deletes_and_mirrors_are_scoped() {
+fn reads_and_deletes_are_scoped() {
     let Scoped {
         store,
         a,
@@ -409,11 +329,6 @@ fn reads_deletes_and_mirrors_are_scoped() {
     put_as(&store, &b, &bob, "bob", "same");
     put_as(&store, &b, &bob, "bob second revision", "same");
     put_as(&store, &b, &bob, "text", "only-b");
-    for scope in [&a, &b] {
-        store
-            .replace_index_documents(scope, &[("same", 1)], Some(scope))
-            .unwrap();
-    }
     assert!(matches!(
         store.get(&a, "only-b", None),
         Err(StoreError::RecordNotFound { .. })
@@ -427,15 +342,11 @@ fn reads_deletes_and_mirrors_are_scoped() {
         HashSet::from(["same".to_owned()])
     );
     store.delete(&a, "same", Some(1)).unwrap();
-    store.replace_index_documents(&a, &[], None).unwrap();
     assert!(store.live_documents(&a).unwrap().is_empty());
     assert_eq!(
         store.get(&b, "same", None).unwrap().text.as_deref(),
         Some("bob second revision")
     );
-    assert_eq!(store.index_documents(&b).unwrap().len(), 1);
-    assert_eq!(store.index_encoder(&b).unwrap(), Some(b.clone()));
-    assert_eq!(store.index_encoder(&a).unwrap(), None);
 }
 
 #[test]
@@ -458,16 +369,6 @@ fn cross_collection_references_fail_in_the_database() {
          VALUES (?1, 'only-b', 1, 'hash', 'now')",
         [&a],
     )));
-    store
-        .replace_index_documents(&a, &[("same", 1)], Some("old"))
-        .unwrap();
-    assert!(store_constraint(store.replace_index_documents(
-        &a,
-        &[("same", 2)],
-        None
-    )));
-    assert_eq!(store.index_documents(&a).unwrap().len(), 1);
-    assert_eq!(store.index_encoder(&a).unwrap().as_deref(), Some("old"));
 }
 
 fn user_version(connection: &Connection) -> i64 {

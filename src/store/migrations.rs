@@ -142,7 +142,6 @@ CREATE TABLE collection_tombstones (id TEXT PRIMARY KEY, deleted_at TEXT NOT NUL
 CREATE TRIGGER prevent_collection_resurrection BEFORE INSERT ON collections
     WHEN EXISTS(SELECT 1 FROM collection_tombstones WHERE id = NEW.id)
     BEGIN SELECT RAISE(ABORT, 'collection was deleted'); END;
-CREATE TABLE purge_jobs (collection_id TEXT PRIMARY KEY);
 CREATE TABLE records (
     collection_id TEXT NOT NULL REFERENCES collections(id),
     id TEXT NOT NULL,
@@ -171,22 +170,6 @@ CREATE TRIGGER revision_delete_version AFTER DELETE ON revisions
     BEGIN UPDATE collections SET content_version = content_version + 1 WHERE id = OLD.collection_id; END;
 CREATE TRIGGER revision_update_version AFTER UPDATE ON revisions
     BEGIN UPDATE collections SET content_version = content_version + 1 WHERE id = NEW.collection_id; END;
-CREATE TABLE index_documents (
-    collection_id TEXT NOT NULL,
-    internal_id INTEGER NOT NULL CHECK (internal_id >= 0),
-    record_id TEXT NOT NULL,
-    revision INTEGER NOT NULL,
-    PRIMARY KEY (collection_id, internal_id),
-    UNIQUE (collection_id, record_id),
-    FOREIGN KEY (collection_id, record_id, revision)
-        REFERENCES revisions(collection_id, record_id, revision)
-);
-CREATE TABLE index_state (
-    collection_id TEXT NOT NULL REFERENCES collections(id),
-    key TEXT NOT NULL,
-    value TEXT,
-    PRIMARY KEY (collection_id, key)
-);
 CREATE TABLE principal_auth_state (
     principal_id TEXT PRIMARY KEY REFERENCES principals(id),
     version INTEGER NOT NULL CHECK (version > 0)
@@ -219,12 +202,10 @@ CREATE TABLE mutations (
     payload_digest TEXT NOT NULL,
     authority TEXT NOT NULL,
     result TEXT NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('committed', 'applied')),
     created_at TEXT NOT NULL,
     target_record_id TEXT,
     UNIQUE (collection_id, principal_id, operation, idempotency_digest)
 );
-CREATE INDEX pending_mutations ON mutations(collection_id, state);
 CREATE INDEX mutations_target ON mutations(collection_id, target_record_id);
 CREATE TABLE import_targets (
     collection_id TEXT NOT NULL,

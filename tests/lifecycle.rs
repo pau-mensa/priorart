@@ -1,34 +1,17 @@
-mod common;
-
 use priorart::{
     auth::{Grant, Operation as Op, RequestContext},
     config::Settings,
-    index::collection_index_path,
     service::{DeleteOptions, Service, WriteOptions, DATABASE_FILE},
     store::{Store, StoreError, Visibility, LOCAL_COLLECTION_ID as LOCAL},
 };
-use std::{path::Path, sync::Arc};
+use std::path::Path;
 
 fn service(path: &Path) -> Service {
-    Service::new(
-        Settings {
-            data_dir: path.into(),
-            ..Default::default()
-        },
-        Some(Arc::new(common::FakeEncoder::new())),
-    )
+    Service::open(Settings {
+        data_dir: path.into(),
+        ..Default::default()
+    })
     .unwrap()
-}
-fn copy_tree(source: &Path, target: &Path) {
-    std::fs::create_dir_all(target).unwrap();
-    for entry in std::fs::read_dir(source).unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_type().unwrap().is_dir() {
-            copy_tree(&entry.path(), &target.join(entry.file_name()));
-        } else {
-            std::fs::copy(entry.path(), target.join(entry.file_name())).unwrap();
-        }
-    }
 }
 fn count(connection: &rusqlite::Connection, table: &str, collection: &str) -> i64 {
     connection
@@ -41,7 +24,7 @@ fn count(connection: &rusqlite::Connection, table: &str, collection: &str) -> i6
 }
 
 #[test]
-fn record_purge_erases_old_generations_without_recreating_on_retry() {
+fn record_purge_erases_content_without_recreating_on_retry() {
     let dir = tempfile::tempdir().unwrap();
     let service = service(dir.path());
     let caller = RequestContext::local();
@@ -65,19 +48,9 @@ fn record_purge_erases_old_generations_without_recreating_on_retry() {
         )
         .unwrap();
     assert_eq!(
-        service
-            .search(&caller, LOCAL, "secret", None, 10)
-            .unwrap()
-            .hits
-            .len(),
-        2
+        service.search(&caller, LOCAL, "secret", None, 10).unwrap()[0].id,
+        record
     );
-    let path = collection_index_path(dir.path(), LOCAL);
-    let previous: Vec<_> = std::fs::read_dir(&path)
-        .unwrap()
-        .map(|e| e.unwrap().file_name())
-        .filter(|n| n != "CURRENT")
-        .collect();
     let options = DeleteOptions {
         expected_revision: Some(1),
         idempotency_key: Some("delete-once"),
@@ -87,9 +60,6 @@ fn record_purge_erases_old_generations_without_recreating_on_retry() {
         service.delete(&caller, LOCAL, &record, options).unwrap(),
         deleted
     );
-    for name in previous {
-        assert!(!path.join(name).exists());
-    }
     let db = rusqlite::Connection::open(dir.path().join(DATABASE_FILE)).unwrap();
     assert_eq!(count(&db, "revisions", LOCAL), 1);
     let cleared: i64 = db
@@ -113,12 +83,13 @@ fn record_purge_erases_old_generations_without_recreating_on_retry() {
             }
         )
         .is_err());
-    let hits = service
-        .search(&caller, LOCAL, "text", None, 10)
-        .unwrap()
-        .hits;
+    let hits = service.search(&caller, LOCAL, "text", None, 10).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].id, "survivor");
+    assert!(service
+        .search(&caller, LOCAL, "secret", None, 10)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -168,20 +139,9 @@ fn collection_purge_revokes_only_its_grants_and_never_recreates_local() {
     assert!(service
         .delete_collection(&RequestContext::anonymous(), &public)
         .is_err());
-    let other_path = collection_index_path(dir.path(), &other);
-    let other_current = std::fs::read(other_path.join("CURRENT")).unwrap();
     service.delete_collection(&caller, &public).unwrap();
-    assert!(!collection_index_path(dir.path(), &public).exists());
     let db = rusqlite::Connection::open(store.path()).unwrap();
-    for table in [
-        "records",
-        "revisions",
-        "index_documents",
-        "index_state",
-        "credential_grants",
-        "mutations",
-        "purge_jobs",
-    ] {
+    for table in ["records", "revisions", "credential_grants", "mutations"] {
         assert_eq!(count(&db, table, &public), 0, "{table}");
     }
     assert!(service.get(&caller, &other, "same", None).is_err());
@@ -193,10 +153,6 @@ fn collection_purge_revokes_only_its_grants_and_never_recreates_local() {
             .text
             .as_deref(),
         Some("other collection")
-    );
-    assert_eq!(
-        std::fs::read(other_path.join("CURRENT")).unwrap(),
-        other_current
     );
     assert!(service.search(&fresh, &public, "public", None, 10).is_err());
     assert!(db
@@ -214,50 +170,4 @@ fn collection_purge_revokes_only_its_grants_and_never_recreates_local() {
         store.get_collection(LOCAL),
         Err(StoreError::CollectionNotFound(_))
     ));
-}
-
-#[test]
-fn restored_old_indexes_cannot_resurrect_a_purged_record() {
-    let dir = tempfile::tempdir().unwrap();
-    let backup = tempfile::tempdir().unwrap();
-    let caller = RequestContext::local();
-    let service = service(dir.path());
-    service
-        .put(
-            &caller,
-            LOCAL,
-            "secret",
-            None,
-            Some("gone"),
-            Default::default(),
-        )
-        .unwrap();
-    let path = collection_index_path(dir.path(), LOCAL);
-    copy_tree(&path, backup.path());
-    service
-        .delete(
-            &caller,
-            LOCAL,
-            "gone",
-            DeleteOptions {
-                expected_revision: Some(1),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    drop(service);
-    std::fs::remove_dir_all(&path).unwrap();
-    copy_tree(backup.path(), &path);
-    let service = self::service(dir.path());
-    assert!(service
-        .search(&caller, LOCAL, "secret", None, 10)
-        .unwrap()
-        .hits
-        .is_empty());
-    for entry in std::fs::read_dir(backup.path()).unwrap() {
-        let name = entry.unwrap().file_name();
-        if name != "CURRENT" {
-            assert!(!path.join(name).exists());
-        }
-    }
 }

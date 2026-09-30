@@ -22,9 +22,7 @@ impl Api {
             max_tokens,
             ..priorart::config::Settings::default()
         };
-        let encoder: std::sync::Arc<dyn priorart::encoder::Encoder> =
-            std::sync::Arc::new(common::FakeEncoder::with_max_tokens(max_tokens));
-        let service = priorart::service::Service::new(settings, Some(encoder)).unwrap();
+        let service = priorart::service::Service::open(settings).unwrap();
         let url = common::spawn(std::sync::Arc::new(service)).await;
         Self {
             _directory: directory,
@@ -177,8 +175,7 @@ async fn search_returns_qualified_hits_without_receipts() {
             "id",
             "metadata",
             "revision",
-            "score",
-            "score_semantics"
+            "score"
         ]
     );
     let mut top: Vec<&str> = found

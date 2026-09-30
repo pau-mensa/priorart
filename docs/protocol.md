@@ -108,11 +108,10 @@ update grant; revoked credentials fail. A put replay on a deleted target is
 rejected. Purged keyed mutations retain a key marker without the content digest
 or result; retrying that key returns `410 mutation_purged`. Replaying an older successful update never replaces a later revision.
 
-The mutation receipt is committed atomically with the content. A retry recovers
-pending index work before succeeding. Without a key the mutation still has a
-journal ID, but submitting it again is a new operation. Receipts currently have no
-expiry. The local MCP workflow does not yet expose retry keys; configurable MCP
-idempotency remains step 13.
+The mutation receipt is committed atomically with the content. Without a key the
+mutation still has a journal ID, but submitting it again is a new operation.
+Receipts currently have no expiry. The local MCP workflow does not yet expose
+retry keys.
 
 ## Read and delete
 
@@ -142,22 +141,19 @@ positive current revision, compared inside the deletion transaction. Missing
 preconditions return `428`; stale ones return `409`. Returns `204`, including a
 repeat deletion with the same last revision. Tombstones reserve IDs. An authorized
 read of a deleted record returns `410`; unknown or forbidden targets return `404`.
-Deletion purges all revisions and hashes. It removes every generation of the affected
-collection index and rebuilds from surviving records before returning success.
+Deletion purges all revisions and hashes and removes the record from the index.
 Record IDs cannot be reused.
-A failed rebuild can return an error after deletion commits; the tombstone is
-already authoritative, and retries resume recovery.
 
 `DELETE /v1/collections/{collection}` requires `admin`. It purges collection
-records, mutation receipts, index state/files, and grants.
+records, mutation receipts, and grants.
 Returns `204`; a repeated request returns the same `404` as any unavailable
 collection. Credentials lose only grants for the deleted collection; existing
 contexts carrying changed grants become stale and must authenticate again.
 Collection IDs cannot be reused, including `local`. No collection is recreated
-on startup. Interrupted filesystem cleanup resumes on restart before serving.
+on startup.
 
 These operations remove live service data, not historical backup copies or every
-residual byte on storage media. See [purge and restore rules](storage.md#purge-and-restore).
+residual byte on storage media. See [deletion](storage.md#deletion).
 
 ## Search
 
@@ -173,24 +169,21 @@ Returns:
 ```json
 {"collections": ["local"],
  "hits": [{"collection_id": "local", "id": "…", "revision": 2, "score": 12.3,
-           "score_semantics": "int8-reconstructed-approximate-full-maxsim",
            "excerpt": "…", "metadata": {"lang": "python"}}]}
 ```
 
 `collections` is required and currently must contain exactly one explicit ID.
 Empty selections, duplicates, wildcards, and multiple collections are rejected;
-there is no search-all default or partial-result fallback. Multi-collection
-retrieval/fusion is step 12.
+there is no search-all default or partial-result fallback.
 
 Queries must be nonempty and at most 16384 UTF-8 bytes. `limit` defaults to 10 and
 must be 1–100. Filters contain at most 64 scalar equalities (strings, numbers,
 booleans), combined with AND, and at most 16384 serialized bytes. Filtering occurs
 inside the authorized collection and matches latest metadata.
 
-Hits bind excerpts/metadata to the exact qualified revision. `score_semantics`
-identifies the scoring recipe; scores from different recipes are not interchangeable.
-Pipeline timing, encoder paths, and global counts are not part of this response.
-Searches persist nothing: no query, filter, result list, or receipt.
+Scores are Lucene BM25 over the collection's live records. Hits bind
+excerpts/metadata to the exact qualified revision. Searches persist nothing: no
+query, filter, result list, or receipt.
 
 ## Streaming export and import
 
@@ -198,7 +191,6 @@ Searches persist nothing: no query, filter, result list, or receipt.
 read access, even on a public collection. It streams `application/x-ndjson` with
 `Cache-Control: no-store`. Records are ordered by `(record_id, revision)` and
 include every retained revision of live records. Deleted records, credentials, grants, indexes, and private import provenance are excluded.
-Export does not load or run the encoder.
 
 Each revision is a separate line:
 
@@ -264,15 +256,13 @@ input and batch key to recover without duplicates. Never infer success solely
 from curl's exit status. Transfers do not persist bearer credentials or upload
 files, and do not include any billing check.
 
-Imports retain ordinary per-revision write-through indexing cost. Exports are
-content transfers, not database backups: they do not preserve tombstones
-or authority. Use the [restore rules](storage.md#purge-and-restore)
-for recovery of an existing service.
+Exports are content transfers, not database backups: they do not preserve
+tombstones or authority. See [backups](storage.md#backups-and-upgrades).
 
 ## Errors and health
 
 Errors have fixed messages that omit request contents, credentials, identifiers,
-SQL errors, encoder details, and paths:
+SQL errors, and paths:
 
 ```json
 {"error":{"code":"not_found","message":"requested resource is unavailable"}}
@@ -291,7 +281,7 @@ SQL errors, encoder details, and paths:
 | 422 | `validation_error` | malformed JSON/query, wrong types, missing/unknown fields |
 | 428 | `revision_required` | authorized existing mutation lacks a precondition |
 | 429 | `resource_limit` | all cached collection execution slots are pinned |
-| 503 | `unavailable` | backend/recovery failure or unsupported transport configuration |
+| 503 | `unavailable` | backend failure or unsupported transport configuration |
 
 `GET /healthz` returns only `{"status":"ok"}`. These response rules do not promise
 constant timing or hide operational side channels. Limits are per request, not a
@@ -301,5 +291,4 @@ rate limiter or hosted admission system.
 
 The bundled MCP client uses explicit `local` routes and search scope. Corrections
 and deletes require `expected_revision`. It currently
-supports the default local server only. Configurable credentials, collection
-selection, and authenticated MCP workflows remain step 13.
+supports the default local server only.

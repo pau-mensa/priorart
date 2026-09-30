@@ -138,13 +138,6 @@ pub struct RecordSummary {
     pub latest: Revision,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct IndexEntry {
-    pub internal_id: u64,
-    pub record_id: String,
-    pub revision: i64,
-}
-
 const TIMESTAMP: &[FormatItem<'_>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6]Z");
 
@@ -328,30 +321,6 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    pub(crate) fn check_delete_revision(
-        &self,
-        collection: &str,
-        record: &str,
-        expected: Option<i64>,
-    ) -> Result<()> {
-        if record_state(&self.connection, collection, record)? == RecordState::Missing {
-            return Err(record_not_found(collection, record, None));
-        }
-        check_revision(&self.connection, collection, record, expected, false)
-    }
-
-    pub(crate) fn check_put_revision(
-        &self,
-        collection: &str,
-        record: Option<&str>,
-        expected: Option<i64>,
-    ) -> Result<()> {
-        if let Some(record) = record {
-            check_revision(&self.connection, collection, record, expected, true)?;
-        }
-        Ok(())
-    }
-
     // Records.
 
     pub fn put(
@@ -502,105 +471,12 @@ impl Store {
             .collect())
     }
 
-    // Index mirror.
-
-    pub fn index_documents(&self, collection_id: &str) -> Result<Vec<IndexEntry>> {
-        let mut statement = self.connection.prepare(
-            "SELECT internal_id, record_id, revision FROM index_documents \
-             WHERE collection_id = ?1 ORDER BY internal_id",
-        )?;
-        let rows = statement.query_map([collection_id], |row| {
-            Ok(IndexEntry {
-                internal_id: row.get::<_, i64>(0)? as u64,
-                record_id: row.get(1)?,
-                revision: row.get(2)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
-
-    pub fn index_encoder(&self, collection_id: &str) -> Result<Option<String>> {
-        Ok(self
-            .connection
-            .query_row(
-                "SELECT value FROM index_state WHERE collection_id = ?1 AND key = 'encoder'",
-                [collection_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten())
-    }
-
-    /// Replaces the mirror with `rows` in internal-ID order, atomically.
-    pub fn replace_index_documents(
-        &self,
-        collection_id: &str,
-        rows: &[(&str, i64)],
-        encoder: Option<&str>,
-    ) -> Result<()> {
-        let transaction = self.write()?;
-        transaction.execute(
-            "DELETE FROM index_documents WHERE collection_id = ?1",
+    pub fn live_record_count(&self, collection_id: &str) -> Result<usize> {
+        Ok(self.connection.query_row(
+            "SELECT COUNT(*) FROM records WHERE collection_id = ?1 AND deleted_at IS NULL",
             [collection_id],
-        )?;
-        {
-            let mut insert = transaction.prepare(
-                "INSERT INTO index_documents (collection_id, internal_id, record_id, revision) \
-                 VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for (position, (record_id, revision)) in rows.iter().enumerate() {
-                insert.execute((collection_id, position as i64, record_id, revision))?;
-            }
-        }
-        set_index_encoder(&transaction, collection_id, encoder)?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    /// Applies one index write to the mirror atomically: drops `removed`,
-    /// shifting later internal IDs down by one, then appends `appended`.
-    pub fn update_index_documents(
-        &self,
-        collection_id: &str,
-        removed: Option<u64>,
-        appended: Option<(&str, i64)>,
-        encoder: Option<&str>,
-    ) -> Result<()> {
-        let transaction = self.write()?;
-        if let Some(removed) = removed {
-            let removed = removed as i64;
-            transaction.execute(
-                "DELETE FROM index_documents WHERE collection_id = ?1 AND internal_id = ?2",
-                (collection_id, removed),
-            )?;
-            // SQLite checks uniqueness row by row, so shift past every ID first.
-            let offset: i64 = transaction.query_row(
-                "SELECT coalesce(MAX(internal_id), 0) + 1 FROM index_documents \
-                 WHERE collection_id = ?1",
-                [collection_id],
-                |row| row.get(0),
-            )?;
-            transaction.execute(
-                "UPDATE index_documents SET internal_id = internal_id + ?3 \
-                 WHERE collection_id = ?1 AND internal_id > ?2",
-                (collection_id, removed, offset),
-            )?;
-            transaction.execute(
-                "UPDATE index_documents SET internal_id = internal_id - ?2 - 1 \
-                 WHERE collection_id = ?1 AND internal_id >= ?2",
-                (collection_id, offset),
-            )?;
-        }
-        if let Some((record_id, revision)) = appended {
-            transaction.execute(
-                "INSERT INTO index_documents (collection_id, internal_id, record_id, revision) \
-                 SELECT ?1, count(*), ?2, ?3 FROM index_documents WHERE collection_id = ?1",
-                (collection_id, record_id, revision),
-            )?;
-        }
-        set_index_encoder(&transaction, collection_id, encoder)?;
-        transaction.commit()?;
-        Ok(())
+            |row| row.get::<_, i64>(0),
+        )? as usize)
     }
 }
 
@@ -637,19 +513,6 @@ fn record_not_found(collection_id: &str, record_id: &str, revision: Option<i64>)
         record_id: record_id.to_owned(),
         revision,
     }
-}
-
-fn set_index_encoder(
-    connection: &Connection,
-    collection_id: &str,
-    encoder: Option<&str>,
-) -> Result<()> {
-    connection.execute(
-        "INSERT INTO index_state (collection_id, key, value) VALUES (?1, 'encoder', ?2) \
-         ON CONFLICT (collection_id, key) DO UPDATE SET value = excluded.value",
-        (collection_id, encoder),
-    )?;
-    Ok(())
 }
 
 fn check_revision(

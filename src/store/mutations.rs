@@ -78,7 +78,7 @@ impl Store {
         let (value, target_record) = change(&transaction)?;
         let mutation_id = new_id();
         transaction.execute(
-            "INSERT INTO mutations VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            "INSERT INTO mutations VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             rusqlite::params![
                 mutation_id,
                 intent.collection,
@@ -88,24 +88,12 @@ impl Store {
                 intent.payload,
                 intent.authority,
                 serde_json::to_string(&value).map_err(|_| StoreError::Journal)?,
-                "committed",
                 now(),
                 target_record
             ],
         )?;
-        crate::fault::check("before_record_commit")?;
         transaction.commit()?;
         Ok(Mutation { mutation_id, value })
-    }
-
-    /// Called only after an index has been reconciled and its generation activated.
-    pub(crate) fn complete_mutations(&self, collection: &str) -> Result<()> {
-        self.connection.execute("UPDATE mutations SET state = 'applied' WHERE collection_id = ?1 AND state = 'committed'", [collection])?;
-        Ok(())
-    }
-
-    pub(crate) fn has_pending_mutations(&self, collection: &str) -> Result<bool> {
-        Ok(self.connection.query_row("SELECT EXISTS(SELECT 1 FROM mutations WHERE collection_id = ?1 AND state = 'committed')", [collection], |r| r.get(0))?)
     }
 }
 

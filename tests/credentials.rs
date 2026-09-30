@@ -267,13 +267,10 @@ fn failed_rotation_and_grant_replacement_roll_back() {
 fn service_context_revalidation_observes_local_administration() {
     let (directory, store) = setup();
     let (id, secret) = issue(&store, &[Operation::Read]);
-    let service = Service::new(
-        Settings {
-            data_dir: directory.path().to_owned(),
-            ..Settings::default()
-        },
-        None,
-    )
+    let service = Service::open(Settings {
+        data_dir: directory.path().to_owned(),
+        ..Settings::default()
+    })
     .unwrap();
     let context = service.authenticate(&secret).unwrap();
     service.validate_context(&context).unwrap();

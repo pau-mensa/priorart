@@ -1,9 +1,8 @@
 //! MCP transport: a thin stdio server forwarding to a running priorart HTTP server.
 //!
-//! A client rather than an embedded service: the index write lock is
-//! process-local and the encoder is expensive to load, so every agent session
-//! must talk to the one `priorart serve` process instead of opening the data
-//! directory itself. Set `PRIORART_URL` to that server.
+//! A client rather than an embedded service: one server owns the data directory
+//! and its in-memory indexes, so every agent session must talk to the one
+//! `priorart serve` process instead of opening the data directory itself. Set `PRIORART_URL` to that server.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -92,7 +91,6 @@ pub struct Hit {
     id: String,
     revision: i64,
     score: f64,
-    score_semantics: String,
     excerpt: String,
     metadata: Option<Map<String, Value>>,
 }

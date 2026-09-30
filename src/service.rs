@@ -3,11 +3,11 @@
 //! Every content operation requires an explicit request context and collection.
 //! Revision preconditions are checked again inside the storage transaction.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::store::mutations::{Intent, Mutation};
-use lateweave::SearchRequest;
+use lateweave::{Query, SearchRequest};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -16,9 +16,8 @@ use sha2::{Digest, Sha256};
 use crate::analyzer::tokens;
 use crate::auth::{AuthError, Operation, RequestContext};
 use crate::config::Settings;
-use crate::encoder::{load_encoder, Encoder, EncoderError};
 use crate::excerpt::{excerpt, DEFAULT_WIDTH};
-use crate::index::{CollectionIndexManager, IndexError};
+use crate::index::{Index, IndexError};
 use crate::policy::{self, PolicyError};
 use crate::store::{Metadata, RecordSummary, Revision, Store, StoreError, Visibility};
 
@@ -61,11 +60,7 @@ pub enum OpenError {
     #[error(transparent)]
     Config(#[from] crate::config::ConfigError),
     #[error(transparent)]
-    Encoder(#[from] EncoderError),
-    #[error(transparent)]
     Store(#[from] StoreError),
-    #[error(transparent)]
-    Index(#[from] IndexError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -82,30 +77,29 @@ pub struct Hit {
     pub id: String,
     pub revision: i64,
     pub score: f64,
-    pub score_semantics: String,
     pub excerpt: String,
     pub metadata: Option<Metadata>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct SearchOutcome {
-    pub hits: Vec<Hit>,
-    /// Empty when there was nothing to search.
-    pub timings: BTreeMap<String, f64>,
-    pub gatherer: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Health {
     pub status: &'static str,
     pub document_count: usize,
-    pub encoder: Option<String>,
-    pub gather_limit: usize,
 }
 
+/// A cached collection: its own connection, and its index once a search needs it.
 struct State {
     store: Store,
-    indexes: CollectionIndexManager,
+    index: Option<Index>,
+}
+
+impl State {
+    fn index(&mut self, collection: &str) -> Result<&mut Index> {
+        if self.index.is_none() {
+            self.index = Some(Index::load(&self.store, collection)?);
+        }
+        Ok(self.index.as_mut().expect("loaded above"))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -124,9 +118,7 @@ pub struct DeleteOptions<'a> {
 
 pub struct Service {
     settings: Settings,
-    encoder_name: Option<String>,
     states: Mutex<States>,
-    encoder: Option<Arc<dyn Encoder>>,
     // Declared last so collection state is dropped before releasing ownership.
     _owner: crate::ownership::DirectoryOwner,
 }
@@ -141,40 +133,9 @@ impl Service {
     pub fn open(settings: Settings) -> Result<Self, OpenError> {
         settings.validate()?;
         let owner = crate::ownership::DirectoryOwner::acquire(&settings.data_dir)?;
-        let encoder = load_encoder(&settings)?;
-        Self::owned(settings, encoder, owner)
-    }
-
-    pub fn new(settings: Settings, encoder: Option<Arc<dyn Encoder>>) -> Result<Self, OpenError> {
-        settings.validate()?;
-        let owner = crate::ownership::DirectoryOwner::acquire(&settings.data_dir)?;
-        Self::owned(settings, encoder, owner)
-    }
-
-    fn owned(
-        settings: Settings,
-        encoder: Option<Arc<dyn Encoder>>,
-        owner: crate::ownership::DirectoryOwner,
-    ) -> Result<Self, OpenError> {
-        let store = Store::open(settings.data_dir.join(DATABASE_FILE))?;
-        let mut after = String::new();
-        loop {
-            let pending = store.pending_purges(&after)?;
-            if pending.is_empty() {
-                break;
-            }
-            for collection in pending {
-                crate::index::purge_index_files(&settings.data_dir, &store, &collection)?;
-                after = collection;
-            }
-        }
-        let encoder_name = encoder
-            .as_ref()
-            .map(|e| e.representation().encoder().to_owned());
+        Store::open(settings.data_dir.join(DATABASE_FILE))?;
         Ok(Self {
             settings,
-            encoder_name,
-            encoder,
             states: Mutex::default(),
             _owner: owner,
         })
@@ -225,14 +186,9 @@ impl Service {
                 let id = states.lru.remove(idle).expect("existing LRU entry");
                 states.loaded.remove(&id);
             }
-            let indexes = CollectionIndexManager::new(
-                &self.settings.data_dir,
-                self.encoder.clone(),
-                std::num::NonZeroUsize::new(1).unwrap(),
-            );
             states.loaded.insert(
                 collection.into(),
-                Arc::new(Mutex::new(State { store, indexes })),
+                Arc::new(Mutex::new(State { store, index: None })),
             );
         }
         states.lru.retain(|id| id != collection);
@@ -240,13 +196,10 @@ impl Service {
         Ok(states.loaded[collection].clone())
     }
 
-    /// Text beyond `PRIORART_MAX_TOKENS` is cut before storing, so stored and
-    /// indexed text match. Lexical-only operation counts analyzer terms.
-    fn cutoff<'a>(&self, text: &'a str) -> Result<&'a str> {
-        match &self.encoder {
-            Some(encoder) => Ok(encoder.fit_document(text).map_err(IndexError::from)?),
-            None => Ok(crate::analyzer::prefix(text, self.settings.max_tokens)),
-        }
+    /// Text beyond `PRIORART_MAX_TOKENS` analyzer terms is cut before storing,
+    /// so stored and indexed text match.
+    fn cutoff<'a>(&self, text: &'a str) -> &'a str {
+        crate::analyzer::prefix(text, self.settings.max_tokens)
     }
 
     pub fn put(
@@ -260,7 +213,7 @@ impl Service {
     ) -> Result<Mutation<(String, i64, bool)>> {
         let handle = self.state(context, collection_id, Operation::Contribute)?;
         let mut state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
-        let State { store, indexes } = &mut *state;
+        let State { store, index } = &mut *state;
         let intent = intent(
             context,
             collection_id,
@@ -292,11 +245,8 @@ impl Service {
             };
             policy::mutation(store, context, collection_id, &result.value.0, operation)?;
             store.get(collection_id, &result.value.0, None)?;
-            indexes.get(store, collection_id)?;
-            policy::validate(store, context)?;
             return Ok(result);
         }
-        authorize_put(store, context, collection_id, record_id, options)?;
         if options.expected_revision.is_some_and(|r| r < 0)
             || (record_id.is_none() && options.expected_revision.is_some_and(|r| r > 0))
         {
@@ -309,15 +259,9 @@ impl Service {
         if record_id.is_some_and(|record_id| !is_record_id(record_id)) {
             return invalid(RECORD_ID_RULE);
         }
-        let stored = self.cutoff(text)?;
+        authorize_put(store, context, collection_id, record_id, options)?;
+        let stored = self.cutoff(text);
         let truncated = stored.len() < text.len();
-        store.check_put_revision(collection_id, record_id, options.expected_revision)?;
-        let index = indexes.get(store, collection_id);
-        authorize_put(store, context, collection_id, record_id, options)?;
-        let index = index?;
-        let encoded = index.encode(stored);
-        authorize_put(store, context, collection_id, record_id, options)?;
-        let encoded = encoded?;
         let created = store.commit_put(
             &intent,
             stored,
@@ -326,11 +270,9 @@ impl Service {
             record_id,
             options.expected_revision,
         )?;
-        crate::fault::check("after_record_commit").map_err(IndexError::from)?;
-        let result = index.upsert(store, &created.value.0, created.value.1, stored, encoded);
-        policy::validate(store, context)?;
-        result?;
-        crate::fault::check("after_mutation_complete").map_err(IndexError::from)?;
+        if let Some(index) = index {
+            index.upsert(&created.value.0, created.value.1, stored);
+        }
         Ok(created)
     }
 
@@ -343,10 +285,7 @@ impl Service {
     ) -> Result<Revision> {
         let handle = self.state(context, collection_id, Operation::Read)?;
         let state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
-        policy::collection(&state.store, context, collection_id, Operation::Read)?;
-        let result = state.store.get(collection_id, record_id, revision);
-        policy::collection(&state.store, context, collection_id, Operation::Read)?;
-        Ok(result?)
+        Ok(state.store.get(collection_id, record_id, revision)?)
     }
 
     pub fn delete(
@@ -358,7 +297,7 @@ impl Service {
     ) -> Result<Mutation<()>> {
         let handle = self.state(context, collection_id, Operation::Delete)?;
         let mut state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
-        let State { store, indexes } = &mut *state;
+        let State { store, index } = &mut *state;
         policy::mutation(store, context, collection_id, record_id, Operation::Delete)?;
         let intent = intent(
             context,
@@ -369,32 +308,25 @@ impl Service {
             "delete",
         )?;
         if let Some((result, _)) = store.replay::<()>(&intent)? {
-            indexes.get(store, collection_id)?;
-            policy::validate(store, context)?;
             return Ok(result);
         }
         if options.expected_revision.is_some_and(|r| r <= 0) {
             return invalid("invalid revision precondition");
         }
-        store.check_delete_revision(collection_id, record_id, options.expected_revision)?;
-        policy::mutation(store, context, collection_id, record_id, Operation::Delete)?;
         let committed = store.commit_delete(&intent, record_id, options.expected_revision)?;
-        crate::fault::check("after_record_commit").map_err(IndexError::from)?;
-        indexes.get(store, collection_id)?;
-        policy::validate(store, context)?;
-        store.complete_mutations(collection_id)?;
-        crate::fault::check("after_mutation_complete").map_err(IndexError::from)?;
+        if let Some(index) = index {
+            index.remove(record_id);
+        }
         Ok(committed)
     }
 
     pub fn delete_collection(&self, context: &RequestContext, collection: &str) -> Result<()> {
         let handle = self.state(context, collection, Operation::Admin)?;
-        let mut state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
-        let State { store, indexes } = &mut *state;
-        policy::collection(store, context, collection, Operation::Admin)?;
-        store.purge_collection(collection)?;
-        crate::fault::check("after_collection_purge_commit").map_err(IndexError::from)?;
-        indexes.finish_purge(store, collection)?;
+        let state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
+        state.store.purge_collection(collection)?;
+        let mut states = self.states.lock().map_err(|_| ServiceError::Poisoned)?;
+        states.loaded.remove(collection);
+        states.lru.retain(|id| id != collection);
         Ok(())
     }
 
@@ -405,11 +337,9 @@ impl Service {
         text: &str,
         filters: Option<&Metadata>,
         limit: i64,
-    ) -> Result<SearchOutcome> {
+    ) -> Result<Vec<Hit>> {
         let handle = self.state(context, collection_id, Operation::Read)?;
         let mut state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
-        let State { store, indexes } = &mut *state;
-        policy::collection(store, context, collection_id, Operation::Read)?;
         if text.trim().is_empty() {
             return invalid("query text must be a non-empty string");
         }
@@ -430,60 +360,41 @@ impl Service {
             }
         }
         let filters = filters.filter(|filters| !filters.is_empty());
-
-        let index = indexes.get(store, collection_id);
-        policy::collection(store, context, collection_id, Operation::Read)?;
-        let index = index?;
         let subset = match filters {
             Some(filters) => {
                 let matching: HashSet<String> =
-                    store.matching_record_ids(collection_id, filters)?;
-                Some(index.internal_ids(&matching))
+                    state.store.matching_record_ids(collection_id, filters)?;
+                Some(state.index(collection_id)?.internal_ids(&matching))
             }
             None => None,
         };
+        let index = state.index(collection_id)?;
         let eligible = subset.as_ref().map_or(index.document_count(), Vec::len);
-        let mut hits = Vec::new();
-        let mut timings = BTreeMap::new();
-        let mut gatherer = "none".to_owned();
-        if eligible > 0 {
-            let gather_limit = self.settings.gather_limit.max(limit);
-            let pipeline = index.pipeline(eligible, gather_limit)?;
-            let mut request = SearchRequest::new(gather_limit, limit);
-            if let Some(subset) = &subset {
-                request = request.with_subset(subset);
-            }
-            let result = pipeline.search(&index.query(text), &request);
-            policy::collection(store, context, collection_id, Operation::Read)?;
-            let result = result.map_err(IndexError::from)?;
-            gatherer = pipeline
-                .gatherer()
-                .score_semantics()
-                .split('-')
-                .next()
-                .unwrap_or_default()
-                .to_owned();
-            timings.insert(
-                "gather_seconds".to_owned(),
-                result.timings.gather.as_secs_f64(),
-            );
-            timings.insert(
-                "rerank_seconds".to_owned(),
-                result.timings.rerank.as_secs_f64(),
-            );
-            timings.insert(
-                "total_seconds".to_owned(),
-                result.timings.total.as_secs_f64(),
-            );
-            let query_tokens = tokens(text);
-            for ranked in &result.documents {
-                let position = ranked.document_id as usize;
-                let revision = store.get(
-                    collection_id,
-                    &index.record_ids()[position],
-                    Some(index.revisions()[position]),
-                )?;
-                hits.push(Hit {
+        if eligible == 0 {
+            return Ok(Vec::new());
+        }
+        let mut request = SearchRequest::new(limit, limit);
+        if let Some(subset) = &subset {
+            request = request.with_subset(subset);
+        }
+        let result = index
+            .pipeline()?
+            .search(&Query::new(text), &request)
+            .map_err(IndexError::from)?;
+        let documents: Vec<(String, i64, f32)> = result
+            .documents
+            .iter()
+            .map(|ranked| {
+                let (id, revision) = index.document(ranked.document_id);
+                (id.to_owned(), revision, ranked.score)
+            })
+            .collect();
+        let query_tokens = tokens(text);
+        documents
+            .into_iter()
+            .map(|(id, revision, score)| {
+                let revision = state.store.get(collection_id, &id, Some(revision))?;
+                Ok(Hit {
                     excerpt: excerpt(
                         revision.text.as_deref().unwrap_or_default(),
                         &query_tokens,
@@ -492,18 +403,11 @@ impl Service {
                     collection_id: revision.collection_id,
                     id: revision.record_id,
                     revision: revision.revision,
-                    score: f64::from(ranked.score),
-                    score_semantics: result.diagnostics.score_semantics.clone(),
+                    score: f64::from(score),
                     metadata: revision.metadata,
-                });
-            }
-        }
-        policy::collection(store, context, collection_id, Operation::Read)?;
-        Ok(SearchOutcome {
-            hits,
-            timings,
-            gatherer,
-        })
+                })
+            })
+            .collect()
     }
 
     pub fn collection(
@@ -563,20 +467,13 @@ impl Service {
         Ok(result)
     }
 
-    /// Scoped diagnostics require admin, including before index loading/recovery.
+    /// Scoped diagnostics require admin.
     pub fn health(&self, context: &RequestContext, collection_id: &str) -> Result<Health> {
-        let handle = self.state(context, collection_id, Operation::Admin)?;
-        let mut state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
-        let State { store, indexes } = &mut *state;
-        policy::collection(store, context, collection_id, Operation::Admin)?;
-        let index = indexes.get(store, collection_id);
-        policy::collection(store, context, collection_id, Operation::Admin)?;
-        let document_count = index?.document_count();
+        let store = self.connect()?;
+        policy::collection(&store, context, collection_id, Operation::Admin)?;
         Ok(Health {
             status: "ok",
-            document_count,
-            encoder: self.encoder_name.clone(),
-            gather_limit: self.settings.gather_limit,
+            document_count: store.live_record_count(collection_id)?,
         })
     }
 }
@@ -680,6 +577,3 @@ fn intent<'a>(
         authority,
     })
 }
-
-#[cfg(test)]
-mod recovery_tests;

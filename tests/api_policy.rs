@@ -31,7 +31,6 @@ struct Api {
     bob: String,
     alice_key: String,
     bob_key: String,
-    encoder: Arc<common::FakeEncoder>,
 }
 impl Api {
     async fn start() -> Self {
@@ -89,15 +88,11 @@ impl Api {
                 .unwrap();
             store.delete(c, "gone", Some(1)).unwrap();
         }
-        let encoder = Arc::new(common::FakeEncoder::new());
-        let service = Service::new(
-            Settings {
-                data_dir: dir.path().to_owned(),
-                mode: ServerMode::Authenticated,
-                ..Settings::default()
-            },
-            Some(encoder.clone()),
-        )
+        let service = Service::open(Settings {
+            data_dir: dir.path().to_owned(),
+            mode: ServerMode::Authenticated,
+            ..Settings::default()
+        })
         .unwrap();
         let url = common::spawn(Arc::new(service)).await;
         Self {
@@ -112,7 +107,6 @@ impl Api {
             bob,
             alice_key,
             bob_key,
-            encoder,
         }
     }
     async fn request(
@@ -194,7 +188,6 @@ async fn scope_is_required_and_forbidden_objects_are_indistinguishable() {
         );
     }
     assert_eq!(hidden.0, StatusCode::NOT_FOUND);
-    assert_eq!(api.encoder.calls(), 0);
     for collections in [
         json!([]),
         json!([api.a, api.b]),
@@ -342,7 +335,6 @@ async fn collection_discovery_and_diagnostics_respect_independent_grants() {
     let reader = api.issue(&api.alice, vec![Grant::new(&api.a, Op::Read)]);
     let path = format!("/v1/collections/{}/diagnostics", api.a);
     assert_eq!(api.get(&path, Some(&reader)).await.0, StatusCode::NOT_FOUND);
-    assert_eq!(api.encoder.calls(), 0);
     let admin = api.issue(&api.alice, vec![Grant::new(&api.a, Op::Admin)]);
     assert_eq!(
         api.get(&format!("/v1/collections/{}", api.a), Some(&admin))
@@ -452,7 +444,6 @@ async fn concurrent_updates_compare_revisions_and_delete_requires_current_revisi
         .0,
         StatusCode::CONFLICT
     );
-    assert_eq!(api.encoder.calls(), 0);
     let (left, right) = tokio::join!(
         api.post(
             &records,
@@ -582,7 +573,6 @@ async fn input_limits_and_errors_do_not_reflect_payloads_or_credentials() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(api.encoder.calls(), 0);
     assert!(!api.dir.path().join("indexes").exists());
 }
 
@@ -626,19 +616,6 @@ async fn expiry_revocation_and_backend_failures_have_safe_responses() {
     assert_eq!(
         api.get(&path, Some(&api.alice_key)).await.0,
         StatusCode::UNAUTHORIZED
-    );
-    api.encoder.set_failing(true);
-    let failure = api
-        .post(
-            "/v1/search",
-            Some(&api.bob_key),
-            json!({"collections": [api.b], "text": "private query sentinel"}),
-        )
-        .await;
-    assert_eq!(failure.0, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        failure.1,
-        json!({"error": {"code": "unavailable", "message": "service is unavailable"}})
     );
     assert_eq!(api.get("/healthz", None).await.1, json!({"status": "ok"}));
 }
@@ -774,18 +751,16 @@ async fn concurrent_retries_return_one_mutation_and_conflicting_payloads_fail() 
         StatusCode::GONE
     );
     let connection = rusqlite::Connection::open(api.dir.path().join(DATABASE_FILE)).unwrap();
-    let journal: String = connection.query_row("SELECT group_concat(idempotency_digest || payload_digest || result || state) FROM mutations", [], |r| r.get(0)).unwrap();
-    for secret in ["private mutation sentinel", "create-once", &api.alice_key] {
-        assert!(!journal.contains(secret));
-    }
-    let pending: i64 = connection
+    let journal: String = connection
         .query_row(
-            "SELECT COUNT(*) FROM mutations WHERE state = 'committed'",
+            "SELECT group_concat(idempotency_digest || payload_digest || result) FROM mutations",
             [],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(pending, 0);
+    for secret in ["private mutation sentinel", "create-once", &api.alice_key] {
+        assert!(!journal.contains(secret));
+    }
 }
 
 #[tokio::test]

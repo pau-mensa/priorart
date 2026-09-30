@@ -18,13 +18,11 @@ protocol change.
   schema.
 - **Raw text queries.** Describe the current problem, context, observations,
   and failed attempts; get ranked references with query-aware excerpts.
-- **Late-interaction retrieval** with [lateweave](https://github.com/pau-mensa/lateweave)
-  and [mLateOn](https://huggingface.co/lightonai/mLateOn) on ONNX
-  Runtime (no torch): exact MaxSim over the whole corpus while it is small,
-  BM25 candidates plus MaxSim rerank once it exceeds the gather limit. Without
-  a model it runs lexical-only.
-- **Single directory of state.** One SQLite file plus a memory-mapped int8
-  vector store. Revisions are kept; deletes remove text and keep a tombstone.
+- **BM25 retrieval** (Lucene variant) through a
+  [lateweave](https://github.com/pau-mensa/lateweave) search pipeline. Each
+  collection's index lives in memory and is rebuilt from SQLite when needed.
+- **One file of state.** A single SQLite database. Revisions are kept; deletes
+  remove text and keep a tombstone.
 - **One binary.** Written in Rust; the HTTP server and the MCP client ship in
   the same `priorart` executable.
 
@@ -35,21 +33,8 @@ dependency, so no sibling checkout is required.
 
 ```bash
 cargo install --path .        # or: cargo build --release
-priorart serve                # lexical-only, http://127.0.0.1:8000
+priorart serve                # http://127.0.0.1:8000
 ```
-
-With the encoder:
-
-```bash
-PRIORART_ENCODER=lightonai/mLateOn priorart serve
-```
-
-The default `onnx` feature runs the official mLateOn ONNX export on CPU
-through ONNX Runtime (the runtime library is downloaded at build time). The
-first start downloads about 320 MB (`model_int8.onnx` plus tokenizer) into the
-Hugging Face cache and re-encodes every stored record; later starts reuse the
-vector store. Set `PRIORART_ENCODER_FILE=model.onnx` for the FP32 graph. `cargo build --no-default-features` produces a lexical-only binary
-without ONNX Runtime; configuring an encoder in that build is a startup error.
 
 ## Quickstart
 
@@ -97,23 +82,18 @@ Or in a project's `.mcp.json`:
 }
 ```
 
-The MCP process is deliberately a client, not an embedded store: the index
-write lock is per process and the encoder is expensive to load, so every agent
-session must go through the one server.
+The MCP process is deliberately a client, not an embedded store: one server owns
+the data directory and its in-memory indexes, so every agent session must go
+through it.
 
 ## Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `PRIORART_MODE` | `local` | `local` identity or `authenticated` header access; both loopback-only; `hosted` is disabled |
-| `PRIORART_DATA_DIR` | `./data` | SQLite file and vector store location |
-| `PRIORART_ENCODER` | `none` | Hub id or local directory of a pylate-onnx-export artifact, or `none` for lexical-only |
-| `PRIORART_ENCODER_FILE` | `model_int8.onnx` | which ONNX graph in that repository to load |
-| `PRIORART_ENCODER_REVISION` | `main` | Hub revision, recorded in the vector store's representation |
-| `PRIORART_ENCODER_THREADS` | auto | ONNX Runtime intra-op threads |
-| `PRIORART_GATHER_LIMIT` | `500` | exhaustive MaxSim up to this many eligible records, BM25 candidates beyond |
-| `PRIORART_MAX_LOADED_INDEXES` | `8` | cached/active collection states and indexes; idle LRU eviction, busy admission returns 429 |
-| `PRIORART_MAX_TOKENS` | `8192` | document token cutoff; longer text is truncated before storing; must not exceed the model's document length |
+| `PRIORART_DATA_DIR` | `./data` | SQLite database location |
+| `PRIORART_MAX_LOADED_INDEXES` | `8` | cached collections and their in-memory indexes; idle LRU eviction, busy admission returns 429 |
+| `PRIORART_MAX_TOKENS` | `8192` | document cutoff in analyzer terms; longer text is truncated before storing |
 | `PRIORART_HOST` / `PRIORART_PORT` | `127.0.0.1` / `8000` | loopback bind address |
 
 ## Local credentials
@@ -128,11 +108,11 @@ Send credentials only in `Authorization: Bearer …`; invalid supplied keys alwa
 The default local mode grants requests without credentials access to `local` only.
 `priorart admin create-collection` provisions a restricted collection; add
 `--visibility public` for an explicitly public collection. The bundled MCP client
-currently targets local mode; configurable authenticated MCP access is step 13.
+currently targets local mode.
 
 ## Limitations of this version
 
-For database upgrades and recovery behavior, see [storage versions](docs/storage.md).
+For database upgrades and backups, see [storage](docs/storage.md).
 
 - Hosted mode is disabled. Local and authenticated HTTP modes are loopback-only;
   do not expose them through a proxy. Per-request limits exist, but rate limiting,
@@ -142,16 +122,11 @@ For database upgrades and recovery behavior, see [storage versions](docs/storage
   unencrypted.
 - One indexed view per record. Text beyond `PRIORART_MAX_TOKENS` is truncated
   before storing, so stored and indexed text match; there is no chunking.
-  The cutoff counts the encoder's tokenizer tokens, special and prefix tokens
-  included; lexical-only mode counts analyzer terms instead.
-  Each stored token is one int8 vector: a record at the 8192-token cutoff adds
-  about 1.1 MB to its collection's vector store with mLateOn.
-- One server owns each data directory. Writes index synchronously under a
+  The cutoff counts the analyzer's terms (casefolded `\w+` runs).
+- One server owns each data directory. Writes update the in-memory index under a
   per-collection lock; different collections can run concurrently within capacity.
-- Record mutations use a durable journal and atomic index-generation activation.
-  HTTP retry keys avoid duplicate mutations after lost responses or recovery.
-  Staging currently copies vector files, adding disk I/O proportional to index size.
-  Deletion purges all affected index generations, then rebuilds surviving records. Backups and physical storage erasure are separate.
+- Record mutations are journaled in SQLite; HTTP retry keys avoid duplicate
+  mutations after lost responses. Backups and physical storage erasure are separate.
 - Searches persist nothing: no query, filter, or result list.
 
 Collection revisions can be streamed through the [export/import API](docs/protocol.md#streaming-export-and-import).

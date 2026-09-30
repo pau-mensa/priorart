@@ -2,11 +2,7 @@ use priorart::auth::RequestContext;
 use priorart::service::WriteOptions;
 mod common;
 
-use std::sync::Arc;
-
-use common::FakeEncoder;
 use priorart::config::Settings;
-use priorart::encoder::Encoder;
 use priorart::index::Index;
 use priorart::service::{Service, ServiceError};
 use priorart::store::{
@@ -44,13 +40,9 @@ fn settings(directory: &TempDir) -> Settings {
     }
 }
 
-fn fake() -> Option<Arc<dyn Encoder>> {
-    Some(Arc::new(FakeEncoder::new()))
-}
-
 fn seeded() -> (TempDir, Service) {
     let directory = tempfile::tempdir().unwrap();
-    let service = Service::new(settings(&directory), fake()).unwrap();
+    let service = Service::open(settings(&directory)).unwrap();
     for (record, text) in DOCS {
         let tags = metadata(json!({"kind": "fix", "topic": record}));
         service
@@ -74,25 +66,17 @@ fn invalid<T: std::fmt::Debug>(result: Result<T, ServiceError>) -> bool {
 #[test]
 fn put_and_search() {
     let (_directory, service) = seeded();
-    let outcome = service
+    let hits = service
         .search(&CALLER, LOCAL, "worker never reached barrier", None, 10)
         .unwrap();
-    let hit = &outcome.hits[0];
+    let hit = &hits[0];
     assert_eq!((hit.id.as_str(), hit.revision), ("nccl", 1));
     assert_eq!(hit.collection_id, LOCAL_COLLECTION_ID);
     assert_eq!(
         hit.metadata,
         Some(metadata(json!({"kind": "fix", "topic": "nccl"})))
     );
-    assert_eq!(
-        hit.score_semantics,
-        "int8-reconstructed-approximate-full-maxsim"
-    );
-    assert_eq!(outcome.gatherer, "exhaustive");
     assert!(hit.excerpt.contains("barrier"));
-    for key in ["gather_seconds", "rerank_seconds", "total_seconds"] {
-        assert!(outcome.timings.contains_key(key));
-    }
 }
 
 #[test]
@@ -116,10 +100,7 @@ fn an_update_supersedes() {
     let outcome = service
         .search(&CALLER, LOCAL, "borrow checker lifetime", None, 10)
         .unwrap();
-    assert_eq!(
-        (outcome.hits[0].id.as_str(), outcome.hits[0].revision),
-        ("nccl", 2)
-    );
+    assert_eq!((outcome[0].id.as_str(), outcome[0].revision), ("nccl", 2));
     assert!(service
         .get(&CALLER, LOCAL, "nccl", None)
         .unwrap()
@@ -151,7 +132,7 @@ fn delete_hides() {
     let outcome = service
         .search(&CALLER, LOCAL, "worker never reached barrier", None, 10)
         .unwrap();
-    assert!(outcome.hits.iter().all(|hit| hit.id != "nccl"));
+    assert!(outcome.iter().all(|hit| hit.id != "nccl"));
     assert!(matches!(
         service.get(&CALLER, LOCAL, "nccl", None),
         Err(ServiceError::Store(StoreError::RecordDeleted { .. }))
@@ -190,7 +171,6 @@ fn filters_restrict() {
         .unwrap();
     assert_eq!(
         outcome
-            .hits
             .iter()
             .map(|hit| hit.id.as_str())
             .collect::<Vec<_>>(),
@@ -200,93 +180,16 @@ fn filters_restrict() {
     assert!(service
         .search(&CALLER, LOCAL, "error", Some(&nothing), 10)
         .unwrap()
-        .hits
         .is_empty());
 }
 
 #[test]
-fn the_gather_limit_switches_to_bm25() {
+fn truncation_counts_analyzer_terms() {
     let directory = tempfile::tempdir().unwrap();
-    let service = Service::new(
-        Settings {
-            gather_limit: 2,
-            ..settings(&directory)
-        },
-        fake(),
-    )
-    .unwrap();
-    for (record, text) in DOCS {
-        service
-            .put(
-                &CALLER,
-                LOCAL,
-                text,
-                None,
-                Some(record),
-                WriteOptions::default(),
-            )
-            .unwrap();
-    }
-    let outcome = service
-        .search(&CALLER, LOCAL, "worker never reached barrier", None, 1)
-        .unwrap();
-    assert_eq!(outcome.gatherer, "bm25");
-    assert_eq!(
-        outcome
-            .hits
-            .iter()
-            .map(|hit| hit.id.as_str())
-            .collect::<Vec<_>>(),
-        ["nccl"]
-    );
-    assert!(!service
-        .search(&CALLER, LOCAL, "worker never reached barrier", None, 3)
-        .unwrap()
-        .hits
-        .is_empty());
-}
-
-#[test]
-fn lexical_only_mode() {
-    let directory = tempfile::tempdir().unwrap();
-    let service = Service::new(settings(&directory), None).unwrap();
-    service
-        .put(
-            &CALLER,
-            LOCAL,
-            DOCS[0].1,
-            None,
-            Some("cuda"),
-            WriteOptions::default(),
-        )
-        .unwrap();
-    service
-        .put(
-            &CALLER,
-            LOCAL,
-            DOCS[2].1,
-            None,
-            Some("nccl"),
-            WriteOptions::default(),
-        )
-        .unwrap();
-    let outcome = service.search(&CALLER, LOCAL, "barrier", None, 10).unwrap();
-    assert_eq!(outcome.hits[0].id, "nccl");
-    assert_eq!(outcome.hits[0].score_semantics, "bm25-lucene");
-    assert_eq!(outcome.gatherer, "bm25");
-    assert_eq!(service.health(&CALLER, LOCAL).unwrap().encoder, None);
-}
-
-#[test]
-fn lexical_only_truncation_counts_analyzer_terms() {
-    let directory = tempfile::tempdir().unwrap();
-    let service = Service::new(
-        Settings {
-            max_tokens: 3,
-            ..settings(&directory)
-        },
-        None,
-    )
+    let service = Service::open(Settings {
+        max_tokens: 3,
+        ..settings(&directory)
+    })
     .unwrap();
     let options = WriteOptions {
         idempotency_key: Some("retry"),
@@ -306,14 +209,9 @@ fn lexical_only_truncation_counts_analyzer_terms() {
     assert!(service
         .search(&CALLER, LOCAL, "resume", None, 10)
         .unwrap()
-        .hits
         .is_empty());
     assert_eq!(
-        service
-            .search(&CALLER, LOCAL, "naive", None, 10)
-            .unwrap()
-            .hits[0]
-            .id,
+        service.search(&CALLER, LOCAL, "naive", None, 10).unwrap()[0].id,
         "long"
     );
     let exact = service
@@ -333,15 +231,64 @@ fn lexical_only_truncation_counts_analyzer_terms() {
 }
 
 #[test]
+fn a_loaded_index_follows_later_writes() {
+    let (_directory, service) = seeded();
+    let ids = |query: &str| -> Vec<String> {
+        service
+            .search(&CALLER, LOCAL, query, None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.id)
+            .collect()
+    };
+    assert_eq!(ids("barrier"), ["nccl"]);
+    service
+        .put(
+            &CALLER,
+            LOCAL,
+            "a new barrier story",
+            None,
+            Some("new"),
+            WriteOptions::default(),
+        )
+        .unwrap();
+    service
+        .put(
+            &CALLER,
+            LOCAL,
+            "nothing relevant anymore",
+            None,
+            Some("nccl"),
+            WriteOptions {
+                expected_revision: Some(1),
+                ..WriteOptions::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(ids("barrier"), ["new"]);
+    service
+        .delete(
+            &CALLER,
+            LOCAL,
+            "new",
+            priorart::service::DeleteOptions {
+                expected_revision: Some(1),
+                idempotency_key: None,
+            },
+        )
+        .unwrap();
+    assert!(ids("barrier").is_empty());
+    assert_eq!(ids("relevant"), ["nccl"]);
+}
+
+#[test]
 fn an_empty_corpus_returns_no_hits() {
     let directory = tempfile::tempdir().unwrap();
-    let service = Service::new(settings(&directory), fake()).unwrap();
-    let outcome = service
+    let service = Service::open(settings(&directory)).unwrap();
+    assert!(service
         .search(&CALLER, LOCAL, "anything", None, 10)
-        .unwrap();
-    assert!(outcome.hits.is_empty());
-    assert!(outcome.timings.is_empty());
-    assert_eq!(outcome.gatherer, "none");
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -421,14 +368,12 @@ fn health() {
     let health = service.health(&CALLER, LOCAL).unwrap();
     assert_eq!(health.status, "ok");
     assert_eq!(health.document_count, 3);
-    assert_eq!(health.encoder.as_deref(), Some("fake"));
-    assert_eq!(health.gather_limit, 500);
 }
 
 #[test]
 fn reopening_keeps_data() {
     let directory = tempfile::tempdir().unwrap();
-    let service = Service::new(settings(&directory), fake()).unwrap();
+    let service = Service::open(settings(&directory)).unwrap();
     service
         .put(
             &CALLER,
@@ -440,12 +385,11 @@ fn reopening_keeps_data() {
         )
         .unwrap();
     drop(service);
-    let reopened = Service::new(settings(&directory), fake()).unwrap();
+    let reopened = Service::open(settings(&directory)).unwrap();
     assert_eq!(
         reopened
             .search(&CALLER, LOCAL, "barrier", None, 10)
-            .unwrap()
-            .hits[0]
+            .unwrap()[0]
             .id,
         "nccl"
     );
@@ -470,7 +414,7 @@ fn the_local_service_never_reads_other_collections() {
         .unwrap();
     drop(store);
 
-    let service = Service::new(settings(&directory), None).unwrap();
+    let service = Service::open(settings(&directory)).unwrap();
     service
         .put(
             &CALLER,
@@ -484,8 +428,7 @@ fn the_local_service_never_reads_other_collections() {
     assert_eq!(service.health(&CALLER, LOCAL).unwrap().document_count, 1);
     let hits = service
         .search(&CALLER, LOCAL, "sentinel", None, 10)
-        .unwrap()
-        .hits;
+        .unwrap();
     assert_eq!(
         hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),
         ["local-record"]
@@ -504,91 +447,7 @@ fn the_local_service_never_reads_other_collections() {
     drop(service);
 
     let store = Store::open(directory.path().join("priorart.sqlite")).unwrap();
-    let mut index = Index::open(directory.path(), &store, None, LOCAL_COLLECTION_ID).unwrap();
-    index.rebuild(&store).unwrap();
-    assert_eq!(index.record_ids(), ["local-record"]);
-}
-
-#[test]
-fn an_encoder_failure_writes_nothing() {
-    let directory = tempfile::tempdir().unwrap();
-    let encoder = Arc::new(FakeEncoder::new());
-    let service = Service::new(settings(&directory), Some(encoder.clone())).unwrap();
-    service
-        .put(
-            &CALLER,
-            LOCAL,
-            DOCS[0].1,
-            None,
-            Some("cuda"),
-            WriteOptions::default(),
-        )
-        .unwrap();
-    encoder.set_failing(true);
-    assert!(matches!(
-        service.put(
-            &CALLER,
-            LOCAL,
-            "replacement text",
-            None,
-            Some("cuda"),
-            WriteOptions {
-                idempotency_key: None,
-                publish: false,
-                expected_revision: Some(1)
-            }
-        ),
-        Err(ServiceError::Index(_))
-    ));
-    assert!(service
-        .put(
-            &CALLER,
-            LOCAL,
-            DOCS[1].1,
-            None,
-            Some("pytest"),
-            WriteOptions::default()
-        )
-        .is_err());
-    encoder.set_failing(false);
-    assert_eq!(
-        service.get(&CALLER, LOCAL, "cuda", None).unwrap().revision,
-        1
-    );
-    assert!(matches!(
-        service.get(&CALLER, LOCAL, "pytest", None),
-        Err(ServiceError::Store(StoreError::RecordNotFound { .. }))
-    ));
-    assert_eq!(service.health(&CALLER, LOCAL).unwrap().document_count, 1);
-}
-
-#[cfg(unix)]
-#[test]
-fn a_failed_index_step_is_rebuilt_before_the_next_search() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let (directory, service) = seeded();
-    let vectors = priorart::index::collection_index_path(directory.path(), LOCAL_COLLECTION_ID);
-    let set_mode =
-        |mode| std::fs::set_permissions(&vectors, std::fs::Permissions::from_mode(mode)).unwrap();
-    set_mode(0o555);
-    let deleted = service.delete(
-        &CALLER,
-        LOCAL,
-        "nccl",
-        priorart::service::DeleteOptions {
-            expected_revision: Some(1),
-            idempotency_key: None,
-        },
-    );
-    let search = service.search(&CALLER, LOCAL, "worker never reached barrier", None, 10);
-    set_mode(0o755);
-    assert!(matches!(deleted, Err(ServiceError::Index(_))));
-    assert!(matches!(search, Err(ServiceError::Index(_))));
-    let outcome = service
-        .search(&CALLER, LOCAL, "worker never reached barrier", None, 10)
-        .unwrap();
-    assert!(!outcome.hits.is_empty());
-    assert!(outcome.hits.iter().all(|hit| hit.id != "nccl"));
-    assert_eq!(service.health(&CALLER, LOCAL).unwrap().document_count, 2);
+    let index = Index::load(&store, LOCAL_COLLECTION_ID).unwrap();
+    assert_eq!(index.document_count(), 1);
+    assert_eq!(index.document(0), ("local-record", 1));
 }

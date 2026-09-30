@@ -1,16 +1,7 @@
-use priorart::service::WriteOptions;
-mod common;
-
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-
-use common::FakeEncoder;
-use lateweave::{Representation, TokenMatrix};
 use priorart::auth::{AuthError, Grant, Operation as Op, RequestContext};
 use priorart::config::Settings;
-use priorart::encoder::{Encoder, EncoderError};
-use priorart::index::collection_index_path;
 use priorart::policy::PolicyError;
+use priorart::service::WriteOptions;
 use priorart::service::{Service, ServiceError, DATABASE_FILE};
 use priorart::store::{Metadata, Store, Visibility, LOCAL_COLLECTION_ID};
 use serde_json::json;
@@ -26,7 +17,7 @@ const ALL: &[Op] = &[
 ];
 
 struct Fixture {
-    dir: TempDir,
+    _dir: TempDir,
     store: Store,
     service: Service,
     alice: String,
@@ -39,7 +30,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new(encoder: Option<Arc<dyn Encoder>>) -> Self {
+    fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join(DATABASE_FILE)).unwrap();
         let alice = store.create_principal().unwrap();
@@ -91,17 +82,14 @@ impl Fixture {
                 .unwrap();
             store.delete(collection, "gone", Some(1)).unwrap();
         }
-        let service = Service::new(
-            Settings {
-                data_dir: dir.path().to_owned(),
-                max_loaded_indexes: 1,
-                ..Settings::default()
-            },
-            encoder,
-        )
+        let service = Service::open(Settings {
+            data_dir: dir.path().to_owned(),
+            max_loaded_indexes: 1,
+            ..Settings::default()
+        })
         .unwrap();
         Self {
-            dir,
+            _dir: dir,
             store,
             service,
             alice,
@@ -150,7 +138,7 @@ fn unauthenticated<T: std::fmt::Debug>(result: Result<T, ServiceError>) {
 
 #[test]
 fn unrelated_principals_cannot_read_mutate_or_inspect_forbidden_scope() {
-    let f = Fixture::new(None);
+    let f = Fixture::new();
     let tags: Metadata = json!({"tag": "shared"}).as_object().unwrap().clone();
     let context = f.bob();
     let expected = "requested resource is unavailable";
@@ -197,21 +185,20 @@ fn unrelated_principals_cannot_read_mutate_or_inspect_forbidden_scope() {
             unavailable(f.service.health(&context, collection)),
             expected
         );
-        assert!(!collection_index_path(f.dir.path(), collection).exists());
     }
     assert_eq!(f.store.get(&f.a, "same", None).unwrap().revision, 1);
     let outcome = f
         .service
         .search(&context, &f.b, "sentinel", Some(&tags), 10)
         .unwrap();
-    assert_eq!(outcome.hits.len(), 1);
-    assert_eq!(outcome.hits[0].collection_id, f.b);
-    assert!(outcome.hits[0].excerpt.contains("beta"));
+    assert_eq!(outcome.len(), 1);
+    assert_eq!(outcome[0].collection_id, f.b);
+    assert!(outcome[0].excerpt.contains("beta"));
 }
 
 #[test]
 fn read_scope_includes_old_revisions_but_not_mutations_or_diagnostics() {
-    let f = Fixture::new(None);
+    let f = Fixture::new();
     let key = f.limited(&f.alice, &f.a, &[Op::Read]);
     f.service
         .put(
@@ -239,13 +226,11 @@ fn read_scope_includes_old_revisions_but_not_mutations_or_diagnostics() {
         f.service.get(&reader, &f.a, "same", None).unwrap().revision,
         2
     );
-    assert!(f
-        .service
-        .search(&reader, &f.a, "second", None, 10)
-        .unwrap()
-        .hits[0]
-        .excerpt
-        .contains("second"));
+    assert!(
+        f.service.search(&reader, &f.a, "second", None, 10).unwrap()[0]
+            .excerpt
+            .contains("second")
+    );
     unavailable(
         f.service
             .put(&reader, &f.a, "new", None, None, WriteOptions::default()),
@@ -265,7 +250,7 @@ fn read_scope_includes_old_revisions_but_not_mutations_or_diagnostics() {
 
 #[test]
 fn anonymous_public_reads_succeed_and_mutations_require_credentials() {
-    let f = Fixture::new(None);
+    let f = Fixture::new();
     let anonymous = RequestContext::anonymous();
     assert_eq!(
         f.service
@@ -278,7 +263,7 @@ fn anonymous_public_reads_succeed_and_mutations_require_credentials() {
         .service
         .search(&anonymous, &f.public, "sentinel", None, 10)
         .unwrap();
-    assert_eq!(outcome.hits.len(), 1);
+    assert_eq!(outcome.len(), 1);
     for context in [&anonymous, &f.bob()] {
         unavailable(f.service.put(
             context,
@@ -308,7 +293,7 @@ fn anonymous_public_reads_succeed_and_mutations_require_credentials() {
 
 #[test]
 fn public_authorship_publication_and_moderation_are_explicit() {
-    let f = Fixture::new(None);
+    let f = Fixture::new();
     let contributor = f.limited(&f.bob, &f.public, &[Op::Contribute, Op::Update, Op::Delete]);
     let author = f.context(&contributor);
     assert!(matches!(
@@ -466,7 +451,7 @@ fn public_authorship_publication_and_moderation_are_explicit() {
 
 #[test]
 fn contribute_does_not_grant_update_even_to_the_original_author() {
-    let f = Fixture::new(None);
+    let f = Fixture::new();
     let key = f.limited(&f.alice, &f.a, &[Op::Contribute]);
     let writer = f.context(&key);
     f.service
@@ -501,7 +486,7 @@ fn contribute_does_not_grant_update_even_to_the_original_author() {
 
 #[test]
 fn revoked_and_reduced_credentials_cannot_reuse_loaded_indexes_or_public_read_access() {
-    let f = Fixture::new(None);
+    let f = Fixture::new();
     let key = f.limited(&f.alice, &f.a, &[Op::Read]);
     let old = f.context(&key);
     f.service.search(&old, &f.a, "sentinel", None, 10).unwrap();
@@ -522,7 +507,7 @@ fn revoked_and_reduced_credentials_cannot_reuse_loaded_indexes_or_public_read_ac
 
 #[test]
 fn local_context_is_neither_anonymous_nor_a_cross_collection_admin() {
-    let f = Fixture::new(None);
+    let f = Fixture::new();
     let local = RequestContext::local();
     f.service
         .put(
@@ -556,7 +541,7 @@ fn local_context_is_neither_anonymous_nor_a_cross_collection_admin() {
 
 #[test]
 fn diagnostics_count_only_the_authorized_collection_after_eviction() {
-    let f = Fixture::new(None);
+    let f = Fixture::new();
     f.service
         .put(
             &f.alice(),
@@ -579,82 +564,9 @@ fn diagnostics_count_only_the_authorized_collection_after_eviction() {
     unavailable(f.service.health(&f.bob(), &f.a));
 }
 
-struct RevokingEncoder {
-    fake: FakeEncoder,
-    action: Mutex<Option<(PathBuf, String, bool)>>,
-}
-impl RevokingEncoder {
-    fn revoke(&self, query: bool) {
-        let mut action = self.action.lock().unwrap();
-        if action
-            .as_ref()
-            .is_some_and(|(_, _, on_query)| *on_query == query)
-        {
-            let (path, id, _) = action.take().unwrap();
-            Store::open(path)
-                .unwrap()
-                .revoke_local_credential(&id)
-                .unwrap();
-        }
-    }
-}
-impl Encoder for RevokingEncoder {
-    fn representation(&self) -> &Representation {
-        self.fake.representation()
-    }
-    fn encode_queries(&self, texts: &[&str]) -> Result<Vec<TokenMatrix>, EncoderError> {
-        self.revoke(true);
-        self.fake.encode_queries(texts)
-    }
-    fn encode_documents(&self, texts: &[&str]) -> Result<Vec<TokenMatrix>, EncoderError> {
-        self.revoke(false);
-        self.fake.encode_documents(texts)
-    }
-    fn fit_document<'a>(&self, text: &'a str) -> Result<&'a str, EncoderError> {
-        self.fake.fit_document(text)
-    }
-}
-
-#[test]
-fn revocation_during_encoding_blocks_search_results_and_record_commits() {
-    for query in [false, true] {
-        let encoder = Arc::new(RevokingEncoder {
-            fake: FakeEncoder::new(),
-            action: Mutex::new(None),
-        });
-        let f = Fixture::new(Some(encoder.clone()));
-        // Load vectors before arming the hook, so the write check runs after the
-        // new document is encoded and the search check after query encoding.
-        f.service.health(&f.alice(), &f.a).unwrap();
-        let context = f.alice();
-        *encoder.action.lock().unwrap() = Some((
-            f.store.path().to_owned(),
-            context.credential().unwrap().id.clone(),
-            query,
-        ));
-        if query {
-            unauthenticated(f.service.search(&context, &f.a, "sentinel", None, 10));
-        } else {
-            unauthenticated(f.service.put(
-                &context,
-                &f.a,
-                "denied update",
-                None,
-                Some("same"),
-                WriteOptions {
-                    idempotency_key: None,
-                    publish: false,
-                    expected_revision: Some(1),
-                },
-            ));
-            assert_eq!(f.store.get(&f.a, "same", None).unwrap().revision, 1);
-        }
-    }
-}
-
 #[test]
 fn expired_credentials_fail_even_for_public_data() {
-    let f = Fixture::new(None);
+    let f = Fixture::new();
     let context = f.bob();
     let id = &context.credential().unwrap().id;
     let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
@@ -689,45 +601,4 @@ fn expired_credentials_fail_even_for_public_data() {
         },
     ));
     unauthenticated(f.service.health(&context, &f.public));
-}
-
-#[test]
-fn revocation_during_recovery_blocks_responses_but_does_not_undo_committed_deletion() {
-    for diagnostics in [false, true] {
-        let encoder = Arc::new(RevokingEncoder {
-            fake: FakeEncoder::new(),
-            action: Mutex::new(None),
-        });
-        let f = Fixture::new(Some(encoder.clone()));
-        let context = f.alice();
-        f.store
-            .put(&f.a, "survivor", None, Some("survivor"), &f.alice, None)
-            .unwrap();
-        *encoder.action.lock().unwrap() = Some((
-            f.store.path().to_owned(),
-            context.credential().unwrap().id.clone(),
-            false,
-        ));
-        if diagnostics {
-            unauthenticated(f.service.health(&context, &f.a));
-        } else {
-            unauthenticated(f.service.delete(
-                &context,
-                &f.a,
-                "same",
-                priorart::service::DeleteOptions {
-                    expected_revision: Some(1),
-                    idempotency_key: None,
-                },
-            ));
-        }
-        if diagnostics {
-            assert!(f.store.get(&f.a, "same", None).is_ok());
-        } else {
-            assert!(matches!(
-                f.store.get(&f.a, "same", None),
-                Err(priorart::store::StoreError::RecordDeleted { .. })
-            ));
-        }
-    }
 }

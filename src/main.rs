@@ -88,7 +88,7 @@ enum AdminCommand {
 
 fn administer(command: AdminCommand) -> Result<(), AnyError> {
     let settings = Settings::from_env()?;
-    // No encoder, HTTP listener, or remote provisioning is involved.
+    // No HTTP listener or remote provisioning is involved.
     let store = Store::open(settings.data_dir.join(DATABASE_FILE))?;
     match command {
         AdminCommand::CreatePrincipal => println!("{}", store.create_principal()?),
@@ -159,13 +159,10 @@ fn serve(host: Option<String>, port: Option<u16>) -> Result<(), AnyError> {
     settings.host = host.unwrap_or(settings.host);
     settings.port = port.unwrap_or(settings.port);
     settings.validate()?;
-    // Opened before the runtime starts: loading the encoder may download it
-    // with a blocking client that owns its own runtime.
     let service = Arc::new(Service::open(settings.clone())?);
     eprintln!(
-        "priorart {VERSION}: data at {}, encoder {}",
-        settings.data_dir.display(),
-        settings.encoder
+        "priorart {VERSION}: data at {}",
+        settings.data_dir.display()
     );
     runtime()?.block_on(async move {
         let address: SocketAddr = tokio::net::lookup_host((settings.host.as_str(), settings.port))

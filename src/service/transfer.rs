@@ -127,7 +127,7 @@ impl Service {
         );
         let handle = self.state(context, collection, Operation::Contribute)?;
         let mut state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
-        let State { store, indexes } = &mut *state;
+        let State { store, index } = &mut *state;
         policy::collection(store, context, collection, Operation::Contribute)?;
         let record = store
             .import_target(collection, principal, &source_digest)?
@@ -162,8 +162,6 @@ impl Service {
                 )?;
             }
             store.get(collection, &result.value.0, Some(result.value.1))?;
-            indexes.get(store, collection)?;
-            policy::validate(store, context)?;
             return Ok(result);
         }
         if position
@@ -176,20 +174,12 @@ impl Service {
         if expected > 0 {
             policy::mutation(store, context, collection, &record, Operation::Update)?;
         }
-        store.check_put_revision(collection, Some(&record), Some(expected))?;
-        let fitted = self.cutoff(&source.text)?;
+        let fitted = self.cutoff(&source.text);
         let truncated = fitted.len() < source.text.len();
         let source = &TransferRecord {
             text: fitted.to_owned(),
             ..source.clone()
         };
-        let index = indexes.get(store, collection)?;
-        let encoded = index.encode(&source.text);
-        policy::collection(store, context, collection, Operation::Contribute)?;
-        if expected > 0 {
-            policy::mutation(store, context, collection, &record, Operation::Update)?;
-        }
-        let encoded = encoded?;
         let committed = store.commit_import(
             &intent,
             &record,
@@ -198,11 +188,9 @@ impl Service {
             truncated,
             &source_digest,
         )?;
-        crate::fault::check("after_record_commit").map_err(IndexError::from)?;
-        let result = index.upsert(store, &record, committed.value.1, &source.text, encoded);
-        policy::validate(store, context)?;
-        result?;
-        store.complete_mutations(collection)?;
+        if let Some(index) = index {
+            index.upsert(&record, committed.value.1, &source.text);
+        }
         Ok(committed)
     }
 }

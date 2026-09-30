@@ -538,7 +538,7 @@ async fn search(
     }
     let collection = body.collections[0].clone();
     identifier(&collection)?;
-    let outcome = blocking(&service, move |s| {
+    let hits = blocking(&service, move |s| {
         s.search(
             &context,
             &collection,
@@ -548,9 +548,7 @@ async fn search(
         )
     })
     .await?;
-    Ok(Json(
-        json!({"collections": body.collections, "hits": outcome.hits}),
-    ))
+    Ok(Json(json!({"collections": body.collections, "hits": hits})))
 }
 async fn delete_collection(
     State(service): State<Arc<Service>>,

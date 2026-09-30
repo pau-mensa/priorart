@@ -317,13 +317,10 @@ mod tests {
                 .unwrap()
                 .into_secret();
             let service = Arc::new(
-                Service::new(
-                    Settings {
-                        data_dir: dir.path().into(),
-                        ..Default::default()
-                    },
-                    None,
-                )
+                Service::open(Settings {
+                    data_dir: dir.path().into(),
+                    ..Default::default()
+                })
                 .unwrap(),
             );
             service

@@ -14,7 +14,7 @@ revoking every key leaves them intact, and a new key for the same principal
 regains access to its records.
 
 `priorart admin` opens the SQLite database selected by `PRIORART_DATA_DIR` directly.
-It requires host filesystem access and starts neither an encoder nor a network
+It requires host filesystem access and starts no network
 listener. A fresh database creates `local-principal` and the restricted `local`
 collection it owns. No credential is issued automatically.
 

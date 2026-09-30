@@ -24,7 +24,7 @@ untrusted operations must use `Service`.
 
 Unknown and unauthorized collections both return `PolicyError::Unavailable`, with
 `requested resource is unavailable`. The service checks this before record/revision
-lookups, filters, or index loading/recovery. A forbidden caller cannot use record
+lookups, filters, or index loading. A forbidden caller cannot use record
 existence or tombstone differences to learn about a restricted collection. An
 authorized reader can still distinguish a missing record from a deleted one.
 
@@ -62,17 +62,12 @@ new author. Private provenance is excluded from public responses and exports.
 
 Authorization runs on every request, including when its index is already resident.
 The service has no result or authorization cache; loaded collection indexes do not
-confer access. Search rechecks after loading/recovering an index, after retrieval,
-and before returning results. Writes recheck after index recovery and encoding,
-before committing the record, and after write-through indexing completes.
+confer access. Writes check authorization immediately before committing.
 
-Each validation observes a SQLite snapshot. A revocation observed by the final
-pre-mutation check denies the write; one observed by the final result check denies
-the response. Revocation after that check cannot recall an already admitted mutation
-or delivered result. If revocation happens during indexing after a record has
-committed, the record can remain committed even though the request returns an
-authentication error. Journaled idempotent retries recover that write only after
-successful reauthentication and authorization.
+Each check observes a SQLite snapshot. A revocation observed by the check denies
+the request; revocation after it cannot recall an admitted mutation or a delivered
+result. Idempotent retries replay a write only after successful reauthentication
+and authorization.
 
 Requests serialize under a per-collection mutex and owned SQLite connection;
 different collections can run concurrently within the bounded collection cache.
@@ -88,7 +83,6 @@ allows no precondition or `Some(0)` (explicit absence). Existing updates require
 preconditions or explicit create collisions return `RevisionConflict`. An explicit
 create requires contribute, while an update requires update and authorship/moderation.
 `Service::delete` requires the current revision, including on repeat tombstone deletes.
-Checks follow policy, precede index work, and run again inside the SQLite mutation
-transaction. Each service mutation returns `Mutation<T>` containing a durable
+Checks follow policy and run inside the SQLite mutation transaction. Each service mutation returns `Mutation<T>` containing a durable
 mutation ID and its operation result. Replays revalidate current original operation
 authority and use the same collection synchronization as new writes.

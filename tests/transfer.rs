@@ -13,7 +13,6 @@ struct Fixture {
     dir: tempfile::TempDir,
     store: Store,
     service: Arc<Service>,
-    encoder: Arc<common::FakeEncoder>,
     source: String,
     destination: String,
     public: String,
@@ -77,23 +76,18 @@ impl Fixture {
                 )
                 .unwrap();
         }
-        let encoder = Arc::new(common::FakeEncoder::new());
         let service = Arc::new(
-            Service::new(
-                Settings {
-                    data_dir: dir.path().into(),
-                    mode: ServerMode::Authenticated,
-                    ..Default::default()
-                },
-                Some(encoder.clone()),
-            )
+            Service::open(Settings {
+                data_dir: dir.path().into(),
+                mode: ServerMode::Authenticated,
+                ..Default::default()
+            })
             .unwrap(),
         );
         Self {
             dir,
             store,
             service,
-            encoder,
             source,
             destination,
             public,
@@ -137,9 +131,8 @@ fn options() -> ImportOptions<'static> {
 }
 
 #[test]
-fn export_is_scoped_generation_checked_and_never_loads_an_encoder() {
+fn export_is_scoped_and_generation_checked() {
     let f = Fixture::new();
-    f.encoder.set_failing(true);
     let rows = f.records();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].revision, 1);
@@ -148,7 +141,6 @@ fn export_is_scoped_generation_checked_and_never_loads_an_encoder() {
         rows[0].author_principal_id.as_deref(),
         Some(f.alice.as_str())
     );
-    assert_eq!(f.encoder.calls(), 0);
     let bob = f.context(&f.bob_key);
     assert!(f.service.export_generation(&bob, &f.source).is_err());
     assert!(f
@@ -255,8 +247,7 @@ fn import_preserves_history_as_new_authored_records_and_retries_without_duplicat
     let hits = f
         .service
         .search(&bob, &f.destination, "second", None, 10)
-        .unwrap()
-        .hits;
+        .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].revision, 2);
     f.service
