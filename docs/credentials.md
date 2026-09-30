@@ -51,6 +51,7 @@ token opens nothing else. Send it only over HTTPS or loopback.
 | `PUT /v1/admin/credentials/{id}/grants` | `{"grants":[…]}`; empty removes all | `204` |
 | `DELETE /v1/admin/credentials/{id}` | none | `204` |
 | `GET /v1/admin/metrics` | none | Prometheus text; see [metrics](protocol.md#metrics) |
+| `GET /v1/admin/search-log` | none | NDJSON; see [search log](protocol.md#search-log-and-feedback) |
 
 Responses with a secret carry `Cache-Control: no-store`. Unknown principals,
 unknown or revoked credentials, and grants the principal may not hold return

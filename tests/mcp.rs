@@ -114,6 +114,7 @@ async fn tools_annotations_and_instructions() {
             "contribute_experience",
             "delete_experience",
             "get_experience",
+            "rate_hits",
             "search_experiences"
         ]
     );
@@ -560,4 +561,67 @@ async fn redirects_are_not_followed() {
     let result = invoke(&client, "get_experience", json!({"id": "moved"})).await;
     assert!(error_text(&result).contains("HTTP 307"));
     assert!(reached.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn searches_carry_an_id_to_rate_when_the_server_logs_them() {
+    let session = session().await;
+    let found = call(
+        &session,
+        "search_experiences",
+        json!({"problem": "barrier"}),
+    )
+    .await;
+    assert!(structured(&found).get("search_id").is_none());
+
+    let directory = tempfile::tempdir().unwrap();
+    let service = Arc::new(
+        Service::open(Settings {
+            data_dir: directory.path().to_owned(),
+            search_log_days: Some(7),
+            ..Settings::default()
+        })
+        .unwrap(),
+    );
+    service
+        .put(
+            &RequestContext::local(),
+            LOCAL_COLLECTION_ID,
+            "NCCL worker never reached the barrier: stray exit() in loader.",
+            None,
+            Some("nccl"),
+            WriteOptions::default(),
+        )
+        .unwrap();
+    let client = attach(config(
+        &common::spawn(service.clone()).await,
+        None,
+        &[LOCAL_COLLECTION_ID],
+        None,
+    ))
+    .await;
+    let found = invoke(&client, "search_experiences", json!({"problem": "barrier"})).await;
+    let search_id = structured(&found)["search_id"].as_str().unwrap().to_owned();
+    let rated = invoke(
+        &client,
+        "rate_hits",
+        json!({"search_id": search_id, "ratings": [{"collection_id": "local", "id": "nccl", "useful": true}]}),
+    )
+    .await;
+    assert_eq!(
+        structured(&rated),
+        &json!({"search_id": search_id, "rated": 1})
+    );
+    let log = service.search_log().unwrap();
+    for _ in 0..200 {
+        let (rows, _) = log.export(0, 10).unwrap();
+        if rows
+            .first()
+            .is_some_and(|row| row["feedback"][0]["useful"] == json!(true))
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the rating was never logged");
 }

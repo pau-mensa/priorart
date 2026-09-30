@@ -1,7 +1,8 @@
 # Storage and upgrades
 
-A data directory holds `priorart.sqlite` (with its WAL files) and `writer.lock`.
-SQLite is the only persistent state. Each collection's BM25 index is built in
+A data directory holds `priorart.sqlite` (with its WAL files), `writer.lock`,
+and, when the [search log](protocol.md#search-log-and-feedback) is enabled,
+`searchlog.sqlite`. SQLite is the only persistent state. Each collection's BM25 index is built in
 memory from its live records on first use, updated after every write, and
 rebuilt from SQLite after a restart or cache eviction.
 
@@ -38,7 +39,10 @@ result, never text or metadata; they back [retries](protocol.md#mutation-retries
 ## Deletion
 
 Deleting a record or collection removes its rows. It does not erase SQLite free
-pages, WAL files, filesystem snapshots, exports, or backups.
+pages, WAL files, filesystem snapshots, exports, or backups. Deleting a record
+leaves its ID in logged searches; deleting a collection removes the searches that
+included it. The search log can be deleted on its own while the server is
+stopped.
 
 ## Backups and upgrades
 

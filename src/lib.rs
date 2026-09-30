@@ -11,6 +11,7 @@ pub mod mcp;
 pub mod metrics;
 mod ownership;
 pub mod policy;
+pub mod searchlog;
 pub mod service;
 pub mod store;
 

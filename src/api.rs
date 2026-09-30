@@ -27,6 +27,7 @@ use crate::{
     config::{ServerMode, Settings},
     metrics,
     policy::PolicyError,
+    searchlog::Rating,
     service::{is_record_id, DeleteOptions, Service, ServiceError, WriteOptions},
     store::{Collection, Metadata, StoreError},
 };
@@ -362,6 +363,11 @@ struct SearchRequest {
     #[serde(default = "default_limit")]
     limit: i64,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FeedbackRequest {
+    ratings: Vec<Rating>,
+}
 pub fn router(service: Arc<Service>) -> Router {
     let limit = service.settings().max_body_bytes();
     Router::new()
@@ -387,6 +393,7 @@ pub fn router(service: Arc<Service>) -> Router {
             post(transfer::import),
         )
         .route("/v1/search", post(search))
+        .route("/v1/search/{search_id}/feedback", post(feedback))
         .merge(admin::routes())
         .fallback(|| async { ApiError::not_found() })
         .method_not_allowed_fallback(|| async {
@@ -619,17 +626,46 @@ async fn search(
         identifier(collection)?;
     }
     let collections = body.collections.clone();
-    let hits = blocking(&service, move |s| {
-        s.search(
+    let (hits, search_id) = blocking(&service, move |s| {
+        let filters = body.filters.as_ref();
+        let hits = s.search(&context, &body.collections, &body.text, filters, body.limit)?;
+        let search_id = s.log_search(
             &context,
             &body.collections,
             &body.text,
-            body.filters.as_ref(),
+            filters,
             body.limit,
-        )
+            &hits,
+        );
+        Ok((hits, search_id))
     })
     .await?;
-    Ok(Json(json!({"collections": collections, "hits": hits})))
+    let mut response = json!({"collections": collections, "hits": hits});
+    if let Some(search_id) = search_id {
+        response["search_id"] = json!(search_id);
+    }
+    Ok(Json(response))
+}
+async fn feedback(
+    State(service): State<Arc<Service>>,
+    Extension(context): Extension<RequestContext>,
+    path: Result<Path<String>, PathRejection>,
+    query: Result<Query<EmptyQuery>, QueryRejection>,
+    body: Result<Json<FeedbackRequest>, JsonRejection>,
+) -> ApiResult<StatusCode> {
+    query?;
+    let Path(search_id) = path?;
+    identifier(&search_id)?;
+    let Json(body) = body?;
+    for rating in &body.ratings {
+        identifier(&rating.collection_id)?;
+        identifier(&rating.id)?;
+    }
+    blocking(&service, move |s| {
+        s.rate_hits(&context, &search_id, body.ratings)
+    })
+    .await?;
+    Ok(StatusCode::ACCEPTED)
 }
 async fn delete_collection(
     State(service): State<Arc<Service>>,

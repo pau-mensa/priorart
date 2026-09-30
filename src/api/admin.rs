@@ -26,6 +26,7 @@ impl From<AuthError> for ApiError {
 pub(super) fn routes() -> Router<Arc<Service>> {
     Router::new()
         .route("/v1/admin/metrics", get(operator_metrics))
+        .route("/v1/admin/search-log", get(search_log))
         .route("/v1/admin/principals", post(create_principal))
         .route("/v1/admin/collections", post(create_collection))
         .route(
@@ -109,9 +110,48 @@ async fn operator_metrics(
     query: Result<Query<EmptyQuery>, QueryRejection>,
 ) -> ApiResult<Response> {
     query?;
-    Ok(prometheus(
-        service.metrics().render_admin(service.cached_collections()),
-    ))
+    Ok(prometheus(service.metrics().render_admin(
+        service.cached_collections(),
+        service.search_log().map(|log| log.dropped()),
+    )))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchLogQuery {
+    #[serde(default)]
+    after: i64,
+    #[serde(default = "default_search_log_page")]
+    limit: i64,
+}
+fn default_search_log_page() -> i64 {
+    1000
+}
+
+/// One page of the search log as NDJSON, closed by an `end` line.
+async fn search_log(
+    State(service): State<Arc<Service>>,
+    query: Result<Query<SearchLogQuery>, QueryRejection>,
+) -> ApiResult<Response> {
+    let Query(query) = query?;
+    if query.after < 0 || !(1..=10_000).contains(&query.limit) {
+        return Err(ApiError::invalid());
+    }
+    let (rows, next) = tokio::task::spawn_blocking(move || {
+        let log = service.search_log().ok_or_else(ApiError::not_found)?;
+        log.export(query.after, query.limit)
+            .map_err(|_| ApiError::unavailable())
+    })
+    .await
+    .map_err(|_| ApiError::unavailable())??;
+    let mut body = String::new();
+    for row in &rows {
+        body.push_str(&row.to_string());
+        body.push('\n');
+    }
+    body.push_str(&json!({"type": "end", "count": rows.len(), "next_cursor": next}).to_string());
+    body.push('\n');
+    Ok(([(CONTENT_TYPE, "application/x-ndjson")], body).into_response())
 }
 
 async fn create_principal(

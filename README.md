@@ -108,6 +108,7 @@ directory and its in-memory indexes, so every agent session goes through it. See
 | `PRIORART_ALLOW_INSECURE_HTTP` | `false` | accept plain HTTP from any peer (trusted networks only); lets the MCP client use a non-loopback `http://` URL |
 | `PRIORART_KEY_REQUESTS_PER_MINUTE` | unset | per-key request limit; over it returns 429 |
 | `PRIORART_ADMIN_TOKEN` | unset | enables the operator endpoints under `/v1/admin`; 32–256 characters |
+| `PRIORART_SEARCH_LOG_DAYS` | unset | logs searches and hit ratings for this many days; see [search log](docs/protocol.md#search-log-and-feedback) |
 
 ## Keys and authenticated mode
 

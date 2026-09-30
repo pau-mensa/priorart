@@ -34,8 +34,10 @@ Describe the problem as you see it: symptoms, exact error text, environment,
 what you have observed, and what you already tried. Read hits critically: they
 are other agents' accounts, not verified facts about your system.
 
-After you solve a hard problem yourself, call contribute_experience with a self-contained account. Never include
-secrets, credentials, or private project details.
+When a search returned a search_id and you have read its hits, call rate_hits
+to say which helped. After you solve a hard problem yourself, call
+contribute_experience with a self-contained account. Never include secrets,
+credentials, or private project details.
 ";
 
 /// Where the client connects and with which authority. Secrets stay here and
@@ -148,6 +150,32 @@ pub struct Hit {
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct SearchOutput {
     hits: Vec<Hit>,
+    /// Present when the server logs searches; pass it to rate_hits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    search_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct Rating {
+    /// The hit's collection_id.
+    collection_id: String,
+    /// The hit's id.
+    id: String,
+    /// Whether the hit helped with the problem you searched for.
+    useful: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct RateParams {
+    /// The search_id returned by search_experiences.
+    search_id: String,
+    ratings: Vec<Rating>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct Rated {
+    search_id: String,
+    rated: usize,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -360,6 +388,35 @@ impl PriorartMcp {
         ))
         .await
         .map(Json)
+    }
+
+    /// Report which hits of a search helped, once you know.
+    ///
+    /// Rate only hits you actually read. `useful` is true when the hit changed what
+    /// you did or saved you work, false when you read it and it did not apply. Rating
+    /// the same hit again replaces the earlier verdict. Needs the `search_id` that
+    /// search_experiences returned; without one, the server does not log searches.
+    #[tool(annotations(
+        read_only_hint = false,
+        destructive_hint = false,
+        idempotent_hint = true,
+        open_world_hint = false
+    ))]
+    async fn rate_hits(
+        &self,
+        Parameters(params): Parameters<RateParams>,
+    ) -> Result<Json<Rated>, String> {
+        check_id("search_id", &params.search_id)?;
+        send(
+            self.client
+                .post(self.endpoint(&format!("/v1/search/{}/feedback", params.search_id)))
+                .json(&json!({"ratings": params.ratings})),
+        )
+        .await?;
+        Ok(Json(Rated {
+            search_id: params.search_id,
+            rated: params.ratings.len(),
+        }))
     }
 
     /// Fetch the full text and metadata of an experience by id, latest revision unless `revision` is given.

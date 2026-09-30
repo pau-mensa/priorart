@@ -142,9 +142,11 @@ const TIMESTAMP: &[FormatItem<'_>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6]Z");
 
 fn now() -> String {
-    OffsetDateTime::now_utc()
-        .format(TIMESTAMP)
-        .expect("UTC timestamps always format")
+    timestamp(OffsetDateTime::now_utc())
+}
+
+pub(crate) fn timestamp(at: OffsetDateTime) -> String {
+    at.format(TIMESTAMP).expect("UTC timestamps always format")
 }
 
 fn digest(text: &str) -> String {

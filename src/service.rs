@@ -22,6 +22,7 @@ use crate::gather::Statistics;
 use crate::index::{Index, IndexError};
 use crate::metrics::Metrics;
 use crate::policy::{self, PolicyError};
+use crate::searchlog::{Rating, SearchLog};
 use crate::store::{Metadata, RecordSummary, Revision, Store, StoreError};
 
 mod transfer;
@@ -127,6 +128,7 @@ pub struct Service {
     settings: Settings,
     states: Mutex<States>,
     metrics: Metrics,
+    search_log: Option<SearchLog>,
     // Declared last so collection state is dropped before releasing ownership.
     _owner: crate::ownership::DirectoryOwner,
 }
@@ -142,10 +144,15 @@ impl Service {
         settings.validate()?;
         let owner = crate::ownership::DirectoryOwner::acquire(&settings.data_dir)?;
         Store::open(settings.data_dir.join(DATABASE_FILE))?;
+        let search_log = settings
+            .search_log_days
+            .map(|days| SearchLog::open(&settings.data_dir.join(crate::searchlog::FILE), days))
+            .transpose()?;
         Ok(Self {
             settings,
             states: Mutex::default(),
             metrics: Metrics::default(),
+            search_log,
             _owner: owner,
         })
     }
@@ -169,6 +176,51 @@ impl Service {
 
     pub fn metrics(&self) -> &Metrics {
         &self.metrics
+    }
+
+    pub fn search_log(&self) -> Option<&SearchLog> {
+        self.search_log.as_ref()
+    }
+
+    /// Queues a completed search for the log, if enabled, and returns its ID.
+    /// Never fails: a search the log cannot take is dropped and counted.
+    pub fn log_search<C: AsRef<str>>(
+        &self,
+        context: &RequestContext,
+        collections: &[C],
+        text: &str,
+        filters: Option<&Metadata>,
+        limit: i64,
+        hits: &[Hit],
+    ) -> Option<String> {
+        let collections: Vec<&str> = collections.iter().map(AsRef::as_ref).collect();
+        self.search_log.as_ref()?.record(
+            context.principal_id(),
+            &collections,
+            text,
+            filters,
+            limit,
+            hits,
+        )
+    }
+
+    /// Queues the searcher's verdict on hits of one of their logged searches.
+    /// Ratings of another principal's search, or of records it did not
+    /// return, are discarded when written.
+    pub fn rate_hits(
+        &self,
+        context: &RequestContext,
+        search_id: &str,
+        ratings: Vec<Rating>,
+    ) -> Result<()> {
+        let (Some(log), Some(principal)) = (&self.search_log, context.principal_id()) else {
+            return Err(PolicyError::Unavailable.into());
+        };
+        if !(1..=MAX_LIMIT as usize).contains(&ratings.len()) {
+            return invalid(format!("ratings must hold 1 to {MAX_LIMIT} entries"));
+        }
+        log.rate(principal, search_id, ratings);
+        Ok(())
     }
 
     pub fn cached_collections(&self) -> usize {
@@ -345,6 +397,9 @@ impl Service {
         states.loaded.remove(collection);
         states.lru.retain(|id| id != collection);
         self.metrics.forget(collection);
+        if let Some(log) = &self.search_log {
+            log.forget_collection(collection);
+        }
         Ok(())
     }
 

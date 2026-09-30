@@ -64,6 +64,8 @@ pub struct Settings {
     /// Accepts plain HTTP from any peer. For private networks only.
     pub allow_insecure_http: bool,
     pub key_requests_per_minute: Option<u32>,
+    /// Enables the search log, keeping entries this many days.
+    pub search_log_days: Option<u32>,
 }
 
 impl Default for Settings {
@@ -79,6 +81,7 @@ impl Default for Settings {
             trusted_proxies: Vec::new(),
             allow_insecure_http: false,
             key_requests_per_minute: None,
+            search_log_days: None,
         }
     }
 }
@@ -148,6 +151,9 @@ impl Settings {
             settings.key_requests_per_minute =
                 Some(parse("PRIORART_KEY_REQUESTS_PER_MINUTE", &value)?);
         }
+        if let Some(value) = get("SEARCH_LOG_DAYS") {
+            settings.search_log_days = Some(parse("PRIORART_SEARCH_LOG_DAYS", &value)?);
+        }
         settings.validate()?;
         Ok(settings)
     }
@@ -168,6 +174,9 @@ impl Settings {
         }
         if self.key_requests_per_minute == Some(0) {
             return invalid("key_requests_per_minute must be positive");
+        }
+        if self.search_log_days == Some(0) {
+            return invalid("search_log_days must be positive");
         }
         if self.max_loaded_indexes == 0 {
             return invalid("max_loaded_indexes must be positive");
@@ -265,6 +274,7 @@ mod tests {
             ("PRIORART_PORT", "70000"),
             ("PRIORART_ADMIN_TOKEN", "too-short"),
             ("PRIORART_KEY_REQUESTS_PER_MINUTE", "0"),
+            ("PRIORART_SEARCH_LOG_DAYS", "0"),
             ("PRIORART_TRUSTED_PROXIES", "10.0.0.0/33"),
             ("PRIORART_TRUSTED_PROXIES", "proxy.internal"),
             ("PRIORART_ALLOW_INSECURE_HTTP", "yes"),

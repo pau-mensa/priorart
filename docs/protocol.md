@@ -154,7 +154,49 @@ Returns:
 
 Scores are Lucene BM25 with statistics taken over the whole selection, so scores
 from different collections compare. Hits are merged by score; ties go to
-collection ID, then record ID. Searches store nothing.
+collection ID, then record ID. Searches store nothing unless the search log is
+enabled.
+
+## Search log and feedback
+
+`PRIORART_SEARCH_LOG_DAYS=N` enables the search log, kept in `searchlog.sqlite`
+next to the database. Each search is then stored with its query, filters,
+collections, limit, time, a salted hash of the caller's principal (none for
+anonymous callers), and the hits returned as collection ID, record ID, revision,
+and score (never record text). The response carries a `search_id`.
+
+Logging never delays or fails a request. Searches and ratings are queued for a
+background writer; when the queue is full or a write fails, entries are dropped
+and counted in `priorart_search_log_dropped_total` (see [metrics](#metrics)), and
+a search that could not be queued has no `search_id`. Searches older than N days
+are deleted with their ratings, at startup and then hourly. Deleting a collection
+deletes every search that included it. Unsetting the variable stops logging but
+leaves `searchlog.sqlite` in place.
+
+`POST /v1/search/{search_id}/feedback` rates hits of that search:
+
+```json
+{"ratings": [{"collection_id": "local", "id": "…", "useful": true}]}
+```
+
+It needs a key (or local mode) and returns `202`: the ratings are queued, not
+yet stored. 1–100 ratings are required (otherwise `400`), and a disabled log
+returns `404`. The writer keeps a rating only if the search exists, was run by
+the same principal, and returned that hit; others are dropped and counted as
+`rejected_feedback`. Rating a hit again replaces the earlier rating.
+
+`GET /v1/admin/search-log?after=0&limit=1000` takes the
+[admin token](credentials.md#remote-administration) and returns
+`application/x-ndjson`: what the writer has stored so far, oldest first, then a
+footer:
+
+```json
+{"type":"search","id":"…","at":"…","principal":"…","collections":["local"],"query":"…","filters":null,"limit":10,"hits":[{"collection_id":"local","id":"r1","revision":2,"score":12.3}],"feedback":[{"collection_id":"local","id":"r1","useful":true,"at":"…"}]}
+{"type":"end","count":1,"next_cursor":null}
+```
+
+`limit` is 1–10000. When `next_cursor` is not null, pass it as `after` for the
+next page.
 
 ## Export and import
 
@@ -248,7 +290,9 @@ so it reveals nothing about collections:
 `GET /v1/admin/metrics` takes the [admin token](credentials.md#remote-administration)
 and adds requests and latency by route, method, and status; search time, writes,
 and indexed documents per collection; index load time; cached collections;
-evictions; and `resource_limit` and `rate_limited` refusals. Collection labels
+evictions; `resource_limit` and `rate_limited` refusals; and, with the
+[search log](#search-log-and-feedback) enabled, entries it dropped by reason
+(`queue_full`, `write_failed`, `rejected_feedback`). Collection labels
 disappear when the collection is deleted. Counters reset on restart.
 
 ## MCP client
@@ -264,7 +308,8 @@ disappear when the collection is deleted. Counters reset on restart.
 | `PRIORART_ALLOW_INSECURE_HTTP` | `false` | allow a non-loopback `http://` URL |
 
 Every tool takes an optional collection override, and hits carry `collection_id`
-for follow-up reads. The key never appears in tool schemas, results, or errors.
+for follow-up reads. When the server logs searches, `search_experiences` returns
+the `search_id` and `rate_hits` sends the agent's ratings. The key never appears in tool schemas, results, or errors.
 The URL must not embed credentials, redirects are not followed, and the key is
 checked against `/healthz` at startup. Transport failures and `502`–`504` are
 retried up to three times; each write keeps one `Idempotency-Key` across its

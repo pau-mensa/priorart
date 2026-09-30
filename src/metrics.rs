@@ -200,7 +200,11 @@ impl Metrics {
         out
     }
 
-    pub fn render_admin(&self, cached_collections: usize) -> String {
+    pub fn render_admin(
+        &self,
+        cached_collections: usize,
+        search_log_dropped: Option<[(&str, u64); 3]>,
+    ) -> String {
         let mut inner = self.inner();
         let mut out = String::new();
         render_public(&mut inner, &mut out);
@@ -306,6 +310,20 @@ impl Metrics {
         ] {
             header(&mut out, name, kind, help);
             let _ = writeln!(out, "{name} {value}");
+        }
+        if let Some(dropped) = search_log_dropped {
+            header(
+                &mut out,
+                "priorart_search_log_dropped_total",
+                "counter",
+                "Search log entries lost, by reason.",
+            );
+            for (reason, count) in dropped {
+                let _ = writeln!(
+                    out,
+                    "priorart_search_log_dropped_total{{reason=\"{reason}\"}} {count}"
+                );
+            }
         }
         out
     }
