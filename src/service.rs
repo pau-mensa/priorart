@@ -3,12 +3,12 @@
 //! Every content operation requires an explicit request context and collection.
 //! Revision preconditions are checked again inside the storage transaction.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::Instant;
 
 use crate::store::mutations::{Intent, Mutation};
-use lateweave::{Query, SearchRequest, Subset};
+use lateweave::{SearchRequest, Subset};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -18,10 +18,10 @@ use crate::analyzer::tokens;
 use crate::auth::{AuthError, Operation, RequestContext};
 use crate::config::Settings;
 use crate::excerpt::{excerpt, DEFAULT_WIDTH};
-use crate::gather::Statistics;
 use crate::index::{Index, IndexError};
 use crate::metrics::Metrics;
 use crate::policy::{self, PolicyError};
+use crate::recipe::{CollectionIndex, Recipe};
 use crate::searchlog::{Rating, SearchLog};
 use crate::store::{Metadata, RecordSummary, Revision, Store, StoreError};
 
@@ -100,10 +100,15 @@ struct State {
 }
 
 impl State {
-    fn index(&mut self, collection: &str, metrics: &Metrics) -> Result<&mut Index> {
+    fn index(
+        &mut self,
+        collection: &str,
+        recipe: &dyn Recipe,
+        metrics: &Metrics,
+    ) -> Result<&mut Index> {
         if self.index.is_none() {
             let started = Instant::now();
-            let index = Index::load(&self.store, collection)?;
+            let index = Index::load(&self.store, collection, recipe)?;
             metrics.index_loaded(collection, started.elapsed(), index.document_count());
             self.index = Some(index);
         }
@@ -126,6 +131,7 @@ pub struct DeleteOptions<'a> {
 
 pub struct Service {
     settings: Settings,
+    recipe: Arc<dyn Recipe>,
     states: Mutex<States>,
     metrics: Metrics,
     search_log: Option<SearchLog>,
@@ -140,7 +146,12 @@ struct States {
 }
 
 impl Service {
+    /// Opens with the built-in BM25 recipe.
     pub fn open(settings: Settings) -> Result<Self, OpenError> {
+        Self::open_with(settings, Arc::new(crate::gather::Bm25Recipe))
+    }
+
+    pub fn open_with(settings: Settings, recipe: Arc<dyn Recipe>) -> Result<Self, OpenError> {
         settings.validate()?;
         let owner = crate::ownership::DirectoryOwner::acquire(&settings.data_dir)?;
         Store::open(settings.data_dir.join(DATABASE_FILE))?;
@@ -150,6 +161,7 @@ impl Service {
             .transpose()?;
         Ok(Self {
             settings,
+            recipe,
             states: Mutex::default(),
             metrics: Metrics::default(),
             search_log,
@@ -271,6 +283,29 @@ impl Service {
         Ok(states.loaded[collection].clone())
     }
 
+    /// Applies a committed write to the loaded index, if any. A recipe failure
+    /// discards the index, so the next search rebuilds it from SQLite.
+    fn reindex(
+        &self,
+        collection: &str,
+        operation: &'static str,
+        index: &mut Option<Index>,
+        change: impl FnOnce(&mut Index) -> crate::recipe::Result<()>,
+    ) {
+        if let Some(loaded) = index {
+            if let Err(error) = change(loaded) {
+                eprintln!("priorart: discarding the index of {collection}: {error}");
+                *index = None;
+                self.metrics.index_discarded(collection);
+            }
+        }
+        self.metrics.write(
+            collection,
+            operation,
+            index.as_ref().map(Index::document_count),
+        );
+    }
+
     /// Text beyond `PRIORART_MAX_TOKENS` analyzer terms is cut before storing,
     /// so stored and indexed text match.
     fn cutoff<'a>(&self, text: &'a str) -> &'a str {
@@ -330,14 +365,9 @@ impl Service {
             record_id,
             options.expected_revision,
         )?;
-        if let Some(index) = index {
-            index.upsert(&created.value.0, created.value.1, stored);
-        }
-        self.metrics.write(
-            collection_id,
-            "put",
-            index.as_ref().map(Index::document_count),
-        );
+        self.reindex(collection_id, "put", index, |index| {
+            index.upsert(&created.value.0, created.value.1, stored)
+        });
         Ok(created)
     }
 
@@ -378,14 +408,9 @@ impl Service {
             return invalid("invalid revision precondition");
         }
         let committed = store.commit_delete(&intent, record_id, options.expected_revision)?;
-        if let Some(index) = index {
-            index.remove(record_id);
-        }
-        self.metrics.write(
-            collection_id,
-            "delete",
-            index.as_ref().map(Index::document_count),
-        );
+        self.reindex(collection_id, "delete", index, |index| {
+            index.remove(record_id)
+        });
         Ok(committed)
     }
 
@@ -403,8 +428,8 @@ impl Service {
         Ok(())
     }
 
-    /// BM25 over every selected collection with statistics summed across
-    /// them, so scores compare; ties go to collection ID, then record ID.
+    /// Ranks every selected collection with the recipe's pipeline, then reads
+    /// each hit's indexed revision.
     pub fn search<C: AsRef<str>>(
         &self,
         context: &RequestContext,
@@ -458,56 +483,61 @@ impl Service {
             .iter()
             .map(|handle| handle.lock().map_err(|_| ServiceError::Poisoned))
             .collect::<Result<Vec<_>>>()?;
-        let query_tokens = tokens(text);
-        let mut statistics = Statistics::default();
+        let mut subset = filters.map(|_| Subset::new());
+        let mut eligible = 0;
         for (collection, state) in collection_ids.iter().zip(&mut states) {
-            statistics.add(
-                state.index(collection, &self.metrics)?.lexical(),
-                &query_tokens,
-            );
-        }
-        let statistics = Arc::new(statistics);
-        let query = Query::new(text);
-        let mut ranked: Vec<(f32, usize, String, i64)> = Vec::new();
-        for (position, (collection, state)) in collection_ids.iter().zip(&mut states).enumerate() {
-            let started = Instant::now();
-            let matching = match filters {
-                Some(filters) => Some(state.store.matching_record_ids(collection, filters)?),
-                None => None,
-            };
-            let index = state.index(collection, &self.metrics)?;
-            if matching
-                .as_ref()
-                .map_or(index.document_count(), HashSet::len)
-                == 0
-            {
-                continue;
+            let count = state
+                .index(collection, &*self.recipe, &self.metrics)?
+                .document_count();
+            match (filters, subset.take()) {
+                (Some(filters), Some(selected)) => {
+                    let ids = state.store.matching_record_ids(collection, filters)?;
+                    eligible += ids.len();
+                    subset = Some(selected.with(*collection, ids));
+                }
+                _ => eligible += count,
             }
-            let subset = matching.map(|ids| Subset::new().with(*collection, ids));
-            let mut request = SearchRequest::new(limit, limit);
+        }
+        let query_tokens = tokens(text);
+        let mut ranked: Vec<(f32, usize, String, i64)> = Vec::new();
+        if eligible > 0 {
+            let started = Instant::now();
+            let indexes: Vec<(&str, &dyn CollectionIndex)> = collection_ids
+                .iter()
+                .zip(&states)
+                .map(|(collection, state)| {
+                    let index = state.index.as_ref().expect("loaded above");
+                    (*collection, index.recipe_index())
+                })
+                .collect();
+            let query = self.recipe.query(text).map_err(IndexError::from)?;
+            let pipeline = self
+                .recipe
+                .pipeline(&query, &indexes)
+                .map_err(IndexError::from)?;
+            let mut request = SearchRequest::new(self.recipe.gather_limit(limit).max(limit), limit);
             if let Some(subset) = &subset {
                 request = request.with_subset(subset);
             }
-            let result = index
-                .pipeline(statistics.clone())
+            let result = pipeline
                 .search(&query, &request)
-                .map_err(IndexError::from)?;
+                .map_err(|error| IndexError::Recipe(error.into()))?;
             for document in result.documents {
+                let unknown = || IndexError::Recipe("the recipe ranked an unindexed record".into());
+                let position = collection_ids
+                    .binary_search(&document.key.corpus())
+                    .map_err(|_| unknown())?;
                 let id = document.key.id();
-                let revision = index.revision(id).expect("ranked documents are indexed");
+                let revision = states[position]
+                    .index
+                    .as_ref()
+                    .and_then(|index| index.revision(id))
+                    .ok_or_else(unknown)?;
                 ranked.push((document.score, position, id.to_owned(), revision));
             }
-            self.metrics
-                .collection_search(collection, started.elapsed());
+            ranked.truncate(limit);
+            self.metrics.ranking(&collection_ids, started.elapsed());
         }
-        ranked.sort_unstable_by(|left, right| {
-            right
-                .0
-                .total_cmp(&left.0)
-                .then(left.1.cmp(&right.1))
-                .then_with(|| left.2.cmp(&right.2))
-        });
-        ranked.truncate(limit);
         let hits = ranked
             .into_iter()
             .map(|(score, position, id, revision)| {

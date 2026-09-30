@@ -152,9 +152,9 @@ Returns:
 - `filters` are up to 64 scalar equalities on metadata (strings, numbers,
   booleans), combined with AND, at most 16384 bytes.
 
-Scores are Lucene BM25 with statistics taken over the whole selection, so scores
-from different collections compare. Hits are merged by score; ties go to
-collection ID, then record ID. Searches store nothing unless the search log is
+With the built-in [recipe](recipes.md), scores are Lucene BM25 with statistics
+taken over the whole selection, so scores from different collections compare.
+Hits are merged by score; ties go to collection ID, then record ID. Searches store nothing unless the search log is
 enabled.
 
 ## Search log and feedback
@@ -288,8 +288,9 @@ so it reveals nothing about collections:
 - `priorart_searches_total{outcome="ok|client_error|server_error"}`.
 
 `GET /v1/admin/metrics` takes the [admin token](credentials.md#remote-administration)
-and adds requests and latency by route, method, and status; search time, writes,
-and indexed documents per collection; index load time; cached collections;
+and adds requests and latency by route, method, and status; ranking time;
+searches, writes, and indexed documents per collection; index load time and
+failed index updates; cached collections;
 evictions; `resource_limit` and `rate_limited` refusals; and, with the
 [search log](#search-log-and-feedback) enabled, entries it dropped by reason
 (`queue_full`, `write_failed`, `rejected_feedback`). Collection labels

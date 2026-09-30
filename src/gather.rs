@@ -1,16 +1,20 @@
-//! [`LexicalGatherer`]: Lucene BM25 as a lateweave candidate generator. It
-//! consumes only query text and honours the subset.
+//! The built-in recipe, [`Bm25Recipe`]: Lucene BM25 as a lateweave candidate
+//! generator over every selected collection. It consumes only query text and
+//! honours the subset.
 
+use std::any::Any;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use lateweave::{
-    Candidate, CandidateGenerator, DocumentKey, Gathered, Query, Requirements, Result, Subset,
+    Candidate, CandidateGenerator, DocumentKey, Gathered, Query, Requirements, Result,
+    SearchPipeline, Subset,
 };
 
 use crate::analyzer::tokens;
+use crate::recipe::{self, CollectionIndex, IndexDocument, Recipe};
 
 pub const LEXICAL_K1: f32 = 1.5;
 pub const LEXICAL_B: f32 = 0.75;
@@ -144,29 +148,108 @@ impl Statistics {
     }
 }
 
-/// One corpus: `record_ids[i]` names BM25 document `i`.
-pub struct LexicalGatherer {
-    corpus: Arc<str>,
+/// One collection's BM25 index: `record_ids[i]` names document `i`. Shared
+/// with pipelines through `Arc`s, copied only when a write finds it shared.
+#[derive(Default)]
+pub struct Bm25Index {
     record_ids: Arc<Vec<Arc<str>>>,
+    positions: HashMap<Arc<str>, usize>,
+    lexical: Arc<Bm25>,
+}
+
+impl Bm25Index {
+    fn push(&mut self, record_id: &str, text: &str) {
+        let record_id: Arc<str> = record_id.into();
+        self.positions
+            .insert(record_id.clone(), self.record_ids.len());
+        Arc::make_mut(&mut self.record_ids).push(record_id);
+        Arc::make_mut(&mut self.lexical).push(text);
+    }
+}
+
+impl CollectionIndex for Bm25Index {
+    fn upsert(&mut self, record_id: &str, _: i64, text: &str) -> recipe::Result<()> {
+        self.remove(record_id)?;
+        self.push(record_id, text);
+        Ok(())
+    }
+
+    fn remove(&mut self, record_id: &str) -> recipe::Result<()> {
+        let Some(position) = self.positions.remove(record_id) else {
+            return Ok(());
+        };
+        Arc::make_mut(&mut self.record_ids).remove(position);
+        for later in &self.record_ids[position..] {
+            *self.positions.get_mut(later).expect("indexed record") -= 1;
+        }
+        Arc::make_mut(&mut self.lexical).remove(position);
+        Ok(())
+    }
+}
+
+/// Lucene BM25 with statistics summed over every selected collection, so
+/// scores compare; ties go to collection ID, then record ID. No reranker.
+pub struct Bm25Recipe;
+
+impl Recipe for Bm25Recipe {
+    fn load(
+        &self,
+        _: &str,
+        documents: Vec<IndexDocument>,
+    ) -> recipe::Result<Box<dyn CollectionIndex>> {
+        let mut index = Bm25Index::default();
+        for document in documents {
+            index.push(&document.record_id, &document.text);
+        }
+        Ok(Box::new(index))
+    }
+
+    fn pipeline(
+        &self,
+        query: &Query,
+        indexes: &[(&str, &dyn CollectionIndex)],
+    ) -> recipe::Result<SearchPipeline> {
+        let terms = tokens(query.text());
+        let mut statistics = Statistics::default();
+        let mut corpora = Vec::with_capacity(indexes.len());
+        for &(collection, index) in indexes {
+            let index = (index as &dyn Any)
+                .downcast_ref::<Bm25Index>()
+                .ok_or("BM25 was given another recipe's index")?;
+            statistics.add(&index.lexical, &terms);
+            corpora.push(Corpus {
+                id: collection.into(),
+                record_ids: index.record_ids.clone(),
+                index: index.lexical.clone(),
+            });
+        }
+        let gatherer = LexicalGatherer::new(corpora, Arc::new(statistics));
+        Ok(SearchPipeline::new(Arc::new(gatherer), None))
+    }
+}
+
+pub struct Corpus {
+    pub id: Arc<str>,
+    pub record_ids: Arc<Vec<Arc<str>>>,
+    pub index: Arc<Bm25>,
+}
+
+/// BM25 over several corpora scored as one.
+pub struct LexicalGatherer {
+    corpora: Vec<Corpus>,
     requires: Requirements,
-    index: Arc<Bm25>,
     statistics: Arc<Statistics>,
 }
 
 impl LexicalGatherer {
-    /// `statistics` must include `index` and the query's terms.
-    pub fn new(
-        corpus: Arc<str>,
-        record_ids: Arc<Vec<Arc<str>>>,
-        index: Arc<Bm25>,
-        statistics: Arc<Statistics>,
-    ) -> Self {
-        debug_assert_eq!(record_ids.len(), index.len());
+    /// `statistics` must include every corpus and the query's terms.
+    pub fn new(corpora: Vec<Corpus>, statistics: Arc<Statistics>) -> Self {
+        for corpus in &corpora {
+            debug_assert_eq!(corpus.record_ids.len(), corpus.index.len());
+        }
         Self {
-            corpus,
-            record_ids,
+            corpora,
             requires: Requirements::new(),
-            index,
             statistics,
         }
     }
@@ -183,21 +266,38 @@ impl CandidateGenerator for LexicalGatherer {
 
     fn gather(&self, query: &Query, limit: usize, subset: Option<&Subset>) -> Result<Gathered> {
         let as_of = SystemTime::now();
-        let eligible = subset.map(|subset| {
-            let ids = subset.ids(&self.corpus);
-            self.record_ids
-                .iter()
-                .map(|id| ids.is_some_and(|ids| ids.contains(id)))
-                .collect::<Vec<_>>()
-        });
         let terms = tokens(query.text());
-        let candidates = self
-            .index
-            .search(&terms, limit, eligible.as_deref(), &self.statistics)
+        let mut scored: Vec<(f32, &Corpus, usize)> = Vec::new();
+        for corpus in &self.corpora {
+            let eligible = subset.map(|subset| {
+                let ids = subset.ids(&corpus.id);
+                corpus
+                    .record_ids
+                    .iter()
+                    .map(|id| ids.is_some_and(|ids| ids.contains(id)))
+                    .collect::<Vec<_>>()
+            });
+            scored.extend(
+                corpus
+                    .index
+                    .search(&terms, limit, eligible.as_deref(), &self.statistics)
+                    .into_iter()
+                    .map(|(document, score)| (score, corpus, document)),
+            );
+        }
+        scored.sort_unstable_by(|left, right| {
+            right
+                .0
+                .total_cmp(&left.0)
+                .then_with(|| left.1.id.cmp(&right.1.id))
+                .then_with(|| left.1.record_ids[left.2].cmp(&right.1.record_ids[right.2]))
+        });
+        scored.truncate(limit);
+        let candidates = scored
             .into_iter()
             .enumerate()
-            .map(|(rank, (document, score))| Candidate {
-                key: DocumentKey::new(self.corpus.clone(), self.record_ids[document].clone()),
+            .map(|(rank, (score, corpus, document))| Candidate {
+                key: DocumentKey::new(corpus.id.clone(), corpus.record_ids[document].clone()),
                 gather_score: score,
                 gather_rank: rank,
                 provenance: "bm25".to_owned(),
@@ -226,7 +326,14 @@ mod tests {
         let ids = (0..TEXTS.len())
             .map(|i| Arc::from(format!("r{i}")))
             .collect();
-        LexicalGatherer::new("t".into(), Arc::new(ids), index, Arc::new(statistics))
+        LexicalGatherer::new(
+            vec![Corpus {
+                id: "t".into(),
+                record_ids: Arc::new(ids),
+                index,
+            }],
+            Arc::new(statistics),
+        )
     }
 
     fn own(index: &Bm25, terms: &[&str]) -> Statistics {

@@ -124,14 +124,9 @@ impl Service {
                 metadata: source.metadata.as_ref(),
             },
         )?;
-        if let Some(index) = index {
-            index.upsert(record, committed.value.1, fitted);
-        }
-        self.metrics.write(
-            collection,
-            "import",
-            index.as_ref().map(Index::document_count),
-        );
+        self.reindex(collection, "import", index, |index| {
+            index.upsert(record, committed.value.1, fitted)
+        });
         Ok(committed)
     }
 }

@@ -21,6 +21,7 @@ protocol change.
 - **BM25 retrieval** (Lucene variant) through a
   [lateweave](https://github.com/pau-mensa/lateweave) search pipeline. Each
   collection's index lives in memory and is rebuilt from SQLite when needed.
+  Builds with their own ranking plug in a [recipe](docs/recipes.md).
 - **One file of state.** A single SQLite database. Revisions are kept; deletes
   remove text and keep a tombstone.
 - **One binary.** Written in Rust; the HTTP server and the MCP client ship in

@@ -82,7 +82,7 @@ struct Search {
 }
 
 enum Message {
-    Search(Search),
+    Search(Box<Search>),
     Feedback {
         principal: String,
         search_id: String,
@@ -207,7 +207,7 @@ impl SearchLog {
                 })
                 .collect(),
         };
-        self.offer(Message::Search(search)).then_some(id)
+        self.offer(Message::Search(Box::new(search))).then_some(id)
     }
 
     /// Queues ratings. The writer keeps only those naming a hit of a search by

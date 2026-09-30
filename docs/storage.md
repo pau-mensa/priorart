@@ -2,8 +2,8 @@
 
 A data directory holds `priorart.sqlite` (with its WAL files), `writer.lock`,
 and, when the [search log](protocol.md#search-log-and-feedback) is enabled,
-`searchlog.sqlite`. SQLite is the only persistent state. Each collection's BM25 index is built in
-memory from its live records on first use, updated after every write, and
+`searchlog.sqlite`. SQLite is the only persistent state. Each collection's index
+is built in memory from its live records on first use, updated after every write, and
 rebuilt from SQLite after a restart or cache eviction.
 
 ## Schema versions

@@ -62,7 +62,9 @@ struct Inner {
     search_outcomes: BTreeMap<&'static str, u64>,
     requests: BTreeMap<(String, &'static str, u16), u64>,
     request_durations: BTreeMap<String, Histogram>,
-    collection_searches: BTreeMap<String, Histogram>,
+    collection_searches: BTreeMap<String, u64>,
+    ranking: Histogram,
+    index_discards: u64,
     collection_writes: BTreeMap<(String, &'static str), u64>,
     indexed_documents: BTreeMap<String, usize>,
     index_loads: Histogram,
@@ -139,12 +141,23 @@ impl Metrics {
         }
     }
 
-    pub fn collection_search(&self, collection: &str, elapsed: Duration) {
-        self.inner()
-            .collection_searches
-            .entry(collection.to_owned())
-            .or_default()
-            .observe(elapsed.as_secs_f64());
+    /// One ranking pass over `collections`.
+    pub fn ranking(&self, collections: &[&str], elapsed: Duration) {
+        let mut inner = self.inner();
+        inner.ranking.observe(elapsed.as_secs_f64());
+        for collection in collections {
+            *inner
+                .collection_searches
+                .entry((*collection).to_owned())
+                .or_default() += 1;
+        }
+    }
+
+    /// A recipe failed to apply a write, so its index was dropped.
+    pub fn index_discarded(&self, collection: &str) {
+        let mut inner = self.inner();
+        inner.index_discards += 1;
+        inner.indexed_documents.remove(collection);
     }
 
     /// A committed write, with the collection's index size if it is loaded.
@@ -236,15 +249,24 @@ impl Metrics {
         }
         header(
             &mut out,
-            "priorart_collection_search_duration_seconds",
+            "priorart_search_ranking_duration_seconds",
             "histogram",
-            "Time spent ranking each collection of a search.",
+            "Time the retrieval recipe spent ranking a search.",
         );
-        for (collection, histogram) in &inner.collection_searches {
-            histogram.render(
-                &mut out,
-                "priorart_collection_search_duration_seconds",
-                &format!("collection=\"{}\"", escape(collection)),
+        inner
+            .ranking
+            .render(&mut out, "priorart_search_ranking_duration_seconds", "");
+        header(
+            &mut out,
+            "priorart_collection_searches_total",
+            "counter",
+            "Ranked searches that included each collection.",
+        );
+        for (collection, count) in &inner.collection_searches {
+            let _ = writeln!(
+                out,
+                "priorart_collection_searches_total{{collection=\"{}\"}} {count}",
+                escape(collection)
             );
         }
         header(
@@ -294,6 +316,12 @@ impl Metrics {
                 "counter",
                 "Cached collections evicted to admit another.",
                 inner.evictions,
+            ),
+            (
+                "priorart_index_update_failures_total",
+                "counter",
+                "Writes the recipe could not apply, discarding the collection's index.",
+                inner.index_discards,
             ),
             (
                 "priorart_resource_limited_total",
