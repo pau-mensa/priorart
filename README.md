@@ -43,15 +43,14 @@ curl -s localhost:8000/v1/collections/local/records -H 'content-type: applicatio
   "text": "NCCL watchdog timeout after epoch 1. Rank 3 had exited early: a stray sys.exit() in a data loader worker. Removed it; all ranks reach the barrier; training completes.",
   "metadata": {"topic": "distributed", "lang": "python"}
 }'
-# {"collection_id":"local","id":"3f9c…","revision":1}
+# {"collection_id":"local","id":"3f9c…","revision":1,"truncated":false}
 
 curl -s localhost:8000/v1/search -H 'content-type: application/json' -d '{
   "collections": ["local"],
   "text": "multi-GPU training hangs at the end of the first epoch, no error, GPU util drops to zero",
   "limit": 3
 }'
-# {"collections":["local"],"hits":[{"id":"3f9c…","revision":1,"score":…,"excerpt":"…"}],…}
-
+# {"collections":["local"],"hits":[{"collection_id":"local","id":"3f9c…","revision":1,"score":…,"excerpt":"…","metadata":{…}}]}
 ```
 
 The full wire specification is in [docs/protocol.md](docs/protocol.md).
@@ -93,9 +92,9 @@ Or in a project's `.mcp.json`:
 }
 ```
 
-The MCP process is deliberately a client, not an embedded store: one server owns
-the data directory and its in-memory indexes, so every agent session must go
-through it. See [MCP client](docs/protocol.md#mcp-client) for its settings.
+The MCP process is a client, not an embedded store: one server owns the data
+directory and its in-memory indexes, so every agent session goes through it. See
+[MCP client](docs/protocol.md#mcp-client) for its settings.
 
 ## Configuration
 
@@ -111,43 +110,31 @@ through it. See [MCP client](docs/protocol.md#mcp-client) for its settings.
 | `PRIORART_KEY_REQUESTS_PER_MINUTE` | unset | per-key request limit; over it returns 429 |
 | `PRIORART_ADMIN_TOKEN` | unset | enables the operator endpoints under `/v1/admin`; 32–256 characters |
 
-## Local credentials
+## Keys and authenticated mode
 
-`priorart admin issue --grant local:read` issues an opaque agent credential for
-the local principal and prints its secret once. Local commands also create
-principals and collections, and list, rotate, revoke, and replace grants. With
-`PRIORART_ADMIN_TOKEN` set, the same provisioning is available over HTTP under
-`/v1/admin`. See [credential administration](docs/credentials.md).
-The Rust service enforces [collection and object policy](docs/policy.md) on explicit
-request contexts. Start with `PRIORART_MODE=authenticated priorart serve` to require
-header credentials for restricted content and mutations. Public reads can be anonymous.
-Send credentials only in `Authorization: Bearer …`; invalid supplied keys always fail.
-The default local mode grants requests without credentials access to `local` only.
-`priorart admin create-collection` provisions a restricted collection; add
-`--visibility public` for an explicitly public collection.
+`PRIORART_MODE=authenticated priorart serve` requires a key for restricted
+collections and for every write; public collections stay readable without one.
+Keys are issued by the operator:
 
-## Limitations of this version
+```bash
+priorart admin create-principal
+priorart admin create-collection --owner PRINCIPAL_ID
+priorart admin issue --principal PRINCIPAL_ID --grant COLLECTION:write
+```
 
-For database upgrades and backups, see [storage](docs/storage.md).
+With `PRIORART_ADMIN_TOKEN` set, the same provisioning is available over HTTP
+under `/v1/admin`. See [credentials](docs/credentials.md) and
+[authorization](docs/policy.md).
 
-- Network hosting means authenticated mode behind a TLS-terminating proxy; see
-  [network hosting](docs/protocol.md#network-hosting). priorart does not terminate
-  TLS itself. Per-key limits are optional; other abuse handling is the host's job.
-- HTTP requests select explicit collections; search spans up to 16 with shared
-  BM25 statistics. Storage is access-controlled by the trusted service and remains
-  unencrypted.
-- One indexed view per record. Text beyond `PRIORART_MAX_TOKENS` is truncated
-  before storing, so stored and indexed text match; there is no chunking.
-  The cutoff counts the analyzer's terms (casefolded `\w+` runs).
-- One server owns each data directory. Writes update the in-memory index under a
-  per-collection lock; different collections can run concurrently within capacity.
-- Record mutations are journaled in SQLite; HTTP retry keys avoid duplicate
-  mutations after lost responses. Backups and physical storage erasure are separate.
-- Searches persist nothing: no query, filter, or result list.
+## Limitations
 
-Collection revisions can be streamed through the [export/import API](docs/protocol.md#streaming-export-and-import).
-Imports require explicit destination visibility and assign new authorship; retries
-resume within a batch without duplicating revisions.
+- priorart does not terminate TLS; serve it beyond loopback behind a proxy (see
+  [network hosting](docs/protocol.md#network-hosting)).
+- Storage is unencrypted, and deletion does not erase backups or free disk pages.
+- Text beyond `PRIORART_MAX_TOKENS` is truncated, not chunked.
+- One server owns each data directory; its indexes live in memory.
+
+See [storage](docs/storage.md) for backups and upgrades.
 
 ## Contributing
 
