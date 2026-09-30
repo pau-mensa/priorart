@@ -26,16 +26,13 @@ pub enum AuthError {
 
 pub type Result<T> = std::result::Result<T, AuthError>;
 
-/// Independent collection capabilities; admin does not imply any other operation.
+/// Collection capabilities, each implying the ones before it. `write` covers
+/// creating records and changing your own; `admin` is owner-level control.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Operation {
     Read,
-    Contribute,
-    Update,
-    Delete,
-    Moderate,
-    Export,
+    Write,
     Admin,
 }
 
@@ -43,11 +40,7 @@ impl Operation {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Read => "read",
-            Self::Contribute => "contribute",
-            Self::Update => "update",
-            Self::Delete => "delete",
-            Self::Moderate => "moderate",
-            Self::Export => "export",
+            Self::Write => "write",
             Self::Admin => "admin",
         }
     }
@@ -58,11 +51,7 @@ impl FromStr for Operation {
     fn from_str(value: &str) -> Result<Self> {
         match value {
             "read" => Ok(Self::Read),
-            "contribute" => Ok(Self::Contribute),
-            "update" => Ok(Self::Update),
-            "delete" => Ok(Self::Delete),
-            "moderate" => Ok(Self::Moderate),
-            "export" => Ok(Self::Export),
+            "write" => Ok(Self::Write),
             "admin" => Ok(Self::Admin),
             _ => Err(AuthError::InvalidInput("unknown credential operation")),
         }

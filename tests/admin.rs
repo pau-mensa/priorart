@@ -19,16 +19,7 @@ fn admin(directory: &TempDir, arguments: &[&str]) -> Output {
 #[test]
 fn local_bootstrap_listing_rotation_and_revocation() {
     let directory = tempfile::tempdir().unwrap();
-    let issued = admin(
-        &directory,
-        &[
-            "issue",
-            "--grant",
-            "local:read",
-            "--grant",
-            "local:contribute",
-        ],
-    );
+    let issued = admin(&directory, &["issue", "--grant", "local:write"]);
     assert!(issued.status.success());
     assert!(issued.stderr.is_empty());
     let value: Value = serde_json::from_slice(&issued.stdout).unwrap();

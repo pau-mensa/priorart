@@ -91,7 +91,6 @@ fn an_update_supersedes() {
             Some("nccl"),
             WriteOptions {
                 idempotency_key: None,
-                publish: false,
                 expected_revision: Some(1),
             },
         )

@@ -50,22 +50,24 @@ fn permitted(context: &RequestContext, collection: &Collection, operation: Opera
         return collection.id == LOCAL_COLLECTION_ID;
     }
     (operation == Operation::Read && collection.visibility == Visibility::Public)
-        || context.has_grant(&collection.id, operation)
+        || context.credential().is_some_and(|credential| {
+            credential
+                .grants
+                .iter()
+                .any(|grant| grant.collection_id == collection.id && grant.operation >= operation)
+        })
 }
 
-/// Updates/deletes require their explicit operation and authorship, or that
-/// operation plus moderate. Ownership alone grants no credential permissions.
+/// Changing a record takes `write` and authorship, or `admin`.
 pub(crate) fn mutation(
     store: &Store,
     context: &RequestContext,
     id: &str,
     record: &str,
-    operation: Operation,
 ) -> Result<()> {
-    let collection = collection(store, context, id, operation)?;
+    let collection = collection(store, context, id, Operation::Write)?;
     let author = store.record_author(id, record)?;
-    if context.is_local()
-        || permitted(context, &collection, Operation::Moderate)
+    if permitted(context, &collection, Operation::Admin)
         || author
             .as_ref()
             .is_some_and(|author| author.as_deref() == context.principal_id())

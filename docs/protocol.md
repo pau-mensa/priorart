@@ -27,8 +27,9 @@ model. Do not expose these modes through a proxy: forwarding-header rejection is
 not proof that a request did not pass through a proxy. Hosted privacy, resource
 accounting, and deletion guarantees are still incomplete.
 
-Mutations require a principal and the [independent operation grants](policy.md).
-Metadata, filters, ownership, and publication intent never confer authorization.
+Mutations require a principal and a [grant](policy.md): `read`, `write`, or
+`admin`, each implying the ones before it. Metadata, filters, and ownership never
+confer authorization.
 Unknown and forbidden resources have the same error envelope. Health returns only
 readiness; it does not load or validate every collection's index.
 
@@ -66,21 +67,19 @@ local administration only; see [credentials](credentials.md).
 
 ```json
 {"text": "…", "metadata": {"lang": "python"}, "id": "optional-client-id",
- "expected_revision": 0, "publish": false}
+ "expected_revision": 0}
 ```
 
 Returns `201 {"collection_id":"…","id":"…","revision":1,"truncated":false}`.
 
 - Omit `id` to generate an ID, or supply a collection-relative ID.
-- Omit `expected_revision` for a new record, or use `0` to explicitly require
-  absence. An explicit create colliding with an existing live ID returns `409`.
-- Updating an existing record requires its positive current `expected_revision`.
-  An authorized update without one returns `428`; a stale value returns `409`.
-  A positive precondition on a missing ID returns `409` and creates nothing.
+- `expected_revision` is optional. Omitted, the write creates the record or appends
+  a revision, whichever applies (last write wins). `0` requires absence; a positive
+  value must equal the current revision. A mismatch returns `409` and writes nothing.
 - Revision comparison and persistence occur in the same SQLite write transaction.
   Of two updates expecting the same revision, only one can append the next revision.
-- Creating needs `contribute`. Updating needs `update` plus original authorship or
-  `moderate`. Public writes additionally require `publish:true` on every request.
+- Creating needs `write`. Updating needs `write` plus original authorship, or
+  `admin`.
 - Text must be nonempty. Text beyond `PRIORART_MAX_TOKENS` (default 8192) is cut
   after the last token that fits and stored that way; the response reports
   `"truncated": true`. Metadata must be an object, at most 65536 serialized UTF-8 bytes,
@@ -97,14 +96,13 @@ letters/digits or `._:-`). Use a fresh key per intended mutation and retain it a
 retries. Keys are scoped to the authenticated principal, collection, and operation.
 Reusing a scoped key with different input returns `409 idempotency_conflict`.
 Input fingerprints include the submitted ID, text (before truncation), metadata,
-publication intent, and revision precondition as applicable. JSON object key order
+and revision precondition as applicable. JSON object key order
 is irrelevant; omitted optional fields and explicit null normalize alike.
 
 Every successful mutation returns `Mutation-Id: <opaque ID>`, including `204`
 deletes. With a matching key, a retry returns the original result and mutation ID,
-even if the original response was lost. Authentication and current original-operation
-authority are still required. Create retries need contribute/authorship, not an
-update grant; revoked credentials fail. A put replay on a deleted target is
+even if the original response was lost. Authentication and current `write` plus
+authorship (or `admin`) are still required; revoked credentials fail. A put replay on a deleted target is
 rejected. Purged keyed mutations retain a key marker without the content digest
 or result; retrying that key returns `410 mutation_purged`. Replaying an older successful update never replaces a later revision.
 
@@ -136,10 +134,9 @@ Returns `{"collection_id","records":[{"id","revision","created_at","updated_at",
 where `created_at` is the record's first revision and `updated_at` its latest.
 
 `DELETE /v1/collections/{collection}/records/{id}?expected_revision=N` requires
-`delete` plus authorship or `moderate`. An authorized existing target requires a
-positive current revision, compared inside the deletion transaction. Missing
-preconditions return `428`; stale ones return `409`. Returns `204`, including a
-repeat deletion with the same last revision. Tombstones reserve IDs. An authorized
+`write` plus authorship, or `admin`. `expected_revision` is optional; when supplied
+it must be the current revision, compared inside the deletion transaction, or the
+delete returns `409`. Returns `204`, including a repeat deletion. Tombstones reserve IDs. An authorized
 read of a deleted record returns `410`; unknown or forbidden targets return `404`.
 Deletion purges all revisions and hashes and removes the record from the index.
 Record IDs cannot be reused.
@@ -192,10 +189,10 @@ query, filter, result list, or receipt.
 
 ## Streaming export and import
 
-`GET /v1/collections/{collection}/export?limit=50` requires `export` and current
-read access, even on a public collection. It streams `application/x-ndjson` with
+`GET /v1/collections/{collection}/export?limit=50` requires `admin`, even on a
+public collection. It streams `application/x-ndjson` with
 `Cache-Control: no-store`. Records are ordered by `(record_id, revision)` and
-include every retained revision of live records. Deleted records, credentials, grants, indexes, and private import provenance are excluded.
+include every retained revision of live records. Deleted records, credentials, grants, and indexes are excluded.
 
 Each revision is a separate line:
 
@@ -213,36 +210,32 @@ revocation or any content change stops the stream. A generation mismatch before
 headers returns `409 export_changed`. Restart the export after a content change;
 do not combine pages from different generations.
 
-`POST /v1/collections/{collection}/import?visibility=restricted` accepts this
-NDJSON format with `Content-Type: application/x-ndjson` and a required
-`Idempotency-Key` identifying the import batch. The destination must already
-exist; its visibility must match the explicit query parameter. Public imports
-also require `publish=true`. `contribute` is required throughout; appending further
-source revisions to a record also requires `update`. No source collection is
-looked up or implicitly selected, and uploaded source IDs grant no access.
+`POST /v1/collections/{collection}/import?overwrite=false` accepts this NDJSON format with
+`Content-Type: application/x-ndjson` and a required `Idempotency-Key` identifying
+the import batch. The destination must already exist, and `write` is required
+throughout. No source collection is looked up, and uploaded source IDs grant no
+access.
 
-Imports create random destination IDs and privately persist their mapping to the
-principal, destination, batch key digest, and source record reference. Source revisions must arrive
-in increasing order for each source record; gaps are allowed and destination
-revision numbers start at 1. Replaying an identical row in the same batch returns
-its original result. Changing a replay's contents conflicts. A new batch key
-creates a separate copy. Imports never overwrite a pre-existing record or an
-intervening manual edit, and purged batches cannot recreate deleted content. Imported
-text beyond the destination's token cutoff is truncated like any other write.
+Imported records keep their source record IDs. By default source revision N must
+land as revision N, so an import into a collection without those IDs reproduces
+them and their revision numbers, and an ID that already exists stops the import
+with `409 revision_conflict`. With `overwrite=true` each row is instead appended
+as the record's next revision, creating it if absent (last write wins); changing
+another author's record still needs `admin`. Deleted IDs cannot be recreated in
+either mode.
 
-The destination collection keeps its owner and visibility. The service assigns
-record authorship to the importing principal and uses new creation timestamps.
-Uploaded author, timestamp, visibility, and source references are unverified
-claims, saved separately as private provenance. They are not returned through
-record/search responses or subsequent exports. Import acknowledgements return
-source-to-destination mappings to the importer. Explicit copies survive deletion
-of their source; deleting the destination purges its provenance.
+Replaying an identical row with the same batch key and mode returns its original
+result; changing its contents or mode conflicts. Under a new batch key, overwrite
+mode appends every row again. Imported text beyond the token cutoff is truncated
+like any other write.
 
-Each accepted row commits content, provenance, and its mutation receipt atomically,
-then indexes it before returning an acknowledgement:
+The importing principal becomes the author, with new creation timestamps. Uploaded
+author, timestamp, and visibility are ignored. Each accepted row commits content
+and its mutation receipt atomically, then indexes it before returning an
+acknowledgement:
 
 ```json
-{"type":"imported","source":{"collection_id":"source","record_id":"r1","revision":2},"collection_id":"destination","record_id":"new-id","revision":1,"mutation_id":"mutation-id"}
+{"type":"imported","source":{"collection_id":"source","record_id":"r1","revision":2},"collection_id":"destination","record_id":"r1","revision":2,"mutation_id":"mutation-id"}
 {"type":"end","count":1}
 ```
 
@@ -284,7 +277,6 @@ SQL errors, and paths:
 | 410 | `record_deleted` | authorized read/write of a tombstoned record |
 | 413 | `payload_too_large` | HTTP body exceeds `256 * max_tokens + 65536` bytes |
 | 422 | `validation_error` | malformed JSON/query, wrong types, missing/unknown fields |
-| 428 | `revision_required` | authorized existing mutation lacks a precondition |
 | 429 | `resource_limit` | all cached collection execution slots are pinned |
 | 503 | `unavailable` | backend failure or unsupported transport configuration |
 
@@ -295,5 +287,5 @@ rate limiter or hosted admission system.
 ## Local MCP workflow
 
 The bundled MCP client uses explicit `local` routes and search scope. Corrections
-and deletes require `expected_revision`. It currently
+and deletes accept an optional `expected_revision`. It currently
 supports the default local server only.

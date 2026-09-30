@@ -75,11 +75,9 @@ filesystem snapshots, exports, or backups.
 
 Each collection has a content version, bumped by every revision change. Export
 reads one revision at a time by keyset and aborts if the version changes. Import
-commits each revision with its private, unverified source claim and its receipt in
-one transaction; purging the record or collection removes the claim. A minimal
-batch mapping (destination record, importer, digest of batch and source reference)
-survives record purge so later rows of that batch cannot bypass the tombstone.
-Import retry keys live in the `put` namespace with an `import:` prefix.
+commits each revision and its receipt in one transaction, under the source record
+ID, so a tombstoned ID cannot be recreated. Import retry keys live in the `put`
+namespace with an `import:` prefix.
 
 ## Backups and upgrades
 

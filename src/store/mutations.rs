@@ -14,14 +14,13 @@ pub(crate) struct Intent<'a> {
     pub operation: &'a str,
     pub key: Option<&'a str>,
     pub payload: String,
-    pub authority: &'a str,
 }
 
 impl Store {
     pub(crate) fn replay<T: DeserializeOwned>(
         &self,
         intent: &Intent<'_>,
-    ) -> Result<Option<(Mutation<T>, String)>> {
+    ) -> Result<Option<Mutation<T>>> {
         replay(&self.connection, intent)
     }
 
@@ -72,13 +71,13 @@ impl Store {
         change: impl FnOnce(&Transaction<'_>) -> Result<(T, String)>,
     ) -> Result<Mutation<T>> {
         let transaction = self.write()?;
-        if let Some((result, _)) = replay(&transaction, intent)? {
+        if let Some(result) = replay(&transaction, intent)? {
             return Ok(result);
         }
         let (value, target_record) = change(&transaction)?;
         let mutation_id = new_id();
         transaction.execute(
-            "INSERT INTO mutations VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            "INSERT INTO mutations VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             rusqlite::params![
                 mutation_id,
                 intent.collection,
@@ -86,7 +85,6 @@ impl Store {
                 intent.operation,
                 intent.key.map(digest),
                 intent.payload,
-                intent.authority,
                 serde_json::to_string(&value).map_err(|_| StoreError::Journal)?,
                 now(),
                 target_record
@@ -100,15 +98,15 @@ impl Store {
 fn replay<T: DeserializeOwned>(
     connection: &Connection,
     intent: &Intent<'_>,
-) -> Result<Option<(Mutation<T>, String)>> {
+) -> Result<Option<Mutation<T>>> {
     let Some(key) = intent.key else {
         return Ok(None);
     };
-    let row: Option<(String, String, String, String)> = connection.query_row(
-        "SELECT id, payload_digest, result, authority FROM mutations WHERE collection_id = ?1 AND principal_id = ?2 AND operation = ?3 AND idempotency_digest = ?4",
+    let row: Option<(String, String, String)> = connection.query_row(
+        "SELECT id, payload_digest, result FROM mutations WHERE collection_id = ?1 AND principal_id = ?2 AND operation = ?3 AND idempotency_digest = ?4",
         (intent.collection, intent.principal, intent.operation, digest(key)),
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?;
-    row.map(|(id, payload, value, authority)| {
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
+    row.map(|(id, payload, value)| {
         if payload.is_empty() {
             return Err(StoreError::MutationPurged);
         }
@@ -116,13 +114,10 @@ fn replay<T: DeserializeOwned>(
             return Err(StoreError::IdempotencyConflict);
         }
         let value = serde_json::from_str(&value).map_err(|_| StoreError::Journal)?;
-        Ok((
-            Mutation {
-                mutation_id: id,
-                value,
-            },
-            authority,
-        ))
+        Ok(Mutation {
+            mutation_id: id,
+            value,
+        })
     })
     .transpose()
 }

@@ -562,17 +562,6 @@ fn revision_preconditions_are_atomic_across_connections() {
     assert!(matches!(
         store.put(
             LOCAL,
-            "missing precondition",
-            None,
-            Some("same"),
-            LOCAL_PRINCIPAL_ID,
-            None
-        ),
-        Err(StoreError::RevisionRequired)
-    ));
-    assert!(matches!(
-        store.put(
-            LOCAL,
             "create collision",
             None,
             Some("same"),
@@ -591,10 +580,6 @@ fn revision_preconditions_are_atomic_across_connections() {
             Some(1)
         ),
         Err(StoreError::RevisionConflict)
-    ));
-    assert!(matches!(
-        store.delete(LOCAL, "same", None),
-        Err(StoreError::RevisionRequired)
     ));
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
     let workers: Vec<_> = ["left", "right"]
@@ -628,6 +613,23 @@ fn revision_preconditions_are_atomic_across_connections() {
     assert!(matches!(
         store.delete(LOCAL, "same", Some(1)),
         Err(StoreError::RevisionConflict)
+    ));
+}
+
+#[test]
+fn omitted_preconditions_write_unconditionally() {
+    let (_directory, store) = open();
+    for revision in 1..=2 {
+        let written = store
+            .put(LOCAL, "text", None, Some("same"), LOCAL_PRINCIPAL_ID, None)
+            .unwrap();
+        assert_eq!(written.revision, revision);
+    }
+    assert!(store.delete(LOCAL, "same", None).unwrap());
+    assert!(!store.delete(LOCAL, "same", None).unwrap());
+    assert!(matches!(
+        store.put(LOCAL, "again", None, Some("same"), LOCAL_PRINCIPAL_ID, None),
+        Err(StoreError::RecordDeleted { .. })
     ));
 }
 

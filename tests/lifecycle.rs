@@ -108,7 +108,7 @@ fn collection_purge_revokes_only_its_grants_and_never_recreates_local() {
         .unwrap();
     let grants: Vec<_> = [&public, &other]
         .into_iter()
-        .flat_map(|c| [Op::Read, Op::Contribute, Op::Admin].map(|op| Grant::new(c, op)))
+        .flat_map(|c| [Grant::new(c, Op::Admin)])
         .collect();
     let key = store
         .issue_local_credential(&principal, &grants, None)
@@ -134,7 +134,6 @@ fn collection_purge_revokes_only_its_grants_and_never_recreates_local() {
             None,
             Some("same"),
             WriteOptions {
-                publish: true,
                 ..Default::default()
             },
         )

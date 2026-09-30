@@ -7,14 +7,7 @@ use priorart::store::{Metadata, Store, Visibility, LOCAL_COLLECTION_ID};
 use serde_json::json;
 use tempfile::TempDir;
 
-const ALL: &[Op] = &[
-    Op::Read,
-    Op::Contribute,
-    Op::Update,
-    Op::Delete,
-    Op::Moderate,
-    Op::Admin,
-];
+const OWNER: &[Op] = &[Op::Admin];
 
 struct Fixture {
     _dir: TempDir,
@@ -44,9 +37,9 @@ impl Fixture {
         let public = store.create_collection(&alice, Visibility::Public).unwrap();
         let alice_grants: Vec<_> = [&a, &public]
             .iter()
-            .flat_map(|id| ALL.iter().map(|op| Grant::new(*id, *op)))
+            .flat_map(|id| OWNER.iter().map(|op| Grant::new(*id, *op)))
             .collect();
-        let bob_grants: Vec<_> = ALL.iter().map(|op| Grant::new(&b, *op)).collect();
+        let bob_grants: Vec<_> = OWNER.iter().map(|op| Grant::new(&b, *op)).collect();
         let alice_key = store
             .issue_local_credential(&alice, &alice_grants, None)
             .unwrap()
@@ -209,7 +202,6 @@ fn read_scope_includes_old_revisions_but_not_mutations_or_diagnostics() {
             Some("same"),
             WriteOptions {
                 idempotency_key: None,
-                publish: false,
                 expected_revision: Some(1),
             },
         )
@@ -274,7 +266,6 @@ fn anonymous_public_reads_succeed_and_mutations_require_credentials() {
             None,
             WriteOptions {
                 idempotency_key: None,
-                publish: true,
                 expected_revision: None,
             },
         ));
@@ -293,21 +284,10 @@ fn anonymous_public_reads_succeed_and_mutations_require_credentials() {
 }
 
 #[test]
-fn public_authorship_publication_and_moderation_are_explicit() {
+fn write_changes_only_your_own_records_and_admin_changes_anyones() {
     let f = Fixture::new();
-    let contributor = f.limited(&f.bob, &f.public, &[Op::Contribute, Op::Update, Op::Delete]);
+    let contributor = f.limited(&f.bob, &f.public, &[Op::Write]);
     let author = f.context(&contributor);
-    assert!(matches!(
-        f.service.put(
-            &author,
-            &f.public,
-            "public text",
-            None,
-            Some("bob-record"),
-            WriteOptions::default()
-        ),
-        Err(ServiceError::InvalidInput(_))
-    ));
     f.service
         .put(
             &author,
@@ -315,11 +295,7 @@ fn public_authorship_publication_and_moderation_are_explicit() {
             "public text",
             None,
             Some("bob-record"),
-            WriteOptions {
-                idempotency_key: None,
-                publish: true,
-                expected_revision: None,
-            },
+            WriteOptions::default(),
         )
         .unwrap();
     assert_eq!(
@@ -337,11 +313,7 @@ fn public_authorship_publication_and_moderation_are_explicit() {
             "corrected public text",
             None,
             Some("bob-record"),
-            WriteOptions {
-                idempotency_key: None,
-                publish: true,
-                expected_revision: Some(1),
-            },
+            WriteOptions::default(),
         )
         .unwrap();
     unavailable(f.service.put(
@@ -350,44 +322,27 @@ fn public_authorship_publication_and_moderation_are_explicit() {
         "overwrite Alice",
         None,
         Some("same"),
-        WriteOptions {
-            idempotency_key: None,
-            publish: true,
-            expected_revision: None,
-        },
+        WriteOptions::default(),
     ));
-    unavailable(f.service.delete(
-        &author,
-        &f.public,
-        "same",
-        priorart::service::DeleteOptions {
-            expected_revision: Some(1),
-            idempotency_key: None,
-        },
-    ));
-    let owner_limited = f.limited(&f.alice, &f.public, &[Op::Update, Op::Delete, Op::Admin]);
-    let owner_limited = f.context(&owner_limited);
+    unavailable(
+        f.service
+            .delete(&author, &f.public, "same", Default::default()),
+    );
+    unavailable(f.service.health(&author, &f.public));
+    let owner_writer = f.limited(&f.alice, &f.public, &[Op::Write]);
+    let owner_writer = f.context(&owner_writer);
     unavailable(f.service.put(
-        &owner_limited,
+        &owner_writer,
         &f.public,
         "owner overwrite",
         None,
         Some("bob-record"),
-        WriteOptions {
-            idempotency_key: None,
-            publish: true,
-            expected_revision: None,
-        },
+        WriteOptions::default(),
     ));
-    unavailable(f.service.delete(
-        &owner_limited,
-        &f.public,
-        "bob-record",
-        priorart::service::DeleteOptions {
-            expected_revision: Some(1),
-            idempotency_key: None,
-        },
-    ));
+    unavailable(
+        f.service
+            .delete(&owner_writer, &f.public, "bob-record", Default::default()),
+    );
     f.service
         .put(
             &f.alice(),
@@ -397,7 +352,6 @@ fn public_authorship_publication_and_moderation_are_explicit() {
             Some("bob-record"),
             WriteOptions {
                 idempotency_key: None,
-                publish: true,
                 expected_revision: Some(2),
             },
         )
@@ -411,27 +365,11 @@ fn public_authorship_publication_and_moderation_are_explicit() {
         Some(f.bob.as_str())
     );
     f.service
-        .delete(
-            &f.alice(),
-            &f.public,
-            "bob-record",
-            priorart::service::DeleteOptions {
-                expected_revision: Some(3),
-                idempotency_key: None,
-            },
-        )
+        .delete(&f.alice(), &f.public, "bob-record", Default::default())
         .unwrap();
     let author = f.context(&contributor);
     f.service
-        .delete(
-            &author,
-            &f.public,
-            "bob-record",
-            priorart::service::DeleteOptions {
-                expected_revision: Some(3),
-                idempotency_key: None,
-            },
-        )
+        .delete(&author, &f.public, "bob-record", Default::default())
         .unwrap(); // tombstone retains ownership
     assert!(f
         .service
@@ -441,48 +379,45 @@ fn public_authorship_publication_and_moderation_are_explicit() {
             "resurrect",
             None,
             Some("bob-record"),
-            WriteOptions {
-                idempotency_key: None,
-                publish: true,
-                expected_revision: None
-            }
+            WriteOptions::default()
         )
         .is_err());
 }
 
 #[test]
-fn contribute_does_not_grant_update_even_to_the_original_author() {
+fn write_implies_read_but_not_admin() {
     let f = Fixture::new();
-    let key = f.limited(&f.alice, &f.a, &[Op::Contribute]);
+    let key = f.limited(&f.alice, &f.a, &[Op::Write]);
     let writer = f.context(&key);
+    for text in ["first", "second"] {
+        f.service
+            .put(
+                &writer,
+                &f.a,
+                text,
+                None,
+                Some("mine"),
+                WriteOptions::default(),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        f.service.get(&writer, &f.a, "mine", None).unwrap().revision,
+        2
+    );
+    assert_eq!(
+        f.service
+            .search(&writer, &[&f.a], "second", None, 10)
+            .unwrap()[0]
+            .id,
+        "mine"
+    );
+    unavailable(f.service.health(&writer, &f.a));
+    unavailable(f.service.delete_collection(&writer, &f.a));
+    unavailable(f.service.export_generation(&writer, &f.a));
     f.service
-        .put(
-            &writer,
-            &f.a,
-            "Bob's record",
-            None,
-            Some("bob"),
-            WriteOptions::default(),
-        )
+        .delete(&writer, &f.a, "mine", Default::default())
         .unwrap();
-    unavailable(f.service.put(
-        &writer,
-        &f.a,
-        "correction",
-        None,
-        Some("bob"),
-        WriteOptions::default(),
-    ));
-    unavailable(f.service.get(&writer, &f.a, "bob", None));
-    unavailable(f.service.delete(
-        &writer,
-        &f.a,
-        "bob",
-        priorart::service::DeleteOptions {
-            expected_revision: Some(1),
-            idempotency_key: None,
-        },
-    ));
 }
 
 #[test]
@@ -599,7 +534,6 @@ fn expired_credentials_fail_even_for_public_data() {
         None,
         WriteOptions {
             idempotency_key: None,
-            publish: true,
             expected_revision: None,
         },
     ));

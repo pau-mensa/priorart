@@ -3,14 +3,14 @@ mod common;
 use priorart::{
     auth::{Grant, Operation as Op, RequestContext},
     config::{ServerMode, Settings},
-    service::{DeleteOptions, ImportOptions, Service, ServiceError, WriteOptions, DATABASE_FILE},
+    service::{DeleteOptions, Service, ServiceError, WriteOptions, DATABASE_FILE},
     store::{ExportCursor, Store, StoreError, TransferRecord, Visibility},
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
 
 struct Fixture {
-    dir: tempfile::TempDir,
+    _dir: tempfile::TempDir,
     store: Store,
     service: Arc<Service>,
     source: String,
@@ -34,14 +34,7 @@ impl Fixture {
             .create_collection(&bob, Visibility::Restricted)
             .unwrap();
         let public = store.create_collection(&bob, Visibility::Public).unwrap();
-        let permissions = [
-            Op::Read,
-            Op::Export,
-            Op::Contribute,
-            Op::Update,
-            Op::Delete,
-            Op::Admin,
-        ];
+        let permissions = [Op::Admin];
         let alice_key = store
             .issue_local_credential(
                 &alice,
@@ -85,7 +78,7 @@ impl Fixture {
             .unwrap(),
         );
         Self {
-            dir,
+            _dir: dir,
             store,
             service,
             source,
@@ -122,13 +115,7 @@ impl Fixture {
         rows
     }
 }
-fn options() -> ImportOptions<'static> {
-    ImportOptions {
-        batch_key: "transfer-once",
-        visibility: Visibility::Restricted,
-        publish: false,
-    }
-}
+const BATCH: &str = "transfer-once";
 
 #[test]
 fn export_is_scoped_and_generation_checked() {
@@ -156,14 +143,14 @@ fn export_is_scoped_and_generation_checked() {
         .service
         .export_generation(&f.context(&read_only), &f.public)
         .is_err());
-    let export_only = f
+    let writer = f
         .store
-        .issue_local_credential(&f.bob, &[Grant::new(&f.destination, Op::Export)], None)
+        .issue_local_credential(&f.bob, &[Grant::new(&f.destination, Op::Write)], None)
         .unwrap()
         .into_secret();
     assert!(f
         .service
-        .export_generation(&f.context(&export_only), &f.destination)
+        .export_generation(&f.context(&writer), &f.destination)
         .is_err());
     let alice = f.context(&f.alice_key);
     let generation = f.service.export_generation(&alice, &f.source).unwrap();
@@ -193,55 +180,33 @@ fn export_is_scoped_and_generation_checked() {
 }
 
 #[test]
-fn import_preserves_history_as_new_authored_records_and_retries_without_duplicates() {
+fn import_keeps_ids_and_history_and_retries_without_duplicates() {
     let f = Fixture::new();
     let records = f.records();
     let bob = f.context(&f.bob_key);
-    let first = f
-        .service
-        .import_revision(&bob, &f.destination, &records[0], options())
-        .unwrap();
-    let second = f
-        .service
-        .import_revision(&bob, &f.destination, &records[1], options())
-        .unwrap();
-    assert_eq!(first.value.0, second.value.0);
-    assert_eq!((first.value.1, second.value.1), (1, 2));
-    assert_eq!(
+    let import = |row: &TransferRecord| {
         f.service
-            .import_revision(&bob, &f.destination, &records[0], options())
-            .unwrap(),
-        first
-    );
-    assert_eq!(
-        f.service
-            .import_revision(&bob, &f.destination, &records[1], options())
-            .unwrap(),
-        second
-    );
+            .import_revision(&bob, &f.destination, row, BATCH, false)
+    };
+    let first = import(&records[0]).unwrap();
+    let second = import(&records[1]).unwrap();
+    assert_eq!(first.value, ("record".to_owned(), 1));
+    assert_eq!(second.value, ("record".to_owned(), 2));
+    assert_eq!(import(&records[0]).unwrap(), first);
+    assert_eq!(import(&records[1]).unwrap(), second);
     let imported = f
         .service
-        .get(&bob, &f.destination, &first.value.0, Some(1))
+        .get(&bob, &f.destination, "record", Some(1))
         .unwrap();
     assert_eq!(
         imported.author_principal_id.as_deref(),
         Some(f.bob.as_str())
     );
     assert_eq!(imported.text.as_deref(), Some("first revision"));
-    let db = rusqlite::Connection::open(f.dir.path().join(DATABASE_FILE)).unwrap();
-    let claim: String = db
-        .query_row(
-            "SELECT source_author_principal_id FROM import_provenance LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(claim, f.alice);
     let mut changed = records[0].clone();
     changed.text = "changed retry".into();
     assert!(matches!(
-        f.service
-            .import_revision(&bob, &f.destination, &changed, options()),
+        import(&changed),
         Err(ServiceError::Store(StoreError::IdempotencyConflict))
     ));
     let hits = f
@@ -251,93 +216,93 @@ fn import_preserves_history_as_new_authored_records_and_retries_without_duplicat
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].revision, 2);
     f.service
-        .delete(
-            &bob,
-            &f.destination,
-            &first.value.0,
-            DeleteOptions {
-                expected_revision: Some(2),
-                ..Default::default()
-            },
-        )
+        .delete(&bob, &f.destination, "record", DeleteOptions::default())
         .unwrap();
-    assert_eq!(
-        db.query_row("SELECT count(*) FROM import_provenance", [], |r| r
-            .get::<_, i64>(0))
-            .unwrap(),
-        0
-    );
-    assert!(f
-        .service
-        .import_revision(&bob, &f.destination, &records[0], options())
-        .is_err());
+    assert!(import(&records[0]).is_err());
     let mut unseen = records[1].clone();
     unseen.revision = 3;
-    assert!(matches!(
-        f.service
-            .import_revision(&bob, &f.destination, &unseen, options()),
-        Err(ServiceError::Store(StoreError::RecordDeleted { .. }))
-    ));
-    assert_eq!(
-        db.query_row(
-            "SELECT count(*) FROM records WHERE collection_id = ?1 AND deleted_at IS NULL",
-            [&f.destination],
-            |r| r.get::<_, i64>(0)
-        )
-        .unwrap(),
-        0
-    );
+    for overwrite in [false, true] {
+        assert!(matches!(
+            f.service
+                .import_revision(&bob, &f.destination, &unseen, BATCH, overwrite),
+            Err(ServiceError::Store(StoreError::RecordDeleted { .. }))
+        ));
+    }
     assert!(f.store.get(&f.source, "record", Some(1)).is_ok());
 }
 
 #[test]
-fn import_never_trusts_source_authority_or_overwrites_intervening_edits() {
+fn existing_ids_conflict_unless_overwriting() {
+    let f = Fixture::new();
+    let records = f.records();
+    let bob = f.context(&f.bob_key);
+    f.service
+        .put(
+            &bob,
+            &f.destination,
+            "local note",
+            None,
+            Some("record"),
+            WriteOptions::default(),
+        )
+        .unwrap();
+    assert!(matches!(
+        f.service
+            .import_revision(&bob, &f.destination, &records[0], BATCH, false),
+        Err(ServiceError::Store(StoreError::RevisionConflict))
+    ));
+    for (row, revision) in records.iter().zip([2, 3]) {
+        let imported = f
+            .service
+            .import_revision(&bob, &f.destination, row, "overwrite", true)
+            .unwrap();
+        assert_eq!(imported.value, ("record".to_owned(), revision));
+    }
+    let text = |revision| {
+        f.service
+            .get(&bob, &f.destination, "record", revision)
+            .unwrap()
+            .text
+    };
+    assert_eq!(text(None).as_deref(), Some("second revision"));
+    assert_eq!(text(Some(1)).as_deref(), Some("local note"));
+    f.service
+        .import_revision(&bob, &f.public, &records[0], BATCH, false)
+        .unwrap();
+    assert!(matches!(
+        f.service
+            .import_revision(&bob, &f.public, &records[0], BATCH, true),
+        Err(ServiceError::Store(StoreError::IdempotencyConflict))
+    ));
+    let writer = f
+        .store
+        .issue_local_credential(&f.alice, &[Grant::new(&f.public, Op::Write)], None)
+        .unwrap()
+        .into_secret();
+    assert!(matches!(
+        f.service
+            .import_revision(&f.context(&writer), &f.public, &records[1], BATCH, true),
+        Err(ServiceError::Policy(_))
+    ));
+}
+
+#[test]
+fn import_never_trusts_source_authority() {
     let f = Fixture::new();
     let mut row = f.records()[0].clone();
     let bob = f.context(&f.bob_key);
     assert!(f
         .service
-        .import_revision(&bob, &f.source, &row, options())
-        .is_err());
-    assert!(f
-        .service
-        .import_revision(&bob, &f.public, &row, options())
-        .is_err());
-    assert!(f
-        .service
-        .import_revision(
-            &bob,
-            &f.public,
-            &row,
-            ImportOptions {
-                visibility: Visibility::Public,
-                ..options()
-            }
-        )
+        .import_revision(&bob, &f.source, &row, BATCH, false)
         .is_err());
     row.collection_id = "forged-source".into();
     row.author_principal_id = Some("forged-author".into());
-    let public = f
-        .service
-        .import_revision(
-            &bob,
-            &f.public,
-            &row,
-            ImportOptions {
-                visibility: Visibility::Public,
-                publish: true,
-                ..options()
-            },
-        )
+    f.service
+        .import_revision(&bob, &f.public, &row, BATCH, false)
         .unwrap();
     let record = f
         .service
-        .get(
-            &RequestContext::anonymous(),
-            &f.public,
-            &public.value.0,
-            None,
-        )
+        .get(&RequestContext::anonymous(), &f.public, "record", None)
         .unwrap();
     assert_eq!(record.author_principal_id.as_deref(), Some(f.bob.as_str()));
     let exported = f
@@ -351,65 +316,20 @@ fn import_never_trusts_source_authority_or_overwrites_intervening_edits() {
         .unwrap()
         .unwrap();
     assert!(!serde_json::to_string(&exported).unwrap().contains("forged"));
-    let copied = f
-        .service
-        .import_revision(&bob, &f.destination, &row, options())
-        .unwrap();
-    f.service
-        .put(
-            &bob,
-            &f.destination,
-            "manual edit",
-            None,
-            Some(&copied.value.0),
-            WriteOptions {
-                expected_revision: Some(1),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    row.revision = 2;
-    assert!(matches!(
-        f.service
-            .import_revision(&bob, &f.destination, &row, options()),
-        Err(ServiceError::Store(StoreError::RevisionConflict))
-    ));
-    let contribute_only = f
+    let read_only = f
         .store
-        .issue_local_credential(&f.bob, &[Grant::new(&f.destination, Op::Contribute)], None)
+        .issue_local_credential(&f.bob, &[Grant::new(&f.destination, Op::Read)], None)
         .unwrap()
         .into_secret();
-    let limited = f.context(&contribute_only);
     assert!(f
         .service
-        .import_revision(&limited, &f.destination, &row, options())
+        .import_revision(&f.context(&read_only), &f.destination, &row, BATCH, false)
         .is_err());
-    let bob = f.context(&f.bob_key);
     row.version = 99;
     assert!(f
         .service
-        .import_revision(&bob, &f.destination, &row, options())
+        .import_revision(&bob, &f.destination, &row, BATCH, false)
         .is_err());
-    f.service.delete_collection(&bob, &f.public).unwrap();
-    let db = rusqlite::Connection::open(f.dir.path().join(DATABASE_FILE)).unwrap();
-    assert_eq!(
-        db.query_row(
-            "SELECT count(*) FROM import_provenance WHERE collection_id = ?1",
-            [&f.public],
-            |r| r.get::<_, i64>(0)
-        )
-        .unwrap(),
-        0
-    );
-    assert_eq!(
-        db.query_row(
-            "SELECT count(*) FROM import_targets WHERE collection_id = ?1",
-            [&f.public],
-            |r| r.get::<_, i64>(0)
-        )
-        .unwrap(),
-        0
-    );
 }
 
 fn frames(body: &str) -> Vec<Value> {
@@ -450,10 +370,7 @@ async fn paginated_streams_round_trip_and_report_partial_imports() {
         .await
         .unwrap();
     assert!(frames(&second).last().unwrap()["next_cursor"].is_null());
-    let import = format!(
-        "{url}/v1/collections/{}/import?visibility=restricted",
-        f.destination
-    );
+    let import = format!("{url}/v1/collections/{}/import", f.destination);
     let send = |body: String| {
         client
             .post(&import)
@@ -470,10 +387,30 @@ async fn paginated_streams_round_trip_and_report_partial_imports() {
         .await
         .unwrap();
     assert_eq!(frames(&accepted).last().unwrap()["type"], "end");
-    let replayed = send(first).send().await.unwrap().text().await.unwrap();
+    let replayed = send(first.clone())
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert_eq!(replayed, accepted);
     let second_result = send(second).send().await.unwrap().text().await.unwrap();
     assert_eq!(frames(&second_result)[0]["revision"], 2);
+    let overwritten = client
+        .post(format!("{import}?overwrite=true"))
+        .bearer_auth(&f.bob_key)
+        .header("content-type", "application/x-ndjson")
+        .header("idempotency-key", "http-overwrite")
+        .body(first.clone())
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(frames(&overwritten)[0]["record_id"], "record");
+    assert_eq!(frames(&overwritten)[0]["revision"], 3);
     let truncated = format!("{}\n", first_rows[0]);
     let partial = send(truncated).send().await.unwrap().text().await.unwrap();
     assert_eq!(frames(&partial)[0]["type"], "imported");

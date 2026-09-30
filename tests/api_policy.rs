@@ -11,14 +11,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tempfile::TempDir;
 
-const ALL: &[Op] = &[
-    Op::Read,
-    Op::Contribute,
-    Op::Update,
-    Op::Delete,
-    Op::Moderate,
-    Op::Admin,
-];
+const OWNER: &[Op] = &[Op::Admin];
 struct Api {
     dir: TempDir,
     store: Store,
@@ -47,7 +40,7 @@ impl Api {
         let public = store.create_collection(&alice, Visibility::Public).unwrap();
         let grants: Vec<_> = [&a, &public]
             .into_iter()
-            .flat_map(|c| ALL.iter().map(move |op| Grant::new(c, *op)))
+            .flat_map(|c| OWNER.iter().map(move |op| Grant::new(c, *op)))
             .collect();
         let alice_key = store
             .issue_local_credential(&alice, &grants, None)
@@ -56,7 +49,10 @@ impl Api {
         let bob_key = store
             .issue_local_credential(
                 &bob,
-                &ALL.iter().map(|op| Grant::new(&b, *op)).collect::<Vec<_>>(),
+                &OWNER
+                    .iter()
+                    .map(|op| Grant::new(&b, *op))
+                    .collect::<Vec<_>>(),
                 None,
             )
             .unwrap()
@@ -285,13 +281,9 @@ async fn public_reads_do_not_downgrade_bad_credentials() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        api.post(
-            &api.records(&api.public),
-            None,
-            json!({"text": "x", "publish": true})
-        )
-        .await
-        .0,
+        api.post(&api.records(&api.public), None, json!({"text": "x"}))
+            .await
+            .0,
         StatusCode::UNAUTHORIZED
     );
     let search = api
@@ -306,7 +298,7 @@ async fn public_reads_do_not_downgrade_bad_credentials() {
 }
 
 #[tokio::test]
-async fn collection_discovery_and_diagnostics_respect_independent_grants() {
+async fn collection_discovery_and_diagnostics_follow_grants() {
     let api = Api::start().await;
     let rows = api.get("/v1/collections", Some(&api.alice_key)).await.1;
     let rows = rows["collections"].as_array().unwrap();
@@ -348,7 +340,7 @@ async fn collection_discovery_and_diagnostics_respect_independent_grants() {
         api.get(&format!("{}/same", api.records(&api.a)), Some(&admin))
             .await
             .0,
-        StatusCode::NOT_FOUND
+        StatusCode::OK
     );
     let diagnostics = api.get(&path, Some(&admin)).await;
     assert_eq!(diagnostics.0, StatusCode::OK);
@@ -357,33 +349,25 @@ async fn collection_discovery_and_diagnostics_respect_independent_grants() {
 }
 
 #[tokio::test]
-async fn public_publication_intent_and_authorship_are_enforced() {
+async fn public_writes_need_only_the_grant_and_authorship_is_enforced() {
     let api = Api::start().await;
-    let bob_public = api.issue(
-        &api.bob,
-        vec![
-            Grant::new(&api.public, Op::Read),
-            Grant::new(&api.public, Op::Contribute),
-            Grant::new(&api.public, Op::Update),
-            Grant::new(&api.public, Op::Delete),
-        ],
-    );
+    let bob_public = api.issue(&api.bob, vec![Grant::new(&api.public, Op::Write)]);
     let records = api.records(&api.public);
     assert_eq!(
         api.post(
             &records,
             Some(&bob_public),
-            json!({"id": "bob", "text": "public text"})
+            json!({"id": "bob", "text": "public text", "publish": true})
         )
         .await
         .0,
-        StatusCode::BAD_REQUEST
+        StatusCode::UNPROCESSABLE_ENTITY
     );
     assert_eq!(
         api.post(
             &records,
             Some(&bob_public),
-            json!({"id": "bob", "text": "public text", "publish": true})
+            json!({"id": "bob", "text": "public text"})
         )
         .await
         .0,
@@ -393,7 +377,7 @@ async fn public_publication_intent_and_authorship_are_enforced() {
         api.post(
             &records,
             Some(&bob_public),
-            json!({"id": "same", "text": "overwrite", "publish": true, "expected_revision": 1})
+            json!({"id": "same", "text": "overwrite", "expected_revision": 1})
         )
         .await
         .0,
@@ -413,19 +397,18 @@ async fn public_publication_intent_and_authorship_are_enforced() {
 }
 
 #[tokio::test]
-async fn concurrent_updates_compare_revisions_and_delete_requires_current_revision() {
+async fn revisions_are_compared_only_when_supplied() {
     let api = Api::start().await;
     let records = api.records(&api.a);
-    assert_eq!(
-        api.post(
+    let unconditional = api
+        .post(
             &records,
             Some(&api.alice_key),
-            json!({"id": "same", "text": "update"})
+            json!({"id": "same", "text": "update"}),
         )
-        .await
-        .0,
-        StatusCode::PRECONDITION_REQUIRED
-    );
+        .await;
+    assert_eq!(unconditional.0, StatusCode::CREATED);
+    assert_eq!(unconditional.1["revision"], 2);
     assert_eq!(
         api.post(
             &records,
@@ -450,12 +433,12 @@ async fn concurrent_updates_compare_revisions_and_delete_requires_current_revisi
         api.post(
             &records,
             Some(&api.alice_key),
-            json!({"id": "same", "text": "first writer", "expected_revision": 1})
+            json!({"id": "same", "text": "first writer", "expected_revision": 2})
         ),
         api.post(
             &records,
             Some(&api.alice_key),
-            json!({"id": "same", "text": "second writer", "expected_revision": 1})
+            json!({"id": "same", "text": "second writer", "expected_revision": 2})
         )
     );
     let mut statuses = [left.0.as_u16(), right.0.as_u16()];
@@ -465,13 +448,13 @@ async fn concurrent_updates_compare_revisions_and_delete_requires_current_revisi
         api.get(&format!("{records}/same"), Some(&api.alice_key))
             .await
             .1["revision"],
-        2
+        3
     );
     for (query, status) in [
-        ("", StatusCode::PRECONDITION_REQUIRED),
-        ("?expected_revision=1", StatusCode::CONFLICT),
-        ("?expected_revision=2", StatusCode::NO_CONTENT),
-        ("?expected_revision=2", StatusCode::NO_CONTENT),
+        ("?expected_revision=2", StatusCode::CONFLICT),
+        ("?expected_revision=3", StatusCode::NO_CONTENT),
+        ("?expected_revision=3", StatusCode::NO_CONTENT),
+        ("", StatusCode::NO_CONTENT),
     ] {
         assert_eq!(
             api.request(
@@ -768,9 +751,9 @@ async fn concurrent_retries_return_one_mutation_and_conflicting_payloads_fail() 
 #[tokio::test]
 async fn idempotency_is_principal_and_collection_scoped_and_rechecks_authority() {
     let api = Api::start().await;
-    let writer = api.issue(&api.bob, vec![Grant::new(&api.public, Op::Contribute)]);
+    let writer = api.issue(&api.bob, vec![Grant::new(&api.public, Op::Write)]);
     let records = api.records(&api.public);
-    let body = json!({"text": "public contribution", "publish": true});
+    let body = json!({"text": "public contribution"});
     let created = keyed(
         &api,
         Method::POST,
@@ -792,7 +775,7 @@ async fn idempotency_is_principal_and_collection_scoped_and_rechecks_authority()
         )
         .await,
         created
-    ); // no update grant needed for create replay
+    );
     let alice = keyed(
         &api,
         Method::POST,
@@ -935,11 +918,7 @@ async fn collection_deletion_is_authorized_and_removes_discovery_and_content() {
 async fn own_records_follow_the_principal_across_key_rotation_and_revocation() {
     let api = Api::start().await;
     let records = format!("/v1/collections/{}/records", api.public);
-    let grants = [
-        Grant::new(&api.public, Op::Read),
-        Grant::new(&api.public, Op::Contribute),
-        Grant::new(&api.public, Op::Update),
-    ];
+    let grants = [Grant::new(&api.public, Op::Write)];
     let issued = api
         .store
         .issue_local_credential(&api.bob, &grants, None)
@@ -951,7 +930,7 @@ async fn own_records_follow_the_principal_across_key_rotation_and_revocation() {
             Method::POST,
             &records,
             Some(&bob_public),
-            Some(json!({"id": "bobs", "text": "bob public note", "publish": true})),
+            Some(json!({"id": "bobs", "text": "bob public note"})),
         )
         .await;
     assert_eq!(status, StatusCode::CREATED);
@@ -1005,7 +984,7 @@ async fn own_records_follow_the_principal_across_key_rotation_and_revocation() {
             Method::POST,
             &records,
             Some(&reissued),
-            Some(json!({"id": "bobs", "text": "edited", "expected_revision": 1, "publish": true})),
+            Some(json!({"id": "bobs", "text": "edited", "expected_revision": 1})),
         )
         .await;
     assert_eq!(status, StatusCode::CREATED);

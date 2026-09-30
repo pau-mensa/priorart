@@ -20,10 +20,9 @@ use crate::excerpt::{excerpt, DEFAULT_WIDTH};
 use crate::gather::Statistics;
 use crate::index::{Index, IndexError};
 use crate::policy::{self, PolicyError};
-use crate::store::{Metadata, RecordSummary, Revision, Store, StoreError, Visibility};
+use crate::store::{Metadata, RecordSummary, Revision, Store, StoreError};
 
 mod transfer;
-pub use transfer::ImportOptions;
 
 pub const MAX_LIMIT: i64 = 100;
 /// A search spans at most this many collections, and never more than
@@ -109,8 +108,7 @@ impl State {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WriteOptions<'a> {
     pub idempotency_key: Option<&'a str>,
-    pub publish: bool,
-    /// None creates a new ID; 0 explicitly requires absence; positive values compare revisions.
+    /// None writes unconditionally; 0 requires absence; positive values compare revisions.
     pub expected_revision: Option<i64>,
 }
 
@@ -170,14 +168,7 @@ impl Service {
         operation: Operation,
     ) -> Result<Arc<Mutex<State>>> {
         let store = self.connect()?;
-        match policy::collection(&store, context, collection, operation) {
-            Err(PolicyError::Unavailable) if operation == Operation::Contribute => {
-                policy::collection(&store, context, collection, Operation::Update)?;
-            }
-            result => {
-                result?;
-            }
-        }
+        policy::collection(&store, context, collection, operation)?;
         self.admit(collection, store)
     }
 
@@ -220,7 +211,7 @@ impl Service {
         record_id: Option<&str>,
         options: WriteOptions<'_>,
     ) -> Result<Mutation<(String, i64, bool)>> {
-        let handle = self.state(context, collection_id, Operation::Contribute)?;
+        let handle = self.state(context, collection_id, Operation::Write)?;
         let mut state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
         let State { store, index } = &mut *state;
         let intent = intent(
@@ -228,31 +219,10 @@ impl Service {
             collection_id,
             "put",
             options.idempotency_key,
-            json!([
-                record_id,
-                text,
-                metadata,
-                options.publish,
-                options.expected_revision
-            ]),
-            if record_id
-                .map(|id| store.record_author(collection_id, id))
-                .transpose()?
-                .flatten()
-                .is_some()
-            {
-                "update"
-            } else {
-                "contribute"
-            },
+            json!([record_id, text, metadata, options.expected_revision]),
         )?;
-        if let Some((result, authority)) = store.replay::<(String, i64, bool)>(&intent)? {
-            let operation = if authority == "contribute" {
-                Operation::Contribute
-            } else {
-                Operation::Update
-            };
-            policy::mutation(store, context, collection_id, &result.value.0, operation)?;
+        if let Some(result) = store.replay::<(String, i64, bool)>(&intent)? {
+            policy::mutation(store, context, collection_id, &result.value.0)?;
             store.get(collection_id, &result.value.0, None)?;
             return Ok(result);
         }
@@ -268,7 +238,13 @@ impl Service {
         if record_id.is_some_and(|record_id| !is_record_id(record_id)) {
             return invalid(RECORD_ID_RULE);
         }
-        authorize_put(store, context, collection_id, record_id, options)?;
+        if let Some(record_id) = record_id {
+            if options.expected_revision != Some(0)
+                && store.record_author(collection_id, record_id)?.is_some()
+            {
+                policy::mutation(store, context, collection_id, record_id)?;
+            }
+        }
         let stored = self.cutoff(text);
         let truncated = stored.len() < text.len();
         let created = store.commit_put(
@@ -304,19 +280,18 @@ impl Service {
         record_id: &str,
         options: DeleteOptions<'_>,
     ) -> Result<Mutation<()>> {
-        let handle = self.state(context, collection_id, Operation::Delete)?;
+        let handle = self.state(context, collection_id, Operation::Write)?;
         let mut state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
         let State { store, index } = &mut *state;
-        policy::mutation(store, context, collection_id, record_id, Operation::Delete)?;
+        policy::mutation(store, context, collection_id, record_id)?;
         let intent = intent(
             context,
             collection_id,
             "delete",
             options.idempotency_key,
             json!([record_id, options.expected_revision]),
-            "delete",
         )?;
-        if let Some((result, _)) = store.replay::<()>(&intent)? {
+        if let Some(result) = store.replay::<()>(&intent)? {
             return Ok(result);
         }
         if options.expected_revision.is_some_and(|r| r <= 0) {
@@ -467,7 +442,7 @@ impl Service {
         id: &str,
     ) -> Result<crate::store::Collection> {
         let store = self.connect()?;
-        let collection = inspect_collection(&store, context, id)?;
+        let collection = policy::collection(&store, context, id, Operation::Read)?;
         policy::validate(&store, context)?;
         Ok(collection)
     }
@@ -486,7 +461,7 @@ impl Service {
         let result = store
             .visible_collections(context, after, limit)?
             .iter()
-            .map(|id| inspect_collection(&store, context, id))
+            .map(|id| policy::collection(&store, context, id, Operation::Read))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         policy::validate(&store, context)?;
         Ok(result)
@@ -529,42 +504,6 @@ impl Service {
     }
 }
 
-fn authorize_put(
-    store: &Store,
-    context: &RequestContext,
-    collection_id: &str,
-    record_id: Option<&str>,
-    options: WriteOptions<'_>,
-) -> Result<()> {
-    // Check some write authority before examining record existence/authorship.
-    let collection = match policy::collection(store, context, collection_id, Operation::Contribute)
-    {
-        Err(PolicyError::Unavailable) => {
-            policy::collection(store, context, collection_id, Operation::Update)?
-        }
-        result => result?,
-    };
-    let existing = record_id
-        .map(|id| store.record_author(collection_id, id))
-        .transpose()?
-        .flatten();
-    if existing.is_some() && options.expected_revision != Some(0) {
-        policy::mutation(
-            store,
-            context,
-            collection_id,
-            record_id.expect("existing record has an ID"),
-            Operation::Update,
-        )?;
-    } else {
-        policy::collection(store, context, collection_id, Operation::Contribute)?;
-    }
-    if collection.visibility == Visibility::Public && !options.publish {
-        return invalid("public writes require explicit publication intent");
-    }
-    Ok(())
-}
-
 fn validate_metadata(metadata: Option<&Metadata>, max_bytes: usize) -> Result<()> {
     fn visit(value: &Value, depth: usize, nodes: &mut usize) -> bool {
         *nodes += 1;
@@ -587,24 +526,12 @@ fn validate_metadata(metadata: Option<&Metadata>, max_bytes: usize) -> Result<()
     Ok(())
 }
 
-fn inspect_collection(
-    store: &Store,
-    context: &RequestContext,
-    id: &str,
-) -> policy::Result<crate::store::Collection> {
-    match policy::collection(store, context, id, Operation::Read) {
-        Err(PolicyError::Unavailable) => policy::collection(store, context, id, Operation::Admin),
-        result => result,
-    }
-}
-
 fn intent<'a>(
     context: &'a RequestContext,
     collection: &'a str,
     operation: &'a str,
     key: Option<&'a str>,
     payload: Value,
-    authority: &'a str,
 ) -> Result<Intent<'a>> {
     if key.is_some_and(|key| {
         key.is_empty()
@@ -625,6 +552,5 @@ fn intent<'a>(
         operation,
         key,
         payload,
-        authority,
     })
 }

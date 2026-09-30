@@ -42,8 +42,6 @@ pub enum StoreError {
     IdempotencyConflict,
     #[error("invalid mutation journal data")]
     Journal,
-    #[error("a revision precondition is required")]
-    RevisionRequired,
     #[error("the revision precondition did not match")]
     RevisionConflict,
     #[error("no record {record_id}{} in collection {collection_id}", revision.map(|r| format!(" revision {r}")).unwrap_or_default())]
@@ -306,8 +304,7 @@ impl Store {
         let mut statement = self.connection.prepare(
             "SELECT id FROM collections WHERE id > ?1 AND
              ((?2 AND id = 'local') OR (NOT ?2 AND (visibility = 'public' OR id IN
-             (SELECT collection_id FROM credential_grants WHERE credential_id = ?3
-              AND operation IN ('read', 'admin'))))) ORDER BY id LIMIT ?4",
+             (SELECT collection_id FROM credential_grants WHERE credential_id = ?3)))) ORDER BY id LIMIT ?4",
         )?;
         let rows = statement.query_map(
             (
@@ -535,9 +532,9 @@ fn check_revision(
         |row| row.get(0),
     )?;
     match (latest, expected) {
-        (None, None | Some(0)) if create => Ok(()),
+        (_, None) => Ok(()),
+        (None, Some(0)) if create => Ok(()),
         (Some(actual), Some(expected)) if actual == expected => Ok(()),
-        (Some(_), None) => Err(StoreError::RevisionRequired),
         _ => Err(StoreError::RevisionConflict),
     }
 }

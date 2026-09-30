@@ -93,11 +93,6 @@ impl From<ServiceError> for ApiError {
             ServiceError::Store(StoreError::RecordDeleted { .. }) => {
                 Self(StatusCode::GONE, "record_deleted", "record was deleted")
             }
-            ServiceError::Store(StoreError::RevisionRequired) => Self(
-                StatusCode::PRECONDITION_REQUIRED,
-                "revision_required",
-                "a revision precondition is required",
-            ),
             ServiceError::Store(StoreError::RevisionConflict) => Self(
                 StatusCode::CONFLICT,
                 "revision_conflict",
@@ -246,8 +241,6 @@ struct PutRequest {
     metadata: Option<Metadata>,
     id: Option<String>,
     expected_revision: Option<i64>,
-    #[serde(default)]
-    publish: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -417,7 +410,6 @@ async fn put_record(
             body.id.as_deref(),
             WriteOptions {
                 idempotency_key: key.0.as_deref(),
-                publish: body.publish,
                 expected_revision: body.expected_revision,
             },
         )

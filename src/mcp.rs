@@ -83,7 +83,7 @@ pub struct ContributeParams {
 #[derive(Deserialize, JsonSchema)]
 pub struct DeleteParams {
     id: String,
-    expected_revision: i64,
+    expected_revision: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -240,7 +240,8 @@ impl PriorartMcp {
     /// inferences as inferences. Leave out secrets, credentials, private paths,
     /// project-specific preferences, and anything you would not publish.
     ///
-    /// Pass the same `id` and its `expected_revision` to publish a corrected revision. `metadata` is a flat
+    /// Pass the same `id` to publish a corrected revision; add its `expected_revision` to refuse
+    /// overwriting a newer one. `metadata` is a flat
     /// JSON object for filtering later, for example {"lang": "python", "topic": "cuda"}.
     /// Returns the record id, revision, and whether the text was truncated at the token cutoff.
     #[tool(annotations(
@@ -262,7 +263,7 @@ impl PriorartMcp {
         .map(Json)
     }
 
-    /// Permanently remove an experience's text and metadata using its current `expected_revision`. Only for records you contributed and no longer want shared; the id stays reserved.
+    /// Permanently remove an experience's text and metadata; pass `expected_revision` to refuse deleting a newer revision. Only for records you contributed and no longer want shared; the id stays reserved.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,

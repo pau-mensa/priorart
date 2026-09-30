@@ -1,8 +1,5 @@
 use super::*;
-use crate::{
-    service::ImportOptions,
-    store::{ExportCursor, TransferRecord, Visibility},
-};
+use crate::store::{ExportCursor, TransferRecord};
 use axum::{
     body::{Body, BodyDataStream, Bytes},
     http::{header::CONTENT_TYPE, HeaderMap},
@@ -162,12 +159,11 @@ pub(super) async fn export(
     Ok(response(Body::from_stream(output)))
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ImportQuery {
-    visibility: Visibility,
     #[serde(default)]
-    publish: bool,
+    overwrite: bool,
 }
 
 struct Lines {
@@ -218,7 +214,7 @@ pub(super) async fn import(
 ) -> ApiResult<Response> {
     let Path(collection) = path?;
     identifier(&collection)?;
-    let Query(query) = query?;
+    let Query(ImportQuery { overwrite }) = query?;
     let key = key.0.ok_or_else(ApiError::invalid)?;
     if headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()) != Some("application/x-ndjson") {
         return Err(ApiError::invalid());
@@ -226,18 +222,7 @@ pub(super) async fn import(
     let c = collection.clone();
     let ctx = context.clone();
     let k = key.clone();
-    blocking(&service, move |s| {
-        s.authorize_import(
-            &ctx,
-            &c,
-            ImportOptions {
-                batch_key: &k,
-                visibility: query.visibility,
-                publish: query.publish,
-            },
-        )
-    })
-    .await?;
+    blocking(&service, move |s| s.authorize_import(&ctx, &c, &k)).await?;
     let lines = Lines {
         body: body.into_data_stream(),
         pending: Bytes::new(),
@@ -262,7 +247,7 @@ pub(super) async fn import(
                     let c = collection.clone();
                     let ctx = context.clone();
                     let k = key.clone();
-                    let imported = blocking(&service, move |s| s.import_revision(&ctx, &c, &record, ImportOptions {batch_key: &k, visibility: query.visibility, publish: query.publish})).await?;
+                    let imported = blocking(&service, move |s| s.import_revision(&ctx, &c, &record, &k, overwrite)).await?;
                     Ok((line(json!({"type":"imported", "source":source, "collection_id":collection,
                         "record_id":imported.value.0, "revision":imported.value.1, "mutation_id":imported.mutation_id})), false))
                 },
@@ -271,7 +256,7 @@ pub(super) async fn import(
                     let c = collection.clone();
                     let ctx = context.clone();
                     let k = key.clone();
-                    blocking(&service, move |s| s.authorize_import(&ctx, &c, ImportOptions {batch_key:&k, visibility:query.visibility, publish:query.publish})).await?;
+                    blocking(&service, move |s| s.authorize_import(&ctx, &c, &k)).await?;
                     Ok((line(json!({"type":"end", "count":count})), true))
                 },
             }
@@ -308,10 +293,7 @@ mod tests {
             let key = store
                 .issue_local_credential(
                     LOCAL_PRINCIPAL_ID,
-                    &[
-                        Grant::new(LOCAL, Operation::Read),
-                        Grant::new(LOCAL, Operation::Export),
-                    ],
+                    &[Grant::new(LOCAL, Operation::Admin)],
                     None,
                 )
                 .unwrap()

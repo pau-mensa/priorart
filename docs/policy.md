@@ -30,33 +30,30 @@ authorized reader can still distinguish a missing record from a deleted one.
 
 ## Current operations
 
+There are three grants, each implying the ones before it: `read`, `write`, `admin`.
+
 | Operation | Required policy |
 |---|---|
-| Get current or old revision; list records; search with or without filters | Public visibility or explicit `read` |
-| Create record | Authenticated `contribute`; author is the requesting principal |
-| Update record | `update` plus original authorship, or `update` plus `moderate` |
-| Delete record | `delete` plus original authorship, or `delete` plus `moderate`; tombstones retain authorship |
-| Export revisions | `export` and current `read`; rechecked for every streamed row |
-| Import revisions | `contribute`, plus `update` for subsequent revisions; explicit destination visibility/publication |
+| Get current or old revision; list records; search with or without filters | Public visibility or `read` |
+| Create record | `write`; author is the requesting principal |
+| Update or delete record | `write` plus original authorship, or `admin`; tombstones retain authorship |
+| Export revisions | `admin`; rechecked for every streamed row |
+| Import revisions | `write`; writing to an existing record needs its authorship or `admin` |
 | Delete collection | `admin`; deletes data and scoped grants, leaving an ID/time tombstone |
-| Scoped health/diagnostics | `admin` on that collection, before loading its index or counting documents |
-| List collections | Public, or `read`/`admin`; scope applied before pagination |
+| Scoped health/diagnostics | `admin` on that collection, before counting documents |
+| List collections | Public, or any grant; scope applied before pagination |
 
 Which grants a key may hold is decided at issuance ([credentials](credentials.md)):
-owners may hold any operation on their collections; anyone may hold `read`,
-`contribute`, `update`, and `delete` on a public collection. `moderate` therefore
-belongs to the owner only.
+owners may hold any grant on their collections; anyone may hold `read` and `write`
+on a public collection. `admin` therefore belongs to the owner only.
 
-Ownership and `admin` do not imply other credential operations. Moderation preserves
-original record authorship. Public visibility grants readability, not write or
-moderation permission. Creating or updating public record text additionally requires
-`publish: true`; the flag grants no authority by itself. Visibility is immutable.
+Ownership alone grants nothing; the key's grants do. Changing another author's
+record preserves its original authorship. Public visibility grants readability,
+not write permission. Visibility is immutable.
 
 Searches persist nothing: no query, filter, result list, or receipt.
 
-Imports treat source identity and authorship as unverified claims; they never
-resolve source IDs or impersonate the uploaded author. The importer becomes the
-new author. Private provenance is excluded from public responses and exports.
+Imports ignore source identity and authorship; the importer becomes the author.
 
 ## Revocation, indexes, and concurrency
 
@@ -77,12 +74,12 @@ they bypass both policy and in-memory index coordination.
 
 ## Revision preconditions
 
-`Service::put` takes `WriteOptions { publish, expected_revision, idempotency_key }`. A new record
-allows no precondition or `Some(0)` (explicit absence). Existing updates require
-`Some(current_revision)`; no precondition returns `RevisionRequired`, and stale
-preconditions or explicit create collisions return `RevisionConflict`. An explicit
-create requires contribute, while an update requires update and authorship/moderation.
-`Service::delete` requires the current revision, including on repeat tombstone deletes.
-Checks follow policy and run inside the SQLite mutation transaction. Each service mutation returns `Mutation<T>` containing a durable
-mutation ID and its operation result. Replays revalidate current original operation
-authority and use the same collection synchronization as new writes.
+`Service::put` takes `WriteOptions { expected_revision, idempotency_key }`. Without
+a precondition the write is unconditional: it creates the record or appends a
+revision. `Some(0)` requires absence, and a positive value must equal the current
+revision; otherwise the write returns `RevisionConflict`. `Service::delete` treats
+its optional `expected_revision` the same way; repeating a delete is a no-op.
+Checks follow policy and run inside the SQLite mutation transaction. Each service
+mutation returns `Mutation<T>` containing a durable mutation ID and its operation
+result. Replays recheck `write` plus authorship or `admin` and use the same
+collection synchronization as new writes.

@@ -1,18 +1,10 @@
 use super::*;
-use crate::store::{ExportCursor, TransferRecord};
-
-#[derive(Clone, Copy)]
-pub struct ImportOptions<'a> {
-    pub batch_key: &'a str,
-    pub visibility: Visibility,
-    pub publish: bool,
-}
+use crate::store::{Content, ExportCursor, TransferRecord};
 
 impl Service {
     pub fn export_generation(&self, context: &RequestContext, collection: &str) -> Result<i64> {
         let store = self.connect()?;
-        policy::collection(&store, context, collection, Operation::Export)?;
-        policy::collection(&store, context, collection, Operation::Read)?;
+        policy::collection(&store, context, collection, Operation::Admin)?;
         let version = store.content_version(collection)?;
         policy::validate(&store, context)?;
         Ok(version)
@@ -31,11 +23,10 @@ impl Service {
         {
             return invalid("invalid export cursor");
         }
-        let handle = self.state(context, collection, Operation::Export)?;
+        let handle = self.state(context, collection, Operation::Admin)?;
         let state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
         let store = &state.store;
-        policy::collection(store, context, collection, Operation::Export)?;
-        let scope = policy::collection(store, context, collection, Operation::Read)?;
+        let scope = policy::collection(store, context, collection, Operation::Admin)?;
         if store.content_version(collection)? != generation {
             return Err(StoreError::ExportChanged.into());
         }
@@ -65,131 +56,76 @@ impl Service {
         &self,
         context: &RequestContext,
         collection: &str,
-        options: ImportOptions<'_>,
+        batch_key: &str,
     ) -> Result<()> {
         let store = self.connect()?;
-        let scope = policy::collection(&store, context, collection, Operation::Contribute)?;
-        if scope.visibility != options.visibility
-            || (scope.visibility == Visibility::Public && !options.publish)
-        {
-            return invalid(
-                "import requires matching destination visibility and explicit public publication",
-            );
-        }
-        intent(
-            context,
-            collection,
-            "put",
-            Some(options.batch_key),
-            json!(null),
-            "contribute",
-        )?;
+        policy::collection(&store, context, collection, Operation::Write)?;
+        intent(context, collection, "put", Some(batch_key), json!(null))?;
         Ok(())
     }
 
+    /// Imports one exported revision under its source record ID. By default
+    /// source revision N must land as revision N, so an existing record with
+    /// that ID conflicts; `overwrite` appends it as a new revision instead.
     pub fn import_revision(
         &self,
         context: &RequestContext,
         collection: &str,
         source: &TransferRecord,
-        options: ImportOptions<'_>,
+        batch_key: &str,
+        overwrite: bool,
     ) -> Result<Mutation<(String, i64)>> {
-        self.authorize_import(context, collection, options)?;
+        self.authorize_import(context, collection, batch_key)?;
         if source.version != 1
             || !is_record_id(&source.collection_id)
             || !is_record_id(&source.record_id)
             || source.revision <= 0
-            || source.created_at.is_empty()
-            || source.created_at.len() > 64
-            || source
-                .author_principal_id
-                .as_ref()
-                .is_some_and(|id| !is_record_id(id))
             || source.text.trim().is_empty()
         {
             return invalid("invalid import revision");
         }
         validate_metadata(source.metadata.as_ref(), 65_536)?;
-        let principal = context.principal_id().ok_or(PolicyError::Unavailable)?;
-        let source_digest = transfer_digest(json!([
-            options.batch_key,
-            source.collection_id,
-            source.record_id
-        ]));
         let key = format!(
             "import:{}",
             transfer_digest(json!([
-                options.batch_key,
+                batch_key,
                 source.collection_id,
                 source.record_id,
                 source.revision
             ]))
         );
-        let handle = self.state(context, collection, Operation::Contribute)?;
+        let handle = self.state(context, collection, Operation::Write)?;
         let mut state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
         let State { store, index } = &mut *state;
-        policy::collection(store, context, collection, Operation::Contribute)?;
-        let record = store
-            .import_target(collection, principal, &source_digest)?
-            .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
-        let position = store.import_position(collection, &record)?;
-        let authority = if position.is_some() {
-            "update"
-        } else {
-            "contribute"
-        };
         let intent = intent(
             context,
             collection,
             "put",
             Some(&key),
-            json!([
-                "import-v1",
-                source,
-                options.visibility.as_str(),
-                options.publish
-            ]),
-            authority,
+            json!(["import-v1", source, overwrite]),
         )?;
-        if let Some((result, original)) = store.replay::<(String, i64)>(&intent)? {
-            if original == "update" {
-                policy::mutation(
-                    store,
-                    context,
-                    collection,
-                    &result.value.0,
-                    Operation::Update,
-                )?;
-            }
-            store.get(collection, &result.value.0, Some(result.value.1))?;
+        let record = source.record_id.as_str();
+        if let Some(result) = store.replay::<(String, i64)>(&intent)? {
+            policy::mutation(store, context, collection, record)?;
+            store.get(collection, record, Some(result.value.1))?;
             return Ok(result);
         }
-        if position
-            .as_ref()
-            .is_some_and(|(source_revision, _)| source.revision <= *source_revision)
-        {
-            return Err(StoreError::RevisionConflict.into());
-        }
-        let expected = position.as_ref().map_or(0, |(_, revision)| *revision);
-        if expected > 0 {
-            policy::mutation(store, context, collection, &record, Operation::Update)?;
+        if store.record_author(collection, record)?.is_some() {
+            policy::mutation(store, context, collection, record)?;
         }
         let fitted = self.cutoff(&source.text);
-        let truncated = fitted.len() < source.text.len();
-        let source = &TransferRecord {
-            text: fitted.to_owned(),
-            ..source.clone()
-        };
         let committed = store.commit_import(
             &intent,
-            &record,
-            expected,
-            source,
-            truncated,
-            &source_digest,
+            record,
+            (!overwrite).then_some(source.revision - 1),
+            Content {
+                text: fitted,
+                truncated: fitted.len() < source.text.len(),
+                metadata: source.metadata.as_ref(),
+            },
         )?;
         if let Some(index) = index {
-            index.upsert(&record, committed.value.1, &source.text);
+            index.upsert(record, committed.value.1, fitted);
         }
         Ok(committed)
     }

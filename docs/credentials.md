@@ -22,7 +22,7 @@ collection it owns. No credential is issued automatically.
 priorart admin create-principal                                # prints the new principal ID
 priorart admin create-collection --owner PRINCIPAL_ID          # restricted
 priorart admin create-collection --owner PRINCIPAL_ID --visibility public
-priorart admin issue --principal PRINCIPAL_ID --grant COLLECTION:read --grant COLLECTION:contribute
+priorart admin issue --principal PRINCIPAL_ID --grant COLLECTION:write
 ```
 
 `issue` writes one JSON object with `credential` metadata and a `secret` to stdout.
@@ -37,9 +37,9 @@ least one explicit grant at issuance. There are no wildcard or implicit grants.
 
 A key may hold:
 
-- any operation on collections its principal owns;
-- `read`, `contribute`, `update`, and `delete` on any public collection. Updates
-  and deletes still require authorship (or `moderate`, which only the owner can hold).
+- any grant on collections its principal owns;
+- `read` or `write` on any public collection. Changing a record still requires
+  its authorship, or `admin`, which only the owner can hold.
 
 Any other grant fails with the same error as an unknown collection.
 
@@ -57,8 +57,9 @@ Revocation is permanent and idempotent. `set-grants` replaces the full grant set
 omitting `--grant` removes all permissions. Local administration cannot rotate an
 expired or revoked key; issue a new key instead.
 
-Operations are independent: `read`, `contribute`, `update`, `delete`, `moderate`,
-`export`, and `admin`. `admin` grants no implicit read or write permission.
+Grants are `read`, `write`, and `admin`, each implying the ones before it. `write`
+creates records and changes your own; `admin` is owner-level control: changing
+anyone's records, export, collection deletion, and diagnostics.
 
 ## Contexts
 

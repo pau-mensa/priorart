@@ -170,10 +170,7 @@ fn require_grantable(
         return Err(AuthError::Forbidden);
     }
     for grant in grants {
-        let record_operation = matches!(
-            grant.operation,
-            Operation::Read | Operation::Contribute | Operation::Update | Operation::Delete
-        );
+        let record_operation = grant.operation != Operation::Admin;
         let allowed: bool = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM collections WHERE id = ?1
              AND (owner_principal_id = ?2 OR (?3 AND visibility = 'public')))",

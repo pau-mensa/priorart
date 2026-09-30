@@ -140,7 +140,7 @@ fn expiry_is_exclusive_and_expired_contexts_are_rejected() {
 fn independent_revocation_and_versioned_contexts() {
     let (_directory, store) = setup();
     let (first_id, first) = issue(&store, &[Operation::Read]);
-    let (_, second) = issue(&store, &[Operation::Contribute]);
+    let (_, second) = issue(&store, &[Operation::Write]);
     let first_context = store.authenticate(&first).unwrap();
     let second_context = store.authenticate(&second).unwrap();
     store.revoke_local_credential(&first_id).unwrap();
@@ -229,7 +229,7 @@ fn rotation_is_atomic_preserves_limits_and_revokes_the_old_key() {
     let parent = store
         .issue_local_credential(
             PRINCIPAL,
-            &grants(&[Operation::Read, Operation::Contribute]),
+            &grants(&[Operation::Read, Operation::Write]),
             Some(end),
         )
         .unwrap();
@@ -258,7 +258,7 @@ fn failed_rotation_and_grant_replacement_roll_back() {
     assert!(store.validate_context(&before).is_ok());
     connection.execute_batch("CREATE TRIGGER fail_grant BEFORE INSERT ON credential_grants BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
     assert!(store
-        .replace_local_credential_grants(&id, &grants(&[Operation::Contribute]))
+        .replace_local_credential_grants(&id, &grants(&[Operation::Write]))
         .is_err());
     assert!(store.validate_context(&before).is_ok());
 }
@@ -354,12 +354,7 @@ fn public_collections_accept_record_grants_from_any_principal() {
     let restricted = store
         .create_collection(&owner, Visibility::Restricted)
         .unwrap();
-    let record_operations = [
-        Operation::Read,
-        Operation::Contribute,
-        Operation::Update,
-        Operation::Delete,
-    ];
+    let record_operations = [Operation::Read, Operation::Write];
     let issued = store
         .issue_local_credential(
             PRINCIPAL,
@@ -374,23 +369,19 @@ fn public_collections_accept_record_grants_from_any_principal() {
     for operation in record_operations {
         assert!(context.has_grant(&public, operation));
     }
-    for operation in [Operation::Admin, Operation::Moderate, Operation::Export] {
-        assert!(matches!(
-            store.issue_local_credential(PRINCIPAL, &[Grant::new(&public, operation)], None),
-            Err(AuthError::Forbidden)
-        ));
-    }
+    assert!(matches!(
+        store.issue_local_credential(PRINCIPAL, &[Grant::new(&public, Operation::Admin)], None),
+        Err(AuthError::Forbidden)
+    ));
     for operation in record_operations {
         assert!(matches!(
             store.issue_local_credential(PRINCIPAL, &[Grant::new(&restricted, operation)], None),
             Err(AuthError::Forbidden)
         ));
     }
-    let owned: Vec<_> = [Operation::Admin, Operation::Moderate, Operation::Export]
-        .iter()
-        .map(|op| Grant::new(&public, *op))
-        .collect();
-    assert!(store.issue_local_credential(&owner, &owned, None).is_ok());
+    assert!(store
+        .issue_local_credential(&owner, &[Grant::new(&public, Operation::Admin)], None)
+        .is_ok());
 }
 
 #[test]

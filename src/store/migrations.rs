@@ -188,9 +188,7 @@ CREATE INDEX credentials_principal ON credentials(principal_id);
 CREATE TABLE credential_grants (
     credential_id TEXT NOT NULL REFERENCES credentials(id),
     collection_id TEXT NOT NULL REFERENCES collections(id),
-    operation TEXT NOT NULL CHECK (operation IN (
-        'read', 'contribute', 'update', 'delete', 'moderate', 'export', 'admin'
-    )),
+    operation TEXT NOT NULL CHECK (operation IN ('read', 'write', 'admin')),
     PRIMARY KEY (credential_id, collection_id, operation)
 );
 CREATE TABLE mutations (
@@ -200,37 +198,12 @@ CREATE TABLE mutations (
     operation TEXT NOT NULL CHECK (operation IN ('put', 'delete')),
     idempotency_digest TEXT,
     payload_digest TEXT NOT NULL,
-    authority TEXT NOT NULL,
     result TEXT NOT NULL,
     created_at TEXT NOT NULL,
     target_record_id TEXT,
     UNIQUE (collection_id, principal_id, operation, idempotency_digest)
 );
 CREATE INDEX mutations_target ON mutations(collection_id, target_record_id);
-CREATE TABLE import_targets (
-    collection_id TEXT NOT NULL,
-    importer_principal_id TEXT NOT NULL REFERENCES principals(id),
-    source_digest TEXT NOT NULL,
-    record_id TEXT NOT NULL,
-    PRIMARY KEY (collection_id, importer_principal_id, source_digest),
-    UNIQUE (collection_id, record_id),
-    FOREIGN KEY (collection_id, record_id) REFERENCES records(collection_id, id) ON DELETE CASCADE
-);
-CREATE TABLE import_provenance (
-    collection_id TEXT NOT NULL,
-    record_id TEXT NOT NULL,
-    revision INTEGER NOT NULL,
-    importer_principal_id TEXT NOT NULL REFERENCES principals(id),
-    source_collection_id TEXT NOT NULL,
-    source_record_id TEXT NOT NULL,
-    source_revision INTEGER NOT NULL CHECK (source_revision > 0),
-    source_visibility TEXT NOT NULL CHECK (source_visibility IN ('public', 'restricted')),
-    source_author_principal_id TEXT,
-    source_created_at TEXT NOT NULL,
-    PRIMARY KEY (collection_id, record_id, revision),
-    FOREIGN KEY (collection_id, record_id, revision)
-        REFERENCES revisions(collection_id, record_id, revision) ON DELETE CASCADE
-);
 ";
 
 #[cfg(test)]
