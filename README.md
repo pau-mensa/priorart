@@ -125,6 +125,13 @@ With `PRIORART_ADMIN_TOKEN` set, the same provisioning is available over HTTP
 under `/v1/admin`. See [credentials](docs/credentials.md) and
 [authorization](docs/policy.md).
 
+## Metrics
+
+`GET /metrics` exposes search latency (histogram plus recent p50/p95/p99) in the
+Prometheus format to anyone who can reach the server. `GET /v1/admin/metrics`,
+behind the admin token, adds per-route and per-collection detail. See
+[metrics](docs/protocol.md#metrics).
+
 ## Limitations
 
 - priorart does not terminate TLS; serve it beyond loopback behind a proxy (see

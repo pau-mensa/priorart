@@ -8,6 +8,7 @@ pub mod excerpt;
 pub mod gather;
 pub mod index;
 pub mod mcp;
+pub mod metrics;
 mod ownership;
 pub mod policy;
 pub mod service;

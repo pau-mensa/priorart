@@ -25,6 +25,7 @@ impl From<AuthError> for ApiError {
 
 pub(super) fn routes() -> Router<Arc<Service>> {
     Router::new()
+        .route("/v1/admin/metrics", get(operator_metrics))
         .route("/v1/admin/principals", post(create_principal))
         .route("/v1/admin/collections", post(create_collection))
         .route(
@@ -101,6 +102,16 @@ struct GrantsRequest {
 struct IssueRequest {
     grants: Vec<Grant>,
     expires_at: Option<i64>,
+}
+
+async fn operator_metrics(
+    State(service): State<Arc<Service>>,
+    query: Result<Query<EmptyQuery>, QueryRejection>,
+) -> ApiResult<Response> {
+    query?;
+    Ok(prometheus(
+        service.metrics().render_admin(service.cached_collections()),
+    ))
 }
 
 async fn create_principal(

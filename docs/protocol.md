@@ -232,6 +232,25 @@ Errors have fixed messages that never echo request contents:
 
 `GET /healthz` returns `{"status":"ok"}`.
 
+## Metrics
+
+`GET /metrics` serves the Prometheus text format to any caller admitted by the
+network rules, with or without a key. It holds only server-wide search figures,
+so it reveals nothing about collections:
+
+- `priorart_search_duration_seconds`: histogram of successful search latency,
+  for `histogram_quantile` in Prometheus.
+- `priorart_search_duration_recent_seconds{quantile="0.5|0.95|0.99"}`: the
+  same quantiles over the last five minutes (at most 10000 searches), `NaN`
+  when there were none.
+- `priorart_searches_total{outcome="ok|client_error|server_error"}`.
+
+`GET /v1/admin/metrics` takes the [admin token](credentials.md#remote-administration)
+and adds requests and latency by route, method, and status; search time, writes,
+and indexed documents per collection; index load time; cached collections;
+evictions; and `resource_limit` and `rate_limited` refusals. Collection labels
+disappear when the collection is deleted. Counters reset on restart.
+
 ## MCP client
 
 `priorart mcp` is a stdio MCP server that forwards tool calls to `PRIORART_URL`.

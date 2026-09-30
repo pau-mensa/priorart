@@ -50,6 +50,7 @@ token opens nothing else. Send it only over HTTPS or loopback.
 | `POST /v1/admin/credentials/{id}/rotate` | none | `201 {"credential","secret"}` |
 | `PUT /v1/admin/credentials/{id}/grants` | `{"grants":[…]}`; empty removes all | `204` |
 | `DELETE /v1/admin/credentials/{id}` | none | `204` |
+| `GET /v1/admin/metrics` | none | Prometheus text; see [metrics](protocol.md#metrics) |
 
 Responses with a secret carry `Cache-Control: no-store`. Unknown principals,
 unknown or revoked credentials, and grants the principal may not hold return

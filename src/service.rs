@@ -4,7 +4,8 @@
 //! Revision preconditions are checked again inside the storage transaction.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::time::Instant;
 
 use crate::store::mutations::{Intent, Mutation};
 use lateweave::{Query, SearchRequest, Subset};
@@ -19,6 +20,7 @@ use crate::config::Settings;
 use crate::excerpt::{excerpt, DEFAULT_WIDTH};
 use crate::gather::Statistics;
 use crate::index::{Index, IndexError};
+use crate::metrics::Metrics;
 use crate::policy::{self, PolicyError};
 use crate::store::{Metadata, RecordSummary, Revision, Store, StoreError};
 
@@ -97,9 +99,12 @@ struct State {
 }
 
 impl State {
-    fn index(&mut self, collection: &str) -> Result<&mut Index> {
+    fn index(&mut self, collection: &str, metrics: &Metrics) -> Result<&mut Index> {
         if self.index.is_none() {
-            self.index = Some(Index::load(&self.store, collection)?);
+            let started = Instant::now();
+            let index = Index::load(&self.store, collection)?;
+            metrics.index_loaded(collection, started.elapsed(), index.document_count());
+            self.index = Some(index);
         }
         Ok(self.index.as_mut().expect("loaded above"))
     }
@@ -121,6 +126,7 @@ pub struct DeleteOptions<'a> {
 pub struct Service {
     settings: Settings,
     states: Mutex<States>,
+    metrics: Metrics,
     // Declared last so collection state is dropped before releasing ownership.
     _owner: crate::ownership::DirectoryOwner,
 }
@@ -139,6 +145,7 @@ impl Service {
         Ok(Self {
             settings,
             states: Mutex::default(),
+            metrics: Metrics::default(),
             _owner: owner,
         })
     }
@@ -160,6 +167,18 @@ impl Service {
         &self.settings
     }
 
+    pub fn metrics(&self) -> &Metrics {
+        &self.metrics
+    }
+
+    pub fn cached_collections(&self) -> usize {
+        self.states
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .loaded
+            .len()
+    }
+
     /// Authorization precedes admission.
     fn state(
         &self,
@@ -178,13 +197,17 @@ impl Service {
         let mut states = self.states.lock().map_err(|_| ServiceError::Poisoned)?;
         if !states.loaded.contains_key(collection) {
             if states.loaded.len() == self.settings.max_loaded_indexes {
-                let idle = states
+                let Some(idle) = states
                     .lru
                     .iter()
                     .position(|id| Arc::strong_count(&states.loaded[id]) == 1)
-                    .ok_or(ServiceError::Busy)?;
+                else {
+                    self.metrics.resource_limited();
+                    return Err(ServiceError::Busy);
+                };
                 let id = states.lru.remove(idle).expect("existing LRU entry");
                 states.loaded.remove(&id);
+                self.metrics.evicted(&id);
             }
             states.loaded.insert(
                 collection.into(),
@@ -258,6 +281,11 @@ impl Service {
         if let Some(index) = index {
             index.upsert(&created.value.0, created.value.1, stored);
         }
+        self.metrics.write(
+            collection_id,
+            "put",
+            index.as_ref().map(Index::document_count),
+        );
         Ok(created)
     }
 
@@ -301,6 +329,11 @@ impl Service {
         if let Some(index) = index {
             index.remove(record_id);
         }
+        self.metrics.write(
+            collection_id,
+            "delete",
+            index.as_ref().map(Index::document_count),
+        );
         Ok(committed)
     }
 
@@ -311,6 +344,7 @@ impl Service {
         let mut states = self.states.lock().map_err(|_| ServiceError::Poisoned)?;
         states.loaded.remove(collection);
         states.lru.retain(|id| id != collection);
+        self.metrics.forget(collection);
         Ok(())
     }
 
@@ -372,17 +406,21 @@ impl Service {
         let query_tokens = tokens(text);
         let mut statistics = Statistics::default();
         for (collection, state) in collection_ids.iter().zip(&mut states) {
-            statistics.add(state.index(collection)?.lexical(), &query_tokens);
+            statistics.add(
+                state.index(collection, &self.metrics)?.lexical(),
+                &query_tokens,
+            );
         }
         let statistics = Arc::new(statistics);
         let query = Query::new(text);
         let mut ranked: Vec<(f32, usize, String, i64)> = Vec::new();
         for (position, (collection, state)) in collection_ids.iter().zip(&mut states).enumerate() {
+            let started = Instant::now();
             let matching = match filters {
                 Some(filters) => Some(state.store.matching_record_ids(collection, filters)?),
                 None => None,
             };
-            let index = state.index(collection)?;
+            let index = state.index(collection, &self.metrics)?;
             if matching
                 .as_ref()
                 .map_or(index.document_count(), HashSet::len)
@@ -404,6 +442,8 @@ impl Service {
                 let revision = index.revision(id).expect("ranked documents are indexed");
                 ranked.push((document.score, position, id.to_owned(), revision));
             }
+            self.metrics
+                .collection_search(collection, started.elapsed());
         }
         ranked.sort_unstable_by(|left, right| {
             right

@@ -2,15 +2,16 @@
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
+    time::Instant,
 };
 
 use axum::{
     extract::{
         rejection::{JsonRejection, PathRejection, QueryRejection},
-        ConnectInfo, DefaultBodyLimit, Path, Query, Request, State,
+        ConnectInfo, DefaultBodyLimit, MatchedPath, Path, Query, Request, State,
     },
     http::{
-        header::{AUTHORIZATION, RETRY_AFTER},
+        header::{AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER},
         HeaderMap, StatusCode,
     },
     middleware::{self, Next},
@@ -24,6 +25,7 @@ use serde_json::{json, Value};
 use crate::{
     auth::{AuthError, RequestContext},
     config::{ServerMode, Settings},
+    metrics,
     policy::PolicyError,
     service::{is_record_id, DeleteOptions, Service, ServiceError, WriteOptions},
     store::{Collection, Metadata, StoreError},
@@ -194,6 +196,24 @@ fn admit_peer(settings: &Settings, peer: IpAddr, headers: &HeaderMap) -> ApiResu
     }
 }
 
+/// Outermost, so refusals by `authenticate` are counted too.
+async fn observe(State(service): State<Arc<Service>>, request: Request, next: Next) -> Response {
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|path| path.as_str().to_owned());
+    let method = request.method().clone();
+    let started = Instant::now();
+    let response = next.run(request).await;
+    service.metrics().request(
+        route.as_deref(),
+        &method,
+        response.status(),
+        started.elapsed(),
+    );
+    response
+}
+
 /// Missing credentials have meaning only in the explicitly selected local mode.
 /// Supplied invalid credentials never fall back to local or anonymous authority.
 async fn authenticate(
@@ -239,6 +259,7 @@ async fn authenticate(
     request.headers_mut().remove(AUTHORIZATION);
     if let Some(credential) = context.credential() {
         if let Err(wait) = limits.take(&credential.id) {
+            service.metrics().rate_limited();
             let mut response = ApiError(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limited",
@@ -345,6 +366,7 @@ pub fn router(service: Arc<Service>) -> Router {
     let limit = service.settings().max_body_bytes();
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/metrics", get(public_metrics))
         .route("/v1/collections", get(collections))
         .route(
             "/v1/collections/{collection}",
@@ -382,6 +404,7 @@ pub fn router(service: Arc<Service>) -> Router {
             ),
             authenticate,
         ))
+        .layer(middleware::from_fn_with_state(service.clone(), observe))
         .with_state(service)
 }
 fn identifier(id: &str) -> ApiResult<()> {
@@ -404,6 +427,16 @@ fn collection_json(c: Collection) -> Value {
 async fn healthz(query: Result<Query<EmptyQuery>, QueryRejection>) -> ApiResult<Json<Value>> {
     query?;
     Ok(Json(json!({"status": "ok"})))
+}
+fn prometheus(body: String) -> Response {
+    ([(CONTENT_TYPE, metrics::CONTENT_TYPE)], body).into_response()
+}
+async fn public_metrics(
+    State(service): State<Arc<Service>>,
+    query: Result<Query<EmptyQuery>, QueryRejection>,
+) -> ApiResult<Response> {
+    query?;
+    Ok(prometheus(service.metrics().render_public()))
 }
 async fn collections(
     State(service): State<Arc<Service>>,
