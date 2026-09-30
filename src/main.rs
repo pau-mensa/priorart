@@ -32,7 +32,8 @@ enum Command {
         #[arg(long)]
         port: Option<u16>,
     },
-    /// Run the stdio MCP server against a running priorart (PRIORART_URL)
+    /// Run the stdio MCP server against a running priorart (PRIORART_URL, PRIORART_KEY,
+    /// PRIORART_COLLECTIONS, PRIORART_WRITE_COLLECTION)
     Mcp {
         /// Override PRIORART_URL (default http://127.0.0.1:8000)
         #[arg(long)]

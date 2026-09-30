@@ -4,8 +4,8 @@ Credential lifecycle, [service policy](policy.md), and [HTTP header authenticati
 are implemented. `PRIORART_MODE=authenticated` enables credential-based access with
 anonymous public reads; default `local` mode uses the local principal when no key
 is supplied. Invalid supplied keys always fail. Only authenticated mode can be
-[served beyond loopback](protocol.md#network-hosting). MCP currently supports the
-local workflow only.
+[served beyond loopback](protocol.md#network-hosting). The [MCP client](protocol.md#mcp-client)
+takes a key from `PRIORART_KEY`.
 
 ## Principals, collections, and keys
 

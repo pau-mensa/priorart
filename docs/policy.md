@@ -5,7 +5,7 @@ collection ID. There is no default collection or omitted-scope search in the Rus
 service API. HTTP v1 authenticates header credentials and selects explicit collections.
 Its default local mode gives requests without credentials access to `local` only;
 authenticated mode uses anonymous public reads as its credential-free default.
-MCP currently selects `local`.
+MCP searches its configured collections and writes to one.
 
 The policy follows the [deny-by-default and per-request validation guidance](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html).
 The low-level `Store` and `Index` APIs remain trusted persistence/retrieval primitives;

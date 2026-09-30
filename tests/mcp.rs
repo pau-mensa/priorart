@@ -1,9 +1,14 @@
-use priorart::auth::RequestContext;
-use priorart::service::WriteOptions;
-use priorart::store::LOCAL_COLLECTION_ID;
+use priorart::auth::{Grant, Operation, RequestContext};
+use priorart::config::{ServerMode, Settings};
+use priorart::service::{Service, WriteOptions, DATABASE_FILE};
+use priorart::store::{Store, Visibility, LOCAL_COLLECTION_ID};
 mod common;
 
-use priorart::mcp::{PriorartMcp, INSTRUCTIONS};
+use axum::response::IntoResponse;
+use axum::{http::StatusCode, Json};
+use std::sync::{Arc, Mutex};
+
+use priorart::mcp::{Config, PriorartMcp, INSTRUCTIONS};
 use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::RunningService;
 use rmcp::{RoleClient, ServiceExt};
@@ -39,7 +44,24 @@ async fn session() -> Session {
         )
         .unwrap();
     let url = common::spawn(service).await;
-    let server = PriorartMcp::connect(Some(url)).await.unwrap();
+    Session {
+        client: attach(config(&url, None, &[LOCAL_COLLECTION_ID], None)).await,
+        _directory: directory,
+    }
+}
+
+fn config(url: &str, key: Option<&str>, collections: &[&str], write: Option<&str>) -> Config {
+    Config {
+        url: url.to_owned(),
+        key: key.map(str::to_owned),
+        collections: collections.iter().map(|c| c.to_string()).collect(),
+        write_collection: write.map(str::to_owned),
+        allow_insecure_http: false,
+    }
+}
+
+async fn attach(config: Config) -> RunningService<RoleClient, ()> {
+    let server = PriorartMcp::connect(config).await.unwrap();
     let (server_side, client_side) = tokio::io::duplex(1 << 16);
     tokio::spawn(async move {
         server
@@ -50,15 +72,19 @@ async fn session() -> Session {
             .await
             .unwrap();
     });
-    Session {
-        _directory: directory,
-        client: ().serve(client_side).await.unwrap(),
-    }
+    ().serve(client_side).await.unwrap()
 }
 
 async fn call(session: &Session, name: &'static str, arguments: Value) -> CallToolResult {
-    session
-        .client
+    invoke(&session.client, name, arguments).await
+}
+
+async fn invoke(
+    client: &RunningService<RoleClient, ()>,
+    name: &'static str,
+    arguments: Value,
+) -> CallToolResult {
+    client
         .call_tool(
             CallToolRequestParams::new(name).with_arguments(arguments.as_object().unwrap().clone()),
         )
@@ -153,7 +179,7 @@ async fn contribute_revise_and_delete() {
     .await;
     assert_eq!(
         structured(&revised),
-        &json!({"id": id, "revision": 2, "truncated": false})
+        &json!({"collection_id": "local", "id": id, "revision": 2, "truncated": false})
     );
     let filtered = call(
         &session,
@@ -168,7 +194,10 @@ async fn contribute_revise_and_delete() {
         json!({"id": id, "expected_revision": 2}),
     )
     .await;
-    assert_eq!(structured(&deleted), &json!({"id": id, "deleted": true}));
+    assert_eq!(
+        structured(&deleted),
+        &json!({"collection_id": "local", "id": id, "deleted": true})
+    );
     let gone = call(&session, "get_experience", json!({"id": id})).await;
     assert!(error_text(&gone).contains("record_deleted"));
 }
@@ -200,6 +229,335 @@ async fn an_unreachable_server_fails_fast() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     drop(listener);
-    let error = PriorartMcp::connect(Some(url)).await.err().unwrap();
+    let error = PriorartMcp::connect(config(&url, None, &["local"], None))
+        .await
+        .err()
+        .unwrap();
     assert!(error.to_string().contains("cannot reach priorart"));
+}
+
+struct Hosted {
+    _directory: TempDir,
+    url: String,
+    secret: String,
+    private: String,
+    public: String,
+}
+
+/// An authenticated server: the key's principal owns `private`; `public` belongs
+/// to someone else and is readable by anyone.
+async fn hosted() -> Hosted {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path().join(DATABASE_FILE)).unwrap();
+    let (me, other) = (
+        store.create_principal().unwrap(),
+        store.create_principal().unwrap(),
+    );
+    let private = store
+        .create_collection(&me, Visibility::Restricted)
+        .unwrap();
+    let public = store.create_collection(&other, Visibility::Public).unwrap();
+    store
+        .put(
+            &private,
+            "private barrier notes",
+            None,
+            Some("mine"),
+            &me,
+            None,
+        )
+        .unwrap();
+    store
+        .put(
+            &public,
+            "public barrier fix",
+            None,
+            Some("shared"),
+            &other,
+            None,
+        )
+        .unwrap();
+    let secret = store
+        .issue_credential(
+            &me,
+            &[
+                Grant::new(&private, Operation::Write),
+                Grant::new(&public, Operation::Read),
+            ],
+            None,
+        )
+        .unwrap()
+        .into_secret();
+    let service = Service::open(Settings {
+        data_dir: directory.path().to_owned(),
+        mode: ServerMode::Authenticated,
+        ..Settings::default()
+    })
+    .unwrap();
+    Hosted {
+        url: common::spawn(Arc::new(service)).await,
+        _directory: directory,
+        secret,
+        private,
+        public,
+    }
+}
+
+#[tokio::test]
+async fn a_key_searches_mixed_scopes_and_writes_to_its_collection() {
+    let h = hosted().await;
+    let client = attach(config(
+        &h.url,
+        Some(&h.secret),
+        &[&h.private, &h.public],
+        Some(&h.private),
+    ))
+    .await;
+    let found = invoke(&client, "search_experiences", json!({"problem": "barrier"})).await;
+    let mut hits: Vec<_> = structured(&found)["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| {
+            (
+                hit["collection_id"].as_str().unwrap().to_owned(),
+                hit["id"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    hits.sort();
+    let mut expected = vec![
+        (h.private.clone(), "mine".to_owned()),
+        (h.public.clone(), "shared".to_owned()),
+    ];
+    expected.sort();
+    assert_eq!(hits, expected);
+    let only_public = invoke(
+        &client,
+        "search_experiences",
+        json!({"problem": "barrier", "collections": [h.public]}),
+    )
+    .await;
+    assert_eq!(
+        structured(&only_public)["hits"].as_array().unwrap().len(),
+        1
+    );
+    let shared = invoke(
+        &client,
+        "get_experience",
+        json!({"id": "shared", "collection": h.public}),
+    )
+    .await;
+    assert_eq!(structured(&shared)["text"], "public barrier fix");
+    let written = invoke(
+        &client,
+        "contribute_experience",
+        json!({"text": "new note"}),
+    )
+    .await;
+    assert_eq!(structured(&written)["collection_id"], h.private.as_str());
+    let refused = invoke(
+        &client,
+        "contribute_experience",
+        json!({"text": "not mine", "collection": h.public}),
+    )
+    .await;
+    assert!(error_text(&refused).contains("not_found"));
+
+    let mixed = attach(config(
+        &h.url,
+        Some(&h.secret),
+        &[&h.private, &h.public],
+        None,
+    ))
+    .await;
+    let undirected = invoke(&mixed, "contribute_experience", json!({"text": "where?"})).await;
+    assert!(error_text(&undirected).contains("no default collection"));
+
+    let anonymous = attach(config(&h.url, None, &[&h.public], None)).await;
+    let public = invoke(
+        &anonymous,
+        "search_experiences",
+        json!({"problem": "barrier"}),
+    )
+    .await;
+    assert_eq!(structured(&public)["hits"][0]["id"], "shared");
+    let private = invoke(
+        &anonymous,
+        "search_experiences",
+        json!({"problem": "barrier", "collections": [h.private]}),
+    )
+    .await;
+    assert!(error_text(&private).contains("not_found"));
+    let write = invoke(&anonymous, "contribute_experience", json!({"text": "anon"})).await;
+    assert!(error_text(&write).contains("unauthenticated"));
+}
+
+#[tokio::test]
+async fn the_key_never_reaches_schemas_output_or_errors() {
+    let h = hosted().await;
+    let client = attach(config(&h.url, Some(&h.secret), &[&h.private], None)).await;
+    let tools = client.list_all_tools().await.unwrap();
+    let mut seen = serde_json::to_string(&tools).unwrap();
+    let schemas = seen.to_lowercase();
+    for word in ["priorart_key", "authorization", "bearer"] {
+        assert!(!schemas.contains(word), "{word}");
+    }
+    for (name, arguments) in [
+        ("search_experiences", json!({"problem": "barrier"})),
+        ("get_experience", json!({"id": "mine"})),
+        ("get_experience", json!({"id": "absent"})),
+        ("contribute_experience", json!({"text": "   "})),
+    ] {
+        seen += &serde_json::to_string(&invoke(&client, name, arguments).await).unwrap();
+    }
+    assert!(seen.contains("barrier") && seen.contains("not_found"));
+    assert!(!seen.contains(&h.secret));
+
+    let wrong = format!("{}x", h.secret);
+    let error = PriorartMcp::connect(config(&h.url, Some(&wrong), &[&h.private], None))
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("rejected PRIORART_KEY"), "{error}");
+    assert!(!error.contains(&wrong));
+}
+
+#[tokio::test]
+async fn urls_keys_and_collections_are_checked_before_connecting() {
+    for (url, key, collections) in [
+        ("http://example.com", None, &["local"][..]),
+        ("http://10.0.0.1:8000", Some("k"), &["local"]),
+        ("ftp://127.0.0.1", None, &["local"]),
+        ("https://user:pass@example.com", None, &["local"]),
+        ("not a url", None, &["local"]),
+        ("http://127.0.0.1:1", Some("two words"), &["local"]),
+        ("http://127.0.0.1:1", None, &[]),
+        ("http://127.0.0.1:1", None, &["a/b"]),
+    ] {
+        let error = PriorartMcp::connect(config(url, key, collections, None))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            !error.to_string().contains("cannot reach"),
+            "{url} {collections:?}: {error}"
+        );
+    }
+    for (url, allow_insecure_http) in [
+        ("http://localhost:1", false),
+        ("http://[::1]:1", false),
+        ("https://127.0.0.1:1", false),
+        ("http://0.0.0.0:1", true),
+    ] {
+        let error = PriorartMcp::connect(Config {
+            allow_insecure_http,
+            ..config(url, None, &["local"], None)
+        })
+        .await
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("cannot reach"), "{url}: {error}");
+    }
+}
+
+type Seen = Arc<Mutex<Vec<(String, Option<String>, Option<String>)>>>;
+
+/// Records method, bearer, and idempotency key; fails each write once with 503
+/// and redirects `/moved` elsewhere.
+async fn flaky(elsewhere: Option<String>) -> (String, Seen) {
+    let seen: Seen = Arc::default();
+    let log = seen.clone();
+    let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+        let log = log.clone();
+        let elsewhere = elsewhere.clone();
+        async move {
+            let header = |name: &str| {
+                request
+                    .headers()
+                    .get(name)
+                    .map(|value| value.to_str().unwrap().to_owned())
+            };
+            let entry = (
+                format!("{} {}", request.method(), request.uri().path()),
+                header("authorization"),
+                header("idempotency-key"),
+            );
+            let mut log = log.lock().unwrap();
+            let retry = log.iter().any(|seen| seen.0 == entry.0);
+            log.push(entry);
+            let path = request.uri().path().to_owned();
+            if let (Some(target), true) = (&elsewhere, path.contains("moved")) {
+                return (
+                    StatusCode::TEMPORARY_REDIRECT,
+                    [("location", format!("{target}{path}"))],
+                    String::new(),
+                )
+                    .into_response();
+            }
+            match (request.method().as_str(), retry) {
+                ("GET", _) if path == "/healthz" => Json(json!({"status": "ok"})).into_response(),
+                ("POST" | "DELETE", false) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                ("POST", true) => (
+                    StatusCode::CREATED,
+                    Json(
+                        json!({"collection_id": "c", "id": "r", "revision": 1, "truncated": false}),
+                    ),
+                )
+                    .into_response(),
+                _ => StatusCode::NO_CONTENT.into_response(),
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, seen)
+}
+
+#[tokio::test]
+async fn retries_reuse_one_idempotency_key_per_write() {
+    let (url, seen) = flaky(None).await;
+    let client = attach(config(&url, Some("pa1_key"), &["c"], None)).await;
+    let written = invoke(&client, "contribute_experience", json!({"text": "note"})).await;
+    assert_eq!(structured(&written)["id"], "r");
+    let deleted = invoke(&client, "delete_experience", json!({"id": "r"})).await;
+    assert_eq!(
+        structured(&deleted),
+        &json!({"collection_id": "c", "id": "r", "deleted": true})
+    );
+    invoke(&client, "contribute_experience", json!({"text": "again"})).await;
+    let seen = seen.lock().unwrap().clone();
+    let keys = |route: &str| -> Vec<String> {
+        seen.iter()
+            .filter(|entry| entry.0 == route)
+            .map(|entry| entry.2.clone().unwrap())
+            .collect()
+    };
+    let posts = keys("POST /v1/collections/c/records");
+    assert_eq!(posts.len(), 3);
+    assert_eq!(posts[0], posts[1]);
+    assert_ne!(posts[1], posts[2]);
+    let deletes = keys("DELETE /v1/collections/c/records/r");
+    assert_eq!(deletes.len(), 2);
+    assert_eq!(deletes[0], deletes[1]);
+    assert_ne!(deletes[0], posts[0]);
+    assert!(seen
+        .iter()
+        .all(|entry| entry.1.as_deref() == Some("Bearer pa1_key")));
+    assert!(seen
+        .iter()
+        .filter(|entry| entry.0.starts_with("GET"))
+        .all(|entry| entry.2.is_none()));
+}
+
+#[tokio::test]
+async fn redirects_are_not_followed() {
+    let (elsewhere, reached) = flaky(None).await;
+    let (url, _) = flaky(Some(elsewhere)).await;
+    let client = attach(config(&url, Some("pa1_key"), &["c"], None)).await;
+    let result = invoke(&client, "get_experience", json!({"id": "moved"})).await;
+    assert!(error_text(&result).contains("HTTP 307"));
+    assert!(reached.lock().unwrap().is_empty());
 }

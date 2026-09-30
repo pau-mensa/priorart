@@ -2,12 +2,14 @@
 //!
 //! A client rather than an embedded service: one server owns the data directory
 //! and its in-memory indexes, so every agent session must talk to the one
-//! `priorart serve` process instead of opening the data directory itself. Set `PRIORART_URL` to that server.
+//! `priorart serve` process instead of opening the data directory itself.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use reqwest::{Client, RequestBuilder};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use reqwest::redirect::Policy;
+use reqwest::{Client, RequestBuilder, Url};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -18,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::service::{is_record_id, RECORD_ID_RULE};
+use crate::store::LOCAL_COLLECTION_ID;
 use crate::VERSION;
 
 pub const DEFAULT_URL: &str = "http://127.0.0.1:8000";
@@ -35,11 +38,49 @@ After you solve a hard problem yourself, call contribute_experience with a self-
 secrets, credentials, or private project details.
 ";
 
+/// Where the client connects and with which authority. Secrets stay here and
+/// in the request headers, never in tool schemas or output.
+pub struct Config {
+    pub url: String,
+    pub key: Option<String>,
+    /// The default search scope.
+    pub collections: Vec<String>,
+    /// The default destination; defaults to the only search collection.
+    pub write_collection: Option<String>,
+    /// Allows plain HTTP to a non-loopback server, as the server's own setting does.
+    pub allow_insecure_http: bool,
+}
+
+impl Config {
+    /// Reads `PRIORART_URL`, `PRIORART_KEY`, `PRIORART_COLLECTIONS`,
+    /// `PRIORART_WRITE_COLLECTION`, and `PRIORART_ALLOW_INSECURE_HTTP`; `url`
+    /// overrides `PRIORART_URL`.
+    pub fn from_env(url: Option<String>) -> Self {
+        let var = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+        let collections = var("PRIORART_COLLECTIONS").map_or_else(
+            || vec![LOCAL_COLLECTION_ID.to_owned()],
+            |value| value.split(',').map(|c| c.trim().to_owned()).collect(),
+        );
+        Self {
+            url: url
+                .or_else(|| var("PRIORART_URL"))
+                .unwrap_or_else(|| DEFAULT_URL.to_owned()),
+            key: var("PRIORART_KEY"),
+            write_collection: var("PRIORART_WRITE_COLLECTION"),
+            allow_insecure_http: var("PRIORART_ALLOW_INSECURE_HTTP").as_deref() == Some("true"),
+            collections,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
-#[error("cannot reach priorart at {url} ({reason}); start `priorart serve` or set PRIORART_URL")]
-pub struct Unreachable {
-    url: String,
-    reason: String,
+pub enum ConnectError {
+    #[error("{0}")]
+    Config(String),
+    #[error(
+        "cannot reach priorart at {url} ({reason}); start `priorart serve` or set PRIORART_URL"
+    )]
+    Unreachable { url: String, reason: String },
 }
 
 /// A metadata value usable in filters: string, number, or boolean.
@@ -58,6 +99,8 @@ type Scalars = BTreeMap<String, Scalar>;
 pub struct SearchParams {
     problem: String,
     filters: Option<Scalars>,
+    /// Collections to search instead of the configured scope.
+    collections: Option<Vec<String>>,
     #[serde(default = "default_limit")]
     limit: i64,
 }
@@ -70,6 +113,8 @@ fn default_limit() -> i64 {
 pub struct GetParams {
     id: String,
     revision: Option<i64>,
+    /// The hit's `collection_id`; defaults to the configured write collection.
+    collection: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -78,16 +123,21 @@ pub struct ContributeParams {
     metadata: Option<Scalars>,
     id: Option<String>,
     expected_revision: Option<i64>,
+    /// Destination instead of the configured write collection.
+    collection: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 pub struct DeleteParams {
     id: String,
     expected_revision: Option<i64>,
+    /// Defaults to the configured write collection.
+    collection: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct Hit {
+    collection_id: String,
     id: String,
     revision: i64,
     score: f64,
@@ -102,6 +152,7 @@ pub struct SearchOutput {
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct Experience {
+    collection_id: String,
     id: String,
     revision: i64,
     text: String,
@@ -111,6 +162,7 @@ pub struct Experience {
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct Contributed {
+    collection_id: String,
     id: String,
     revision: i64,
     truncated: bool,
@@ -118,6 +170,7 @@ pub struct Contributed {
 
 #[derive(Serialize, JsonSchema)]
 pub struct Deleted {
+    collection_id: String,
     id: String,
     deleted: bool,
 }
@@ -126,12 +179,36 @@ pub struct Deleted {
 pub struct PriorartMcp {
     client: Client,
     url: String,
+    collections: Vec<String>,
+    write_collection: Option<String>,
     tool_router: ToolRouter<Self>,
 }
 
-/// `code: message` from the protocol's error envelope, or the raw status.
-async fn send(request: RequestBuilder) -> Result<reqwest::Response, String> {
-    let response = request.send().await.map_err(|error| error.to_string())?;
+const ATTEMPTS: u32 = 3;
+
+/// Retries transport failures and gateway errors; a write carries the same
+/// idempotency key on every attempt, so a retry never applies it twice.
+/// Errors are `code: message` from the protocol's envelope, or the raw status.
+async fn send(mut request: RequestBuilder) -> Result<reqwest::Response, String> {
+    let mut delay = Duration::from_millis(200);
+    let mut attempt = 1;
+    let response = loop {
+        let retry = (attempt < ATTEMPTS).then(|| request.try_clone()).flatten();
+        let outcome = request.send().await;
+        let transient = match &outcome {
+            Ok(response) => matches!(response.status().as_u16(), 502..=504),
+            Err(error) => !error.is_builder(),
+        };
+        match retry {
+            Some(next) if transient => {
+                tokio::time::sleep(delay).await;
+                delay *= 4;
+                attempt += 1;
+                request = next;
+            }
+            _ => break outcome.map_err(|error| error.to_string())?,
+        }
+    };
     if response.status().is_success() {
         return Ok(response);
     }
@@ -163,33 +240,100 @@ async fn send_json<T: DeserializeOwned>(request: RequestBuilder) -> Result<T, St
 
 #[tool_router]
 impl PriorartMcp {
-    /// Checks the server's health so a misconfigured URL fails at startup.
-    pub async fn connect(url: Option<String>) -> Result<Self, Unreachable> {
-        let url = url
-            .or_else(|| std::env::var("PRIORART_URL").ok())
-            .unwrap_or_else(|| DEFAULT_URL.to_owned())
-            .trim_end_matches('/')
-            .to_owned();
-        let unreachable = |reason: String| Unreachable {
+    /// Checks the configuration and the server's health, so a bad URL or key
+    /// fails at startup.
+    pub async fn connect(config: Config) -> Result<Self, ConnectError> {
+        let invalid = |message: String| ConnectError::Config(message);
+        let url = config.url.trim_end_matches('/').to_owned();
+        let parsed =
+            Url::parse(&url).map_err(|_| invalid(format!("invalid PRIORART_URL {url:?}")))?;
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(invalid(
+                "PRIORART_URL must not contain credentials; use PRIORART_KEY".into(),
+            ));
+        }
+        let host = parsed.host_str().unwrap_or_default();
+        let loopback = host == "localhost"
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        match parsed.scheme() {
+            "https" => {}
+            "http" if loopback || config.allow_insecure_http => {}
+            _ => {
+                return Err(invalid(
+                    "PRIORART_URL must use https unless it is loopback or PRIORART_ALLOW_INSECURE_HTTP=true".into(),
+                ))
+            }
+        }
+        for collection in config.collections.iter().chain(&config.write_collection) {
+            check_id("collection", collection).map_err(invalid)?;
+        }
+        if config.collections.is_empty() {
+            return Err(invalid(
+                "PRIORART_COLLECTIONS must name at least one collection".into(),
+            ));
+        }
+        let mut headers = HeaderMap::new();
+        if let Some(key) = &config.key {
+            let mut value = HeaderValue::from_str(&format!("Bearer {key}"))
+                .ok()
+                .filter(|_| !key.contains(char::is_whitespace))
+                .ok_or_else(|| invalid("PRIORART_KEY is not a valid key".into()))?;
+            value.set_sensitive(true);
+            headers.insert(AUTHORIZATION, value);
+        }
+        let unreachable = |reason: String| ConnectError::Unreachable {
             url: url.clone(),
             reason,
         };
         let client = Client::builder()
             .timeout(Duration::from_secs(60))
+            .redirect(Policy::none())
+            .default_headers(headers)
             .build()
             .map_err(|error| unreachable(error.to_string()))?;
         send(client.get(format!("{url}/healthz")))
             .await
-            .map_err(unreachable)?;
+            .map_err(|reason| {
+                if reason.starts_with("unauthenticated:") {
+                    invalid(format!("{url} rejected PRIORART_KEY"))
+                } else {
+                    unreachable(reason)
+                }
+            })?;
+        let write_collection = config
+            .write_collection
+            .or(match config.collections.as_slice() {
+                [only] => Some(only.clone()),
+                _ => None,
+            });
         Ok(Self {
             client,
             url,
+            collections: config.collections,
+            write_collection,
             tool_router: Self::tool_router(),
         })
     }
 
     fn endpoint(&self, path: &str) -> String {
         format!("{}{path}", self.url)
+    }
+
+    fn collection(&self, chosen: Option<String>) -> Result<String, String> {
+        let collection = chosen
+            .or_else(|| self.write_collection.clone())
+            .ok_or("no default collection: pass `collection` (for a hit, its collection_id)")?;
+        check_id("collection", &collection)?;
+        Ok(collection)
+    }
+
+    fn record(&self, collection: &str, id: &str) -> Result<String, String> {
+        check_id("id", id)?;
+        Ok(self.endpoint(&format!("/v1/collections/{collection}/records/{id}")))
     }
 
     /// Find experiences from other agents that may reduce your remaining work.
@@ -199,16 +343,20 @@ impl PriorartMcp {
     /// already tried. Vocabulary from the resolution is unknown to you, so describe
     /// the failure, not a guessed cause.
     ///
-    /// Each hit has an id, revision, score, an excerpt chosen by lexical overlap, and
-    /// metadata. Fetch the full text with get_experience. Optional
+    /// Each hit has a collection_id, id, revision, score, an excerpt chosen by lexical
+    /// overlap, and metadata. Fetch the full text with get_experience, passing the
+    /// hit's collection_id as `collection`. Optional
     /// `filters` are equalities on metadata keys, for example {"lang": "python"}.
     #[tool(annotations(read_only_hint = true, open_world_hint = false))]
     async fn search_experiences(
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<Json<SearchOutput>, String> {
+        let collections = params
+            .collections
+            .unwrap_or_else(|| self.collections.clone());
         send_json(self.client.post(self.endpoint("/v1/search")).json(
-            &json!({"collections": ["local"], "text": params.problem, "filters": params.filters, "limit": params.limit}),
+            &json!({"collections": collections, "text": params.problem, "filters": params.filters, "limit": params.limit}),
         ))
         .await
         .map(Json)
@@ -220,10 +368,8 @@ impl PriorartMcp {
         &self,
         Parameters(params): Parameters<GetParams>,
     ) -> Result<Json<Experience>, String> {
-        check_record_id(&params.id)?;
-        let mut request = self
-            .client
-            .get(self.endpoint(&format!("/v1/collections/local/records/{}", params.id)));
+        let collection = self.collection(params.collection)?;
+        let mut request = self.client.get(self.record(&collection, &params.id)?);
         if let Some(revision) = params.revision {
             request = request.query(&[("revision", revision)]);
         }
@@ -254,9 +400,11 @@ impl PriorartMcp {
         &self,
         Parameters(params): Parameters<ContributeParams>,
     ) -> Result<Json<Contributed>, String> {
+        let collection = self.collection(params.collection)?;
         send_json(
             self.client
-                .post(self.endpoint("/v1/collections/local/records"))
+                .post(self.endpoint(&format!("/v1/collections/{collection}/records")))
+                .header("Idempotency-Key", idempotency_key())
                 .json(&json!({"text": params.text, "metadata": params.metadata, "id": params.id, "expected_revision": params.expected_revision})),
         )
         .await
@@ -274,27 +422,33 @@ impl PriorartMcp {
         &self,
         Parameters(params): Parameters<DeleteParams>,
     ) -> Result<Json<Deleted>, String> {
-        check_record_id(&params.id)?;
+        let collection = self.collection(params.collection)?;
         send(
             self.client
-                .delete(self.endpoint(&format!("/v1/collections/local/records/{}", params.id)))
+                .delete(self.record(&collection, &params.id)?)
+                .header("Idempotency-Key", idempotency_key())
                 .query(&[("expected_revision", params.expected_revision)]),
         )
         .await?;
         Ok(Json(Deleted {
+            collection_id: collection,
             id: params.id,
             deleted: true,
         }))
     }
 }
 
-/// Record IDs go into URL paths, which only valid IDs can do unchanged.
-fn check_record_id(id: &str) -> Result<(), String> {
+/// IDs go into URL paths, which only valid IDs can do unchanged.
+fn check_id(kind: &str, id: &str) -> Result<(), String> {
     if is_record_id(id) {
         Ok(())
     } else {
-        Err(format!("invalid id: {RECORD_ID_RULE}"))
+        Err(format!("invalid {kind}: {RECORD_ID_RULE}"))
     }
+}
+
+fn idempotency_key() -> String {
+    format!("mcp:{}", uuid::Uuid::new_v4().simple())
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -308,7 +462,7 @@ impl ServerHandler for PriorartMcp {
 
 /// Serves MCP on stdin/stdout; stdout is the protocol channel.
 pub async fn run(url: Option<String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let server = PriorartMcp::connect(url).await?;
+    let server = PriorartMcp::connect(Config::from_env(url)).await?;
     server
         .serve(rmcp::transport::stdio())
         .await?

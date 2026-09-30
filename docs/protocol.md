@@ -130,8 +130,8 @@ or result; retrying that key returns `410 mutation_purged`. Replaying an older s
 
 The mutation receipt is committed atomically with the content. Without a key the
 mutation still has a journal ID, but submitting it again is a new operation.
-Receipts currently have no expiry. The local MCP workflow does not yet expose
-retry keys.
+Receipts currently have no expiry. The MCP client sends a fresh key with each
+write and reuses it when it retries.
 
 ## Read and delete
 
@@ -307,8 +307,18 @@ SQL errors, and paths:
 `GET /healthz` returns only `{"status":"ok"}`. These response rules do not promise
 constant timing or hide operational side channels.
 
-## Local MCP workflow
+## MCP client
 
-The bundled MCP client uses explicit `local` routes and search scope. Corrections
-and deletes accept an optional `expected_revision`. It currently
-supports the default local server only.
+`priorart mcp` forwards tool calls to `PRIORART_URL`. `PRIORART_KEY` is sent as
+`Authorization: Bearer`; it never appears in tool schemas, results, or errors.
+Searches default to `PRIORART_COLLECTIONS` (comma-separated, default `local`),
+and writes to `PRIORART_WRITE_COLLECTION`, which defaults to the search scope
+when that is a single collection. Every tool takes an optional collection
+override; hits carry `collection_id` for follow-up reads.
+
+The URL must be HTTPS unless it is loopback or `PRIORART_ALLOW_INSECURE_HTTP=true`
+(the server's opt-in, honoured by the client too), and must not embed credentials.
+Redirects are not followed. The key and the URL are checked against `/healthz`
+at startup. Transport failures and `502`–`504` are retried up to three times;
+writes carry one `Idempotency-Key` across their attempts. Corrections and
+deletes accept an optional `expected_revision`.

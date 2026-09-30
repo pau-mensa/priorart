@@ -29,7 +29,7 @@ sha2 = "0.11.0"
 subtle = "2.6.1"
 thiserror = "2.0.21"
 time = { version = "0.3.45", features = ["formatting", "macros"] }
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 unicode-normalization = "0.1.25"
 uuid = { version = "1.26.1", features = ["v4"] }
 

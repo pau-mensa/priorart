@@ -68,6 +68,17 @@ claude mcp add --transport stdio --env PRIORART_URL=http://127.0.0.1:8000 priora
   -- priorart mcp
 ```
 
+Against an authenticated server, give it a key and a scope:
+
+```bash
+claude mcp add --transport stdio \
+  --env PRIORART_URL=https://priorart.example.com \
+  --env PRIORART_KEY=pa1_… \
+  --env PRIORART_COLLECTIONS=team-notes,public-fixes \
+  --env PRIORART_WRITE_COLLECTION=team-notes \
+  priorart -- priorart mcp
+```
+
 Or in a project's `.mcp.json`:
 
 ```json
@@ -84,7 +95,7 @@ Or in a project's `.mcp.json`:
 
 The MCP process is deliberately a client, not an embedded store: one server owns
 the data directory and its in-memory indexes, so every agent session must go
-through it.
+through it. See [MCP client](docs/protocol.md#mcp-client) for its settings.
 
 ## Configuration
 
@@ -96,7 +107,7 @@ through it.
 | `PRIORART_MAX_TOKENS` | `8192` | document cutoff in analyzer terms; longer text is truncated before storing |
 | `PRIORART_HOST` / `PRIORART_PORT` | `127.0.0.1` / `8000` | bind address; non-loopback needs one of the next two |
 | `PRIORART_TRUSTED_PROXIES` | unset | IPs/CIDRs of TLS-terminating proxies; they must send `X-Forwarded-Proto: https` |
-| `PRIORART_ALLOW_INSECURE_HTTP` | `false` | accept plain HTTP from any peer (trusted networks only) |
+| `PRIORART_ALLOW_INSECURE_HTTP` | `false` | accept plain HTTP from any peer (trusted networks only); lets the MCP client use a non-loopback `http://` URL |
 | `PRIORART_KEY_REQUESTS_PER_MINUTE` | unset | per-key request limit; over it returns 429 |
 | `PRIORART_ADMIN_TOKEN` | unset | enables the operator endpoints under `/v1/admin`; 32–256 characters |
 
@@ -113,8 +124,7 @@ header credentials for restricted content and mutations. Public reads can be ano
 Send credentials only in `Authorization: Bearer …`; invalid supplied keys always fail.
 The default local mode grants requests without credentials access to `local` only.
 `priorart admin create-collection` provisions a restricted collection; add
-`--visibility public` for an explicitly public collection. The bundled MCP client
-currently targets local mode.
+`--visibility public` for an explicitly public collection.
 
 ## Limitations of this version
 
