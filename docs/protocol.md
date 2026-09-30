@@ -172,16 +172,21 @@ Returns:
            "excerpt": "…", "metadata": {"lang": "python"}}]}
 ```
 
-`collections` is required and currently must contain exactly one explicit ID.
-Empty selections, duplicates, wildcards, and multiple collections are rejected;
-there is no search-all default or partial-result fallback.
+`collections` is required and names 1–16 collections, and no more than
+`PRIORART_MAX_LOADED_INDEXES`. Empty selections, duplicates, and wildcards are
+rejected. The caller needs `read` on every collection: one unknown or forbidden ID
+rejects the whole search with the usual `404`, and there is no search-all default or
+partial result.
 
 Queries must be nonempty and at most 16384 UTF-8 bytes. `limit` defaults to 10 and
 must be 1–100. Filters contain at most 64 scalar equalities (strings, numbers,
-booleans), combined with AND, and at most 16384 serialized bytes. Filtering occurs
-inside the authorized collection and matches latest metadata.
+booleans), combined with AND, and at most 16384 serialized bytes. Filters apply
+within each collection and match latest metadata.
 
-Scores are Lucene BM25 over the collection's live records. Hits bind
+Scores are Lucene BM25 over the selected collections' live records, with document
+count, average length, and term frequencies taken over the whole selection, so
+scores from different collections compare. Hits are merged by score; ties go to
+collection ID, then record ID. Hits bind
 excerpts/metadata to the exact qualified revision. Searches persist nothing: no
 query, filter, result list, or receipt.
 

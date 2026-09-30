@@ -48,7 +48,10 @@ fn record_purge_erases_content_without_recreating_on_retry() {
         )
         .unwrap();
     assert_eq!(
-        service.search(&caller, LOCAL, "secret", None, 10).unwrap()[0].id,
+        service
+            .search(&caller, &[LOCAL], "secret", None, 10)
+            .unwrap()[0]
+            .id,
         record
     );
     let options = DeleteOptions {
@@ -83,11 +86,11 @@ fn record_purge_erases_content_without_recreating_on_retry() {
             }
         )
         .is_err());
-    let hits = service.search(&caller, LOCAL, "text", None, 10).unwrap();
+    let hits = service.search(&caller, &[LOCAL], "text", None, 10).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].id, "survivor");
     assert!(service
-        .search(&caller, LOCAL, "secret", None, 10)
+        .search(&caller, &[LOCAL], "secret", None, 10)
         .unwrap()
         .is_empty());
 }
@@ -154,7 +157,9 @@ fn collection_purge_revokes_only_its_grants_and_never_recreates_local() {
             .as_deref(),
         Some("other collection")
     );
-    assert!(service.search(&fresh, &public, "public", None, 10).is_err());
+    assert!(service
+        .search(&fresh, &[&public], "public", None, 10)
+        .is_err());
     assert!(db
         .execute(
             "INSERT INTO collections (id, owner_principal_id, visibility, created_at) VALUES (?1, ?2, 'public', 'now')",

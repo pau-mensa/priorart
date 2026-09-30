@@ -533,22 +533,21 @@ async fn search(
 ) -> ApiResult<Json<Value>> {
     query?;
     let Json(body) = body?;
-    if body.collections.len() != 1 {
-        return Err(ApiError::invalid());
+    for collection in &body.collections {
+        identifier(collection)?;
     }
-    let collection = body.collections[0].clone();
-    identifier(&collection)?;
+    let collections = body.collections.clone();
     let hits = blocking(&service, move |s| {
         s.search(
             &context,
-            &collection,
+            &body.collections,
             &body.text,
             body.filters.as_ref(),
             body.limit,
         )
     })
     .await?;
-    Ok(Json(json!({"collections": body.collections, "hits": hits})))
+    Ok(Json(json!({"collections": collections, "hits": hits})))
 }
 async fn delete_collection(
     State(service): State<Arc<Service>>,

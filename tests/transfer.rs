@@ -246,7 +246,7 @@ fn import_preserves_history_as_new_authored_records_and_retries_without_duplicat
     ));
     let hits = f
         .service
-        .search(&bob, &f.destination, "second", None, 10)
+        .search(&bob, &[&f.destination], "second", None, 10)
         .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].revision, 2);

@@ -177,7 +177,7 @@ fn unrelated_principals_cannot_read_mutate_or_inspect_forbidden_scope() {
         assert_eq!(
             unavailable(
                 f.service
-                    .search(&context, collection, "sentinel", Some(&tags), 10)
+                    .search(&context, &[collection], "sentinel", Some(&tags), 10)
             ),
             expected
         );
@@ -189,7 +189,7 @@ fn unrelated_principals_cannot_read_mutate_or_inspect_forbidden_scope() {
     assert_eq!(f.store.get(&f.a, "same", None).unwrap().revision, 1);
     let outcome = f
         .service
-        .search(&context, &f.b, "sentinel", Some(&tags), 10)
+        .search(&context, &[&f.b], "sentinel", Some(&tags), 10)
         .unwrap();
     assert_eq!(outcome.len(), 1);
     assert_eq!(outcome[0].collection_id, f.b);
@@ -226,11 +226,12 @@ fn read_scope_includes_old_revisions_but_not_mutations_or_diagnostics() {
         f.service.get(&reader, &f.a, "same", None).unwrap().revision,
         2
     );
-    assert!(
-        f.service.search(&reader, &f.a, "second", None, 10).unwrap()[0]
-            .excerpt
-            .contains("second")
-    );
+    assert!(f
+        .service
+        .search(&reader, &[&f.a], "second", None, 10)
+        .unwrap()[0]
+        .excerpt
+        .contains("second"));
     unavailable(
         f.service
             .put(&reader, &f.a, "new", None, None, WriteOptions::default()),
@@ -261,7 +262,7 @@ fn anonymous_public_reads_succeed_and_mutations_require_credentials() {
     );
     let outcome = f
         .service
-        .search(&anonymous, &f.public, "sentinel", None, 10)
+        .search(&anonymous, &[&f.public], "sentinel", None, 10)
         .unwrap();
     assert_eq!(outcome.len(), 1);
     for context in [&anonymous, &f.bob()] {
@@ -489,18 +490,23 @@ fn revoked_and_reduced_credentials_cannot_reuse_loaded_indexes_or_public_read_ac
     let f = Fixture::new();
     let key = f.limited(&f.alice, &f.a, &[Op::Read]);
     let old = f.context(&key);
-    f.service.search(&old, &f.a, "sentinel", None, 10).unwrap();
+    f.service
+        .search(&old, &[&f.a], "sentinel", None, 10)
+        .unwrap();
     let id = &old.credential().unwrap().id;
     f.store.replace_local_credential_grants(id, &[]).unwrap();
-    unauthenticated(f.service.search(&old, &f.a, "sentinel", None, 10));
+    unauthenticated(f.service.search(&old, &[&f.a], "sentinel", None, 10));
     let reduced = f.context(&key);
-    unavailable(f.service.search(&reduced, &f.a, "sentinel", None, 10));
+    unavailable(f.service.search(&reduced, &[&f.a], "sentinel", None, 10));
     f.service
-        .search(&reduced, &f.public, "sentinel", None, 10)
+        .search(&reduced, &[&f.public], "sentinel", None, 10)
         .unwrap();
     f.store.revoke_local_credential(id).unwrap();
     unauthenticated(f.service.get(&reduced, &f.public, "same", None));
-    unauthenticated(f.service.search(&reduced, &f.public, "sentinel", None, 10));
+    unauthenticated(
+        f.service
+            .search(&reduced, &[&f.public], "sentinel", None, 10),
+    );
     unauthenticated(f.service.health(&reduced, &f.public));
     assert!(f.service.authenticate(&key).is_err());
 }
@@ -528,7 +534,10 @@ fn local_context_is_neither_anonymous_nor_a_cross_collection_admin() {
     );
     for collection in [&f.a, &f.b, &f.public, "unknown"] {
         unavailable(f.service.get(&local, collection, "same", None));
-        unavailable(f.service.search(&local, collection, "sentinel", None, 10));
+        unavailable(
+            f.service
+                .search(&local, &[collection], "sentinel", None, 10),
+        );
         unavailable(f.service.health(&local, collection));
     }
     unavailable(f.service.get(
@@ -578,7 +587,10 @@ fn expired_credentials_fail_even_for_public_data() {
         )
         .unwrap();
     unauthenticated(f.service.get(&context, &f.public, "same", None));
-    unauthenticated(f.service.search(&context, &f.public, "sentinel", None, 10));
+    unauthenticated(
+        f.service
+            .search(&context, &[&f.public], "sentinel", None, 10),
+    );
     unauthenticated(f.service.put(
         &context,
         &f.public,

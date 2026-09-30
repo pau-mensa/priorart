@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use lateweave::{document_ids_digest, CorpusManifest, SearchPipeline};
 
-use crate::gather::{Bm25, LexicalGatherer};
+use crate::gather::{Bm25, LexicalGatherer, Statistics};
 use crate::store::{Store, StoreError};
 
 #[derive(Debug, thiserror::Error)]
@@ -98,8 +98,13 @@ impl Index {
             .collect()
     }
 
-    /// BM25 candidates with no reranker; a non-empty index is required.
-    pub fn pipeline(&self) -> Result<SearchPipeline> {
+    pub fn lexical(&self) -> &Bm25 {
+        &self.lexical
+    }
+
+    /// BM25 candidates scored against `statistics`, with no reranker; a
+    /// non-empty index is required.
+    pub fn pipeline(&self, statistics: Arc<Statistics>) -> Result<SearchPipeline> {
         let manifest = CorpusManifest::new(
             self.collection_id.clone(),
             "bm25",
@@ -107,7 +112,7 @@ impl Index {
             document_ids_digest(&self.record_ids),
         )?
         .with_generation(self.generation);
-        let gatherer = LexicalGatherer::new(manifest, self.lexical.clone())?;
+        let gatherer = LexicalGatherer::new(manifest, self.lexical.clone(), statistics)?;
         Ok(SearchPipeline::new(Arc::new(gatherer), None)?)
     }
 }

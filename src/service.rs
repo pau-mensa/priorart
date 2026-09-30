@@ -17,6 +17,7 @@ use crate::analyzer::tokens;
 use crate::auth::{AuthError, Operation, RequestContext};
 use crate::config::Settings;
 use crate::excerpt::{excerpt, DEFAULT_WIDTH};
+use crate::gather::Statistics;
 use crate::index::{Index, IndexError};
 use crate::policy::{self, PolicyError};
 use crate::store::{Metadata, RecordSummary, Revision, Store, StoreError, Visibility};
@@ -25,6 +26,9 @@ mod transfer;
 pub use transfer::ImportOptions;
 
 pub const MAX_LIMIT: i64 = 100;
+/// A search spans at most this many collections, and never more than
+/// `PRIORART_MAX_LOADED_INDEXES`.
+pub const MAX_SEARCH_COLLECTIONS: usize = 16;
 pub const DATABASE_FILE: &str = "priorart.sqlite";
 
 static RECORD_ID: LazyLock<Regex> =
@@ -158,8 +162,7 @@ impl Service {
         &self.settings
     }
 
-    /// Authorization precedes admission. Each cached collection owns its connection
-    /// and mutex. Pinned entries cannot be evicted or replaced while a request uses them.
+    /// Authorization precedes admission.
     fn state(
         &self,
         context: &RequestContext,
@@ -175,6 +178,12 @@ impl Service {
                 result?;
             }
         }
+        self.admit(collection, store)
+    }
+
+    /// Each cached collection owns its connection and mutex. Pinned entries
+    /// cannot be evicted or replaced while a request uses them.
+    fn admit(&self, collection: &str, store: Store) -> Result<Arc<Mutex<State>>> {
         let mut states = self.states.lock().map_err(|_| ServiceError::Poisoned)?;
         if !states.loaded.contains_key(collection) {
             if states.loaded.len() == self.settings.max_loaded_indexes {
@@ -330,16 +339,32 @@ impl Service {
         Ok(())
     }
 
-    pub fn search(
+    /// BM25 over every selected collection with statistics summed across
+    /// them, so scores compare; ties go to collection ID, then record ID.
+    pub fn search<C: AsRef<str>>(
         &self,
         context: &RequestContext,
-        collection_id: &str,
+        collection_ids: &[C],
         text: &str,
         filters: Option<&Metadata>,
         limit: i64,
     ) -> Result<Vec<Hit>> {
-        let handle = self.state(context, collection_id, Operation::Read)?;
-        let mut state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
+        let mut collection_ids: Vec<&str> = collection_ids.iter().map(AsRef::as_ref).collect();
+        let fan_out = MAX_SEARCH_COLLECTIONS.min(self.settings.max_loaded_indexes);
+        if !(1..=fan_out).contains(&collection_ids.len()) {
+            return invalid(format!("collections must name 1 to {fan_out} collections"));
+        }
+        collection_ids.sort_unstable();
+        if collection_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return invalid("collections must not repeat");
+        }
+        let authority = self.connect()?;
+        let authorize = || {
+            collection_ids.iter().try_for_each(|collection| {
+                policy::collection(&authority, context, collection, Operation::Read).map(drop)
+            })
+        };
+        authorize()?;
         if text.trim().is_empty() {
             return invalid("query text must be a non-empty string");
         }
@@ -360,40 +385,64 @@ impl Service {
             }
         }
         let filters = filters.filter(|filters| !filters.is_empty());
-        let subset = match filters {
-            Some(filters) => {
-                let matching: HashSet<String> =
-                    state.store.matching_record_ids(collection_id, filters)?;
-                Some(state.index(collection_id)?.internal_ids(&matching))
-            }
-            None => None,
-        };
-        let index = state.index(collection_id)?;
-        let eligible = subset.as_ref().map_or(index.document_count(), Vec::len);
-        if eligible == 0 {
-            return Ok(Vec::new());
-        }
-        let mut request = SearchRequest::new(limit, limit);
-        if let Some(subset) = &subset {
-            request = request.with_subset(subset);
-        }
-        let result = index
-            .pipeline()?
-            .search(&Query::new(text), &request)
-            .map_err(IndexError::from)?;
-        let documents: Vec<(String, i64, f32)> = result
-            .documents
+        let handles = collection_ids
             .iter()
-            .map(|ranked| {
-                let (id, revision) = index.document(ranked.document_id);
-                (id.to_owned(), revision, ranked.score)
-            })
-            .collect();
+            .map(|collection| self.admit(collection, self.connect()?))
+            .collect::<Result<Vec<_>>>()?;
+        // Locked in collection ID order; writers only ever hold one.
+        let mut states = handles
+            .iter()
+            .map(|handle| handle.lock().map_err(|_| ServiceError::Poisoned))
+            .collect::<Result<Vec<_>>>()?;
         let query_tokens = tokens(text);
-        documents
+        let mut statistics = Statistics::default();
+        for (collection, state) in collection_ids.iter().zip(&mut states) {
+            statistics.add(state.index(collection)?.lexical(), &query_tokens);
+        }
+        let statistics = Arc::new(statistics);
+        let query = Query::new(text);
+        let mut ranked: Vec<(f32, usize, String, i64)> = Vec::new();
+        for (position, (collection, state)) in collection_ids.iter().zip(&mut states).enumerate() {
+            let subset = match filters {
+                Some(filters) => {
+                    let matching: HashSet<String> =
+                        state.store.matching_record_ids(collection, filters)?;
+                    Some(state.index(collection)?.internal_ids(&matching))
+                }
+                None => None,
+            };
+            let index = state.index(collection)?;
+            if subset.as_ref().map_or(index.document_count(), Vec::len) == 0 {
+                continue;
+            }
+            let mut request = SearchRequest::new(limit, limit);
+            if let Some(subset) = &subset {
+                request = request.with_subset(subset);
+            }
+            let result = index
+                .pipeline(statistics.clone())?
+                .search(&query, &request)
+                .map_err(IndexError::from)?;
+            ranked.extend(result.documents.iter().map(|ranked| {
+                let (id, revision) = index.document(ranked.document_id);
+                (ranked.score, position, id.to_owned(), revision)
+            }));
+        }
+        ranked.sort_unstable_by(|left, right| {
+            right
+                .0
+                .total_cmp(&left.0)
+                .then(left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
+        ranked.truncate(limit);
+        let hits = ranked
             .into_iter()
-            .map(|(id, revision, score)| {
-                let revision = state.store.get(collection_id, &id, Some(revision))?;
+            .map(|(score, position, id, revision)| {
+                let revision =
+                    states[position]
+                        .store
+                        .get(collection_ids[position], &id, Some(revision))?;
                 Ok(Hit {
                     excerpt: excerpt(
                         revision.text.as_deref().unwrap_or_default(),
@@ -407,7 +456,9 @@ impl Service {
                     metadata: revision.metadata,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        authorize()?;
+        Ok(hits)
     }
 
     pub fn collection(

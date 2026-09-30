@@ -117,8 +117,8 @@ For database upgrades and backups, see [storage](docs/storage.md).
 - Hosted mode is disabled. Local and authenticated HTTP modes are loopback-only;
   do not expose them through a proxy. Per-request limits exist, but rate limiting,
   hosted admission, and full deletion guarantees remain future work.
-- HTTP requests select an explicit collection; search currently accepts exactly
-  one collection. Storage is access-controlled by the trusted service and remains
+- HTTP requests select explicit collections; search spans up to 16 with shared
+  BM25 statistics. Storage is access-controlled by the trusted service and remains
   unencrypted.
 - One indexed view per record. Text beyond `PRIORART_MAX_TOKENS` is truncated
   before storing, so stored and indexed text match; there is no chunking.

@@ -67,7 +67,7 @@ fn invalid<T: std::fmt::Debug>(result: Result<T, ServiceError>) -> bool {
 fn put_and_search() {
     let (_directory, service) = seeded();
     let hits = service
-        .search(&CALLER, LOCAL, "worker never reached barrier", None, 10)
+        .search(&CALLER, &[LOCAL], "worker never reached barrier", None, 10)
         .unwrap();
     let hit = &hits[0];
     assert_eq!((hit.id.as_str(), hit.revision), ("nccl", 1));
@@ -98,7 +98,7 @@ fn an_update_supersedes() {
         .unwrap();
     assert_eq!(mutation.value.1, 2);
     let outcome = service
-        .search(&CALLER, LOCAL, "borrow checker lifetime", None, 10)
+        .search(&CALLER, &[LOCAL], "borrow checker lifetime", None, 10)
         .unwrap();
     assert_eq!((outcome[0].id.as_str(), outcome[0].revision), ("nccl", 2));
     assert!(service
@@ -130,7 +130,7 @@ fn delete_hides() {
         )
         .unwrap();
     let outcome = service
-        .search(&CALLER, LOCAL, "worker never reached barrier", None, 10)
+        .search(&CALLER, &[LOCAL], "worker never reached barrier", None, 10)
         .unwrap();
     assert!(outcome.iter().all(|hit| hit.id != "nccl"));
     assert!(matches!(
@@ -167,7 +167,7 @@ fn filters_restrict() {
     let (_directory, service) = seeded();
     let pytest = metadata(json!({"topic": "pytest"}));
     let outcome = service
-        .search(&CALLER, LOCAL, "error fixed", Some(&pytest), 10)
+        .search(&CALLER, &[LOCAL], "error fixed", Some(&pytest), 10)
         .unwrap();
     assert_eq!(
         outcome
@@ -178,7 +178,7 @@ fn filters_restrict() {
     );
     let nothing = metadata(json!({"topic": "nothing"}));
     assert!(service
-        .search(&CALLER, LOCAL, "error", Some(&nothing), 10)
+        .search(&CALLER, &[LOCAL], "error", Some(&nothing), 10)
         .unwrap()
         .is_empty());
 }
@@ -207,11 +207,14 @@ fn truncation_counts_analyzer_terms() {
     let stored = service.get(&CALLER, LOCAL, "long", None).unwrap();
     assert_eq!(stored.text.as_deref(), Some("  Straße café, naïve"));
     assert!(service
-        .search(&CALLER, LOCAL, "resume", None, 10)
+        .search(&CALLER, &[LOCAL], "resume", None, 10)
         .unwrap()
         .is_empty());
     assert_eq!(
-        service.search(&CALLER, LOCAL, "naive", None, 10).unwrap()[0].id,
+        service
+            .search(&CALLER, &[LOCAL], "naive", None, 10)
+            .unwrap()[0]
+            .id,
         "long"
     );
     let exact = service
@@ -235,7 +238,7 @@ fn a_loaded_index_follows_later_writes() {
     let (_directory, service) = seeded();
     let ids = |query: &str| -> Vec<String> {
         service
-            .search(&CALLER, LOCAL, query, None, 10)
+            .search(&CALLER, &[LOCAL], query, None, 10)
             .unwrap()
             .into_iter()
             .map(|hit| hit.id)
@@ -286,7 +289,7 @@ fn an_empty_corpus_returns_no_hits() {
     let directory = tempfile::tempdir().unwrap();
     let service = Service::open(settings(&directory)).unwrap();
     assert!(service
-        .search(&CALLER, LOCAL, "anything", None, 10)
+        .search(&CALLER, &[LOCAL], "anything", None, 10)
         .unwrap()
         .is_empty());
 }
@@ -344,9 +347,9 @@ fn validation() {
             WriteOptions::default(),
         )
         .unwrap();
-    assert!(invalid(service.search(&CALLER, LOCAL, "   ", None, 10)));
-    assert!(invalid(service.search(&CALLER, LOCAL, "ok", None, 0)));
-    assert!(invalid(service.search(&CALLER, LOCAL, "ok", None, 101)));
+    assert!(invalid(service.search(&CALLER, &[LOCAL], "   ", None, 10)));
+    assert!(invalid(service.search(&CALLER, &[LOCAL], "ok", None, 0)));
+    assert!(invalid(service.search(&CALLER, &[LOCAL], "ok", None, 101)));
     for bad in [
         json!({"nested": {"a": 1}}),
         json!({"list": [1]}),
@@ -354,7 +357,7 @@ fn validation() {
     ] {
         assert!(invalid(service.search(
             &CALLER,
-            LOCAL,
+            &[LOCAL],
             "ok",
             Some(&metadata(bad)),
             10
@@ -388,7 +391,7 @@ fn reopening_keeps_data() {
     let reopened = Service::open(settings(&directory)).unwrap();
     assert_eq!(
         reopened
-            .search(&CALLER, LOCAL, "barrier", None, 10)
+            .search(&CALLER, &[LOCAL], "barrier", None, 10)
             .unwrap()[0]
             .id,
         "nccl"
@@ -427,7 +430,7 @@ fn the_local_service_never_reads_other_collections() {
         .unwrap();
     assert_eq!(service.health(&CALLER, LOCAL).unwrap().document_count, 1);
     let hits = service
-        .search(&CALLER, LOCAL, "sentinel", None, 10)
+        .search(&CALLER, &[LOCAL], "sentinel", None, 10)
         .unwrap();
     assert_eq!(
         hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),

@@ -2,7 +2,7 @@
 //! consumes only query text and honours the subset.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use lateweave::{Candidate, CandidateGenerator, CorpusManifest, Query, Requirements, Result};
@@ -14,8 +14,9 @@ pub const LEXICAL_B: f32 = 0.75;
 
 /// Lucene-variant BM25: `idf = ln(1 + (N - df + 0.5) / (df + 0.5))` times
 /// `tf / (tf + k1 * (1 - b + b * dl / avgdl))`, summed over query terms
-/// (repeated query terms count again). Maintained incrementally so a write
-/// tokenizes only the document it changes.
+/// (repeated query terms count again). `N`, `df`, and `avgdl` come from
+/// [`Statistics`], so several indexes can score as one corpus. Maintained
+/// incrementally so a write tokenizes only the document it changes.
 #[derive(Clone, Default)]
 pub struct Bm25 {
     postings: HashMap<String, Vec<(u32, u32)>>,
@@ -76,13 +77,16 @@ impl Bm25 {
     }
 
     /// Positive scores, best first, ties by ascending document ID.
-    fn search(&self, terms: &[String], limit: usize, subset: Option<&[u64]>) -> Vec<(u64, f32)> {
+    fn search(
+        &self,
+        terms: &[String],
+        limit: usize,
+        subset: Option<&[u64]>,
+        statistics: &Statistics,
+    ) -> Vec<(u64, f32)> {
         let count = self.lengths.len();
-        let average_length = if count == 0 {
-            0.0
-        } else {
-            self.total_length as f32 / count as f32
-        };
+        let documents = statistics.documents as f32;
+        let average_length = statistics.total_length as f32 / documents;
         let eligible = subset.map(|subset| {
             let mut mask = vec![false; count];
             for &document in subset {
@@ -95,8 +99,12 @@ impl Bm25 {
             let Some(postings) = self.postings.get(term) else {
                 continue;
             };
-            let frequency = postings.len() as f32;
-            let idf = (1.0 + (count as f32 - frequency + 0.5) / (frequency + 0.5)).ln();
+            let frequency = statistics
+                .frequencies
+                .get(term)
+                .copied()
+                .unwrap_or_default() as f32;
+            let idf = (1.0 + (documents - frequency + 0.5) / (frequency + 0.5)).ln();
             for &(document, term_count) in postings {
                 if eligible
                     .as_ref()
@@ -124,14 +132,40 @@ impl Bm25 {
     }
 }
 
+/// Document count, total length, and query-term document frequencies, summed
+/// over every index a search spans so their scores are comparable.
+#[derive(Debug, Default)]
+pub struct Statistics {
+    documents: u64,
+    total_length: u64,
+    frequencies: HashMap<String, u64>,
+}
+
+impl Statistics {
+    pub fn add(&mut self, index: &Bm25, terms: &[String]) {
+        self.documents += index.len() as u64;
+        self.total_length += index.total_length;
+        for term in terms.iter().collect::<HashSet<_>>() {
+            let frequency = index.postings.get(term).map_or(0, Vec::len) as u64;
+            *self.frequencies.entry(term.clone()).or_default() += frequency;
+        }
+    }
+}
+
 pub struct LexicalGatherer {
     corpus: CorpusManifest,
     requires: Requirements,
     index: Arc<Bm25>,
+    statistics: Arc<Statistics>,
 }
 
 impl LexicalGatherer {
-    pub fn new(corpus: CorpusManifest, index: Arc<Bm25>) -> Result<Self> {
+    /// `statistics` must include `index` and the query's terms.
+    pub fn new(
+        corpus: CorpusManifest,
+        index: Arc<Bm25>,
+        statistics: Arc<Statistics>,
+    ) -> Result<Self> {
         if index.len() as u64 != corpus.document_count() {
             return Err(lateweave::Error::InvalidInput(
                 "lexical texts do not match the corpus manifest".to_owned(),
@@ -141,6 +175,7 @@ impl LexicalGatherer {
             corpus,
             requires: Requirements::new(),
             index,
+            statistics,
         })
     }
 }
@@ -167,7 +202,7 @@ impl CandidateGenerator for LexicalGatherer {
         let terms = tokens(query.text());
         Ok(self
             .index
-            .search(&terms, limit, subset)
+            .search(&terms, limit, subset, &self.statistics)
             .into_iter()
             .enumerate()
             .map(|(rank, (document_id, score))| Candidate {
@@ -197,6 +232,25 @@ mod tests {
         CorpusManifest::new("t", "v", TEXTS.len() as u64, document_ids_digest(ids)).unwrap()
     }
 
+    fn gatherer(texts: &[&str]) -> Result<LexicalGatherer> {
+        let index = Arc::new(Bm25::new(texts));
+        let statistics = own(
+            &index,
+            &["cuda", "attention", "barrier", "worker", "timeout"],
+        );
+        LexicalGatherer::new(corpus(), index, Arc::new(statistics))
+    }
+
+    fn own(index: &Bm25, terms: &[&str]) -> Statistics {
+        let mut statistics = Statistics::default();
+        statistics.add(index, &strings(terms));
+        statistics
+    }
+
+    fn strings(terms: &[&str]) -> Vec<String> {
+        terms.iter().map(|term| term.to_string()).collect()
+    }
+
     fn ids(candidates: &[Candidate]) -> Vec<u64> {
         candidates
             .iter()
@@ -206,7 +260,7 @@ mod tests {
 
     #[test]
     fn lexical_ranks_matches_first_and_drops_zero_scores() {
-        let gatherer = LexicalGatherer::new(corpus(), Arc::new(Bm25::new(&TEXTS))).unwrap();
+        let gatherer = gatherer(&TEXTS).unwrap();
         let found = gatherer
             .gather(&Query::new("worker barrier timeout"), 10, None)
             .unwrap();
@@ -220,7 +274,7 @@ mod tests {
 
     #[test]
     fn lexical_honours_the_subset() {
-        let gatherer = LexicalGatherer::new(corpus(), Arc::new(Bm25::new(&TEXTS))).unwrap();
+        let gatherer = gatherer(&TEXTS).unwrap();
         let found = gatherer
             .gather(&Query::new("cuda attention barrier"), 10, Some(&[1, 2]))
             .unwrap();
@@ -234,7 +288,7 @@ mod tests {
     #[test]
     fn lucene_scores_match_the_reference_formula() {
         let index = Bm25::new(&["a b", "a", "c c c d"]);
-        let scores = index.search(&["a".to_owned()], 10, None);
+        let scores = index.search(&strings(&["a"]), 10, None, &own(&index, &["a"]));
         let average = 7.0 / 3.0;
         let idf = (1.0f32 + (3.0 - 2.0 + 0.5) / (2.0 + 0.5)).ln();
         let expected = |length: f32| idf / (1.0 + 1.5 * (0.25 + 0.75 * length / average));
@@ -253,10 +307,9 @@ mod tests {
         index.push("b b a");
         let fresh = Bm25::new(&["c c c d", "a e", "b b a"]);
         for query in [["a"], ["b"], ["c"], ["e"], ["gone"]] {
-            let terms: Vec<String> = query.iter().map(|term| term.to_string()).collect();
             assert_eq!(
-                index.search(&terms, 10, None),
-                fresh.search(&terms, 10, None)
+                index.search(&strings(&query), 10, None, &own(&index, &query)),
+                fresh.search(&strings(&query), 10, None, &own(&fresh, &query))
             );
         }
         assert_eq!(index.len(), 3);
@@ -264,7 +317,28 @@ mod tests {
     }
 
     #[test]
+    fn shared_statistics_score_split_indexes_as_one_corpus() {
+        let whole = Bm25::new(&["a b", "a", "c c c d", "a a d"]);
+        let left = Bm25::new(&["a b", "a"]);
+        let right = Bm25::new(&["c c c d", "a a d"]);
+        let query = strings(&["a", "d", "a"]);
+        let mut shared = Statistics::default();
+        shared.add(&left, &query);
+        shared.add(&right, &query);
+        let expected = whole.search(&query, 10, None, &own(&whole, &["a", "d"]));
+        let mut split: Vec<(u64, f32)> = left.search(&query, 10, None, &shared);
+        split.extend(
+            right
+                .search(&query, 10, None, &shared)
+                .into_iter()
+                .map(|(document, score)| (document + 2, score)),
+        );
+        split.sort_unstable_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
+        assert_eq!(split, expected);
+    }
+
+    #[test]
     fn mismatched_texts_are_rejected() {
-        assert!(LexicalGatherer::new(corpus(), Arc::new(Bm25::new(&TEXTS[..2]))).is_err());
+        assert!(gatherer(&TEXTS[..2]).is_err());
     }
 }

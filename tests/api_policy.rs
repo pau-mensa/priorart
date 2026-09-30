@@ -176,7 +176,9 @@ async fn scope_is_required_and_forbidden_objects_are_indistinguishable() {
                 hidden
             );
         }
-        assert_eq!(api.post("/v1/search", Some(&api.alice_key), json!({"collections": [collection], "text": "sentinel", "filters": {"tag": "shared"}})).await, hidden);
+        for collections in [json!([collection]), json!([api.a, collection])] {
+            assert_eq!(api.post("/v1/search", Some(&api.alice_key), json!({"collections": collections, "text": "sentinel", "filters": {"tag": "shared"}})).await, hidden);
+        }
         assert_eq!(
             api.post(
                 &api.records(collection),
@@ -190,9 +192,9 @@ async fn scope_is_required_and_forbidden_objects_are_indistinguishable() {
     assert_eq!(hidden.0, StatusCode::NOT_FOUND);
     for collections in [
         json!([]),
-        json!([api.a, api.b]),
         json!([api.a, api.a]),
         json!(["*"]),
+        json!((0..9).map(|i| format!("c{i}")).collect::<Vec<_>>()),
     ] {
         assert_eq!(
             api.post(

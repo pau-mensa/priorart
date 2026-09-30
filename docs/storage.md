@@ -42,7 +42,8 @@ startup. The in-memory indexes depend on this: a second writer would leave them
 stale. Use a local filesystem with reliable advisory locks.
 
 Each cached collection has its own mutex, SQLite connection, and index. Operations
-within a collection serialize; different collections run concurrently.
+within a collection serialize; different collections run concurrently. A search
+holds every selected collection's mutex, taken in collection ID order.
 `PRIORART_MAX_LOADED_INDEXES` (default 8) bounds cached collections. Idle ones are
 evicted LRU; when every slot is in use, a request for another collection gets
 `429 resource_limit`.
