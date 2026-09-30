@@ -55,6 +55,8 @@ pub enum StoreError {
         collection_id: String,
         record_id: String,
     },
+    #[error("no principal {0}")]
+    PrincipalNotFound(String),
     #[error("no collection {0}")]
     CollectionNotFound(String),
     #[error(transparent)]
@@ -261,6 +263,14 @@ impl Store {
         owner_principal_id: &str,
         visibility: Visibility,
     ) -> Result<String> {
+        let exists: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM principals WHERE id = ?1)",
+            [owner_principal_id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::PrincipalNotFound(owner_principal_id.to_owned()));
+        }
         let id = new_id();
         self.connection.execute(
             "INSERT INTO collections (id, owner_principal_id, visibility, created_at) VALUES (?1, ?2, ?3, ?4)",

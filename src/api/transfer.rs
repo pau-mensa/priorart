@@ -291,7 +291,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let store = Store::open(dir.path().join(DATABASE_FILE)).unwrap();
             let key = store
-                .issue_local_credential(
+                .issue_credential(
                     LOCAL_PRINCIPAL_ID,
                     &[Grant::new(LOCAL, Operation::Admin)],
                     None,
@@ -346,7 +346,7 @@ mod tests {
                 serde_json::from_slice(&body.next().await.unwrap().unwrap()).unwrap();
             assert_eq!(first["type"], "revision");
             if revoke {
-                store.revoke_local_credential(&id).unwrap();
+                store.revoke_credential(&id).unwrap();
             } else {
                 service
                     .put(

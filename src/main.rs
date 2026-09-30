@@ -100,23 +100,23 @@ fn administer(command: AdminCommand) -> Result<(), AnyError> {
             grants,
             expires_at,
         } => {
-            print_issued(store.issue_local_credential(&principal, &grants, expires_at)?)?;
+            print_issued(store.issue_credential(&principal, &grants, expires_at)?)?;
         }
         AdminCommand::List { principal } => {
             println!(
                 "{}",
-                serde_json::to_string(&store.local_credentials(&principal)?)?
+                serde_json::to_string(&store.credentials(&principal)?)?
             );
         }
         AdminCommand::Rotate { credential_id } => {
-            print_issued(store.rotate_local_credential(&credential_id)?)?;
+            print_issued(store.rotate_credential(&credential_id)?)?;
         }
-        AdminCommand::Revoke { credential_id } => store.revoke_local_credential(&credential_id)?,
+        AdminCommand::Revoke { credential_id } => store.revoke_credential(&credential_id)?,
         AdminCommand::SetGrants {
             credential_id,
             grants,
         } => {
-            store.replace_local_credential_grants(&credential_id, &grants)?;
+            store.replace_credential_grants(&credential_id, &grants)?;
         }
     }
     Ok(())

@@ -19,7 +19,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings
 | `gather` | BM25 and its lateweave candidate generator |
 | `analyzer`, `excerpt` | terms for BM25 and query-aware excerpts |
 | `service` | the protocol operations, transport-independent |
-| `api` | axum routes and the error envelope |
+| `api` | axum routes and the error envelope; `api::admin` for the operator endpoints |
 | `mcp` | stdio MCP tools forwarding to the HTTP API |
 | `main.rs` | the `priorart serve` / `priorart mcp` CLI |
 

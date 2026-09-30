@@ -41,11 +41,11 @@ impl Fixture {
             .collect();
         let bob_grants: Vec<_> = OWNER.iter().map(|op| Grant::new(&b, *op)).collect();
         let alice_key = store
-            .issue_local_credential(&alice, &alice_grants, None)
+            .issue_credential(&alice, &alice_grants, None)
             .unwrap()
             .into_secret();
         let bob_key = store
-            .issue_local_credential(&bob, &bob_grants, None)
+            .issue_credential(&bob, &bob_grants, None)
             .unwrap()
             .into_secret();
         for (collection, principal, text) in [
@@ -103,7 +103,7 @@ impl Fixture {
     fn limited(&self, principal: &str, collection: &str, ops: &[Op]) -> String {
         let grants: Vec<_> = ops.iter().map(|op| Grant::new(collection, *op)).collect();
         self.store
-            .issue_local_credential(principal, &grants, None)
+            .issue_credential(principal, &grants, None)
             .unwrap()
             .into_secret()
     }
@@ -429,14 +429,14 @@ fn revoked_and_reduced_credentials_cannot_reuse_loaded_indexes_or_public_read_ac
         .search(&old, &[&f.a], "sentinel", None, 10)
         .unwrap();
     let id = &old.credential().unwrap().id;
-    f.store.replace_local_credential_grants(id, &[]).unwrap();
+    f.store.replace_credential_grants(id, &[]).unwrap();
     unauthenticated(f.service.search(&old, &[&f.a], "sentinel", None, 10));
     let reduced = f.context(&key);
     unavailable(f.service.search(&reduced, &[&f.a], "sentinel", None, 10));
     f.service
         .search(&reduced, &[&f.public], "sentinel", None, 10)
         .unwrap();
-    f.store.revoke_local_credential(id).unwrap();
+    f.store.revoke_credential(id).unwrap();
     unauthenticated(f.service.get(&reduced, &f.public, "same", None));
     unauthenticated(
         f.service

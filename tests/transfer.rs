@@ -36,7 +36,7 @@ impl Fixture {
         let public = store.create_collection(&bob, Visibility::Public).unwrap();
         let permissions = [Op::Admin];
         let alice_key = store
-            .issue_local_credential(
+            .issue_credential(
                 &alice,
                 &permissions
                     .iter()
@@ -47,7 +47,7 @@ impl Fixture {
             .unwrap()
             .into_secret();
         let bob_key = store
-            .issue_local_credential(
+            .issue_credential(
                 &bob,
                 &[&destination, &public]
                     .into_iter()
@@ -136,7 +136,7 @@ fn export_is_scoped_and_generation_checked() {
         .is_err());
     let read_only = f
         .store
-        .issue_local_credential(&f.bob, &[Grant::new(&f.public, Op::Read)], None)
+        .issue_credential(&f.bob, &[Grant::new(&f.public, Op::Read)], None)
         .unwrap()
         .into_secret();
     assert!(f
@@ -145,7 +145,7 @@ fn export_is_scoped_and_generation_checked() {
         .is_err());
     let writer = f
         .store
-        .issue_local_credential(&f.bob, &[Grant::new(&f.destination, Op::Write)], None)
+        .issue_credential(&f.bob, &[Grant::new(&f.destination, Op::Write)], None)
         .unwrap()
         .into_secret();
     assert!(f
@@ -171,7 +171,7 @@ fn export_is_scoped_and_generation_checked() {
     ));
     let generation = f.service.export_generation(&alice, &f.source).unwrap();
     f.store
-        .revoke_local_credential(&alice.credential().unwrap().id)
+        .revoke_credential(&alice.credential().unwrap().id)
         .unwrap();
     assert!(f
         .service
@@ -276,7 +276,7 @@ fn existing_ids_conflict_unless_overwriting() {
     ));
     let writer = f
         .store
-        .issue_local_credential(&f.alice, &[Grant::new(&f.public, Op::Write)], None)
+        .issue_credential(&f.alice, &[Grant::new(&f.public, Op::Write)], None)
         .unwrap()
         .into_secret();
     assert!(matches!(
@@ -318,7 +318,7 @@ fn import_never_trusts_source_authority() {
     assert!(!serde_json::to_string(&exported).unwrap().contains("forged"));
     let read_only = f
         .store
-        .issue_local_credential(&f.bob, &[Grant::new(&f.destination, Op::Read)], None)
+        .issue_credential(&f.bob, &[Grant::new(&f.destination, Op::Read)], None)
         .unwrap()
         .into_secret();
     assert!(f

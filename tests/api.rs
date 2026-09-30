@@ -360,10 +360,7 @@ async fn credential_administration_has_no_remote_endpoint() {
     let store =
         priorart::store::Store::open(api._directory.path().join(priorart::service::DATABASE_FILE))
             .unwrap();
-    assert!(store
-        .local_credentials("local-principal")
-        .unwrap()
-        .is_empty());
+    assert!(store.credentials("local-principal").unwrap().is_empty());
 }
 
 #[tokio::test]

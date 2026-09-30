@@ -91,7 +91,7 @@ impl Fixture {
             .collect();
         let key = self
             .store
-            .issue_local_credential(&self.principal, &grants, None)
+            .issue_credential(&self.principal, &grants, None)
             .unwrap()
             .into_secret();
         service.authenticate(&key).unwrap()

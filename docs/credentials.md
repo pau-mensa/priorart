@@ -1,4 +1,4 @@
-# Local credential administration
+# Credential administration
 
 Credential lifecycle, [service policy](policy.md), and [HTTP header authentication](protocol.md)
 are implemented. `PRIORART_MODE=authenticated` enables credential-based access with
@@ -54,12 +54,35 @@ priorart admin set-grants --credential-id LOOKUP_ID --grant local:read
 version. It never returns secrets or verifiers. Rotation atomically issues a new
 ID/secret with the same principal, grants, and expiry and revokes the old key.
 Revocation is permanent and idempotent. `set-grants` replaces the full grant set;
-omitting `--grant` removes all permissions. Local administration cannot rotate an
+omitting `--grant` removes all permissions. Administration cannot rotate an
 expired or revoked key; issue a new key instead.
 
 Grants are `read`, `write`, and `admin`, each implying the ones before it. `write`
 creates records and changes your own; `admin` is owner-level control: changing
 anyone's records, export, collection deletion, and diagnostics.
+
+## Remote administration
+
+Setting `PRIORART_ADMIN_TOKEN` (32–256 visible ASCII characters) enables operator
+endpoints under `/v1/admin`; without it they return `404`. They accept only
+`Authorization: Bearer <admin token>`, compared in constant time. Collection keys
+never open them, and the admin token is not a credential anywhere else. Secrets
+are returned once, with `Cache-Control: no-store`.
+
+| Request | Body | Response |
+|---|---|---|
+| `POST /v1/admin/principals` | none | `201 {"id"}` |
+| `POST /v1/admin/collections` | `{"owner", "visibility"?}` (default `restricted`) | `201 {"id","visibility","created_at","owner_principal_id"}` |
+| `POST /v1/admin/principals/{principal}/credentials` | `{"grants":[{"collection_id","operation"}], "expires_at"?}` | `201 {"credential","secret"}` |
+| `GET /v1/admin/principals/{principal}/credentials` | none | `{"credentials":[…]}`, metadata only |
+| `POST /v1/admin/credentials/{id}/rotate` | none | `201 {"credential","secret"}` |
+| `PUT /v1/admin/credentials/{id}/grants` | `{"grants":[…]}`; empty removes all | `204` |
+| `DELETE /v1/admin/credentials/{id}` | none | `204` |
+
+The same grant rules apply as for the CLI. Unknown principals, unknown or revoked
+credentials, and grants the principal may not hold return `404`. Grant replacement
+bumps the key's grant version, so it applies to the next request. Until network listeners are
+supported, these endpoints are loopback-only like the rest of the API.
 
 ## Contexts
 

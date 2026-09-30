@@ -19,7 +19,7 @@ Authorization: Bearer pa1_<lookup-id>_<secret>
 
 Malformed, expired, revoked, or unknown credentials return `401`; they never fall
 back to local or anonymous access. Credentials are not accepted as URL, JSON, or
-MCP arguments. See [local credential administration](credentials.md).
+MCP arguments. See [credential administration](credentials.md).
 
 Both modes require a loopback listener and loopback peers. Forwarding headers are
 rejected. Hosted mode is rejected at startup before opening storage or loading a
@@ -48,18 +48,12 @@ contexts see only `local`. No owner identity or global count is returned.
 
 `GET /v1/collections/{collection}` returns that collection's summary under the same
 policy. `GET /v1/collections/{collection}/diagnostics` requires `admin` and returns
-`{"status":"ok","document_count":N}` for that collection only. Admin alone does
-not grant access to records or searches.
+`{"status":"ok","document_count":N}` for that collection only.
 
-Collection creation is trusted local administration, not a collection-level grant:
-
-```bash
-priorart admin create-collection                    # restricted, owned by local-principal
-priorart admin create-collection --visibility public
-```
-
-Visibility is immutable. Principal, collection, and credential provisioning are
-local administration only; see [credentials](credentials.md).
+Principals, collections, and keys are provisioned by the operator, never through a
+collection grant: locally with `priorart admin`, or over HTTP under `/v1/admin`
+when `PRIORART_ADMIN_TOKEN` is set. Visibility is immutable. See
+[credentials](credentials.md).
 
 ## Create or update a record
 

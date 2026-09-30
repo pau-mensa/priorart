@@ -95,12 +95,15 @@ through it.
 | `PRIORART_MAX_LOADED_INDEXES` | `8` | cached collections and their in-memory indexes; idle LRU eviction, busy admission returns 429 |
 | `PRIORART_MAX_TOKENS` | `8192` | document cutoff in analyzer terms; longer text is truncated before storing |
 | `PRIORART_HOST` / `PRIORART_PORT` | `127.0.0.1` / `8000` | loopback bind address |
+| `PRIORART_ADMIN_TOKEN` | unset | enables the operator endpoints under `/v1/admin`; 32–256 characters |
 
 ## Local credentials
 
 `priorart admin issue --grant local:read` issues an opaque agent credential for
 the local principal and prints its secret once. Local commands also create
-principals and collections, and list, rotate, revoke, and replace grants. See [credential administration](docs/credentials.md).
+principals and collections, and list, rotate, revoke, and replace grants. With
+`PRIORART_ADMIN_TOKEN` set, the same provisioning is available over HTTP under
+`/v1/admin`. See [credential administration](docs/credentials.md).
 The Rust service enforces [collection and object policy](docs/policy.md) on explicit
 request contexts. Start with `PRIORART_MODE=authenticated priorart serve` to require
 header credentials for restricted content and mutations. Public reads can be anonymous.

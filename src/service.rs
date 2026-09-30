@@ -143,7 +143,7 @@ impl Service {
         })
     }
 
-    fn connect(&self) -> Result<Store, StoreError> {
+    pub(crate) fn connect(&self) -> Result<Store, StoreError> {
         Store::connect(&self.settings.data_dir.join(DATABASE_FILE))
     }
 

@@ -1,7 +1,11 @@
 //! Settings, read once from `PRIORART_*` environment variables.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::PathBuf;
+
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -15,9 +19,40 @@ pub enum ServerMode {
     Hosted,
 }
 
+/// The operator token for `/v1/admin`: 32–256 visible ASCII characters. Debug
+/// output never shows it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AdminToken(String);
+
+impl AdminToken {
+    pub fn new(token: impl Into<String>) -> Result<Self, ConfigError> {
+        let token = token.into();
+        if !(32..=256).contains(&token.len()) || !token.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(ConfigError(
+                "PRIORART_ADMIN_TOKEN must be 32-256 visible ASCII characters".into(),
+            ));
+        }
+        Ok(Self(token))
+    }
+
+    pub fn matches(&self, candidate: &str) -> bool {
+        Sha256::digest(&self.0)
+            .ct_eq(&Sha256::digest(candidate))
+            .into()
+    }
+}
+
+impl fmt::Debug for AdminToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AdminToken([REDACTED])")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     pub mode: ServerMode,
+    /// Enables the operator endpoints; without it they do not exist.
+    pub admin_token: Option<AdminToken>,
     pub data_dir: PathBuf,
     pub max_loaded_indexes: usize,
     pub max_tokens: usize,
@@ -29,6 +64,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             mode: ServerMode::Local,
+            admin_token: None,
             data_dir: PathBuf::from("data"),
             max_loaded_indexes: 8,
             max_tokens: 8192,
@@ -53,6 +89,9 @@ impl Settings {
                 "hosted" => ServerMode::Hosted,
                 _ => return Err(ConfigError("unknown server mode".into())),
             };
+        }
+        if let Some(value) = get("ADMIN_TOKEN") {
+            settings.admin_token = Some(AdminToken::new(value)?);
         }
         if let Some(value) = get("DATA_DIR") {
             settings.data_dir = PathBuf::from(value);
@@ -161,11 +200,23 @@ mod tests {
             ("PRIORART_MAX_TOKENS", "0"),
             ("PRIORART_PORT", "0"),
             ("PRIORART_PORT", "70000"),
+            ("PRIORART_ADMIN_TOKEN", "too-short"),
+            ("PRIORART_ADMIN_TOKEN", &format!("{} x", "a".repeat(40))),
         ] {
             assert!(
                 Settings::from_vars(vars(&[(key, value)])).is_err(),
                 "{key}={value}"
             );
         }
+    }
+
+    #[test]
+    fn the_admin_token_is_matched_exactly_and_never_printed() {
+        let secret = "s".repeat(40);
+        let settings = Settings::from_vars(vars(&[("PRIORART_ADMIN_TOKEN", &secret)])).unwrap();
+        let token = settings.admin_token.as_ref().unwrap();
+        assert!(token.matches(&secret));
+        assert!(!token.matches(&"s".repeat(39)));
+        assert!(!format!("{settings:?}").contains(&secret));
     }
 }

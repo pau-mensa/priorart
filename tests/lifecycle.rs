@@ -111,7 +111,7 @@ fn collection_purge_revokes_only_its_grants_and_never_recreates_local() {
         .flat_map(|c| [Grant::new(c, Op::Admin)])
         .collect();
     let key = store
-        .issue_local_credential(&principal, &grants, None)
+        .issue_credential(&principal, &grants, None)
         .unwrap()
         .into_secret();
     let service = service(dir.path());

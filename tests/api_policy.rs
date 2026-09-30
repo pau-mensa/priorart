@@ -43,11 +43,11 @@ impl Api {
             .flat_map(|c| OWNER.iter().map(move |op| Grant::new(c, *op)))
             .collect();
         let alice_key = store
-            .issue_local_credential(&alice, &grants, None)
+            .issue_credential(&alice, &grants, None)
             .unwrap()
             .into_secret();
         let bob_key = store
-            .issue_local_credential(
+            .issue_credential(
                 &bob,
                 &OWNER
                     .iter()
@@ -136,7 +136,7 @@ impl Api {
     }
     fn issue(&self, principal: &str, grants: Vec<Grant>) -> String {
         self.store
-            .issue_local_credential(principal, &grants, None)
+            .issue_credential(principal, &grants, None)
             .unwrap()
             .into_secret()
     }
@@ -246,9 +246,9 @@ async fn public_reads_do_not_downgrade_bad_credentials() {
     assert_eq!(api.get(&path, Some(&api.bob_key)).await.0, StatusCode::OK);
     let root = api
         .store
-        .issue_local_credential(&api.alice, &[Grant::new(&api.public, Op::Read)], None)
+        .issue_credential(&api.alice, &[Grant::new(&api.public, Op::Read)], None)
         .unwrap();
-    api.store.revoke_local_credential(&root.info.id).unwrap();
+    api.store.revoke_credential(&root.info.id).unwrap();
     for key in ["invalid-secret-sentinel", &root.into_secret()] {
         let result = api.get(&path, Some(key)).await;
         assert_eq!(result.0, StatusCode::UNAUTHORIZED);
@@ -567,7 +567,7 @@ async fn expiry_revocation_and_backend_failures_have_safe_responses() {
     let path = format!("{}/same", api.records(&api.public));
     let expiring = api
         .store
-        .issue_local_credential(&api.alice, &[Grant::new(&api.public, Op::Read)], None)
+        .issue_credential(&api.alice, &[Grant::new(&api.public, Op::Read)], None)
         .unwrap();
     let connection = rusqlite::Connection::open(api.dir.path().join(DATABASE_FILE)).unwrap();
     connection
@@ -590,7 +590,7 @@ async fn expiry_revocation_and_backend_failures_have_safe_responses() {
     );
     let context = api.store.authenticate(&api.alice_key).unwrap();
     api.store
-        .revoke_local_credential(&context.credential().unwrap().id)
+        .revoke_credential(&context.credential().unwrap().id)
         .unwrap();
     assert_eq!(
         api.post("/v1/search", Some(&api.alice_key), request)
@@ -811,7 +811,7 @@ async fn idempotency_is_principal_and_collection_scoped_and_rechecks_authority()
     assert_ne!(restricted.2, alice.2); // same principal and operation, different collection
     let context = api.store.authenticate(&writer).unwrap();
     api.store
-        .revoke_local_credential(&context.credential().unwrap().id)
+        .revoke_credential(&context.credential().unwrap().id)
         .unwrap();
     assert_eq!(
         keyed(
@@ -919,10 +919,7 @@ async fn own_records_follow_the_principal_across_key_rotation_and_revocation() {
     let api = Api::start().await;
     let records = format!("/v1/collections/{}/records", api.public);
     let grants = [Grant::new(&api.public, Op::Write)];
-    let issued = api
-        .store
-        .issue_local_credential(&api.bob, &grants, None)
-        .unwrap();
+    let issued = api.store.issue_credential(&api.bob, &grants, None).unwrap();
     let lookup = issued.info.id.clone();
     let bob_public = issued.into_secret();
     let (status, created) = api
@@ -956,18 +953,14 @@ async fn own_records_follow_the_principal_across_key_rotation_and_revocation() {
         StatusCode::NOT_FOUND
     );
 
-    let rotated = api
-        .store
-        .rotate_local_credential(&lookup)
-        .unwrap()
-        .into_secret();
+    let rotated = api.store.rotate_credential(&lookup).unwrap().into_secret();
     assert_eq!(
         api.get(&mine, Some(&bob_public)).await.0,
         StatusCode::UNAUTHORIZED
     );
     assert_eq!(ids(&api.get(&mine, Some(&rotated)).await.1), ["bobs"]);
-    for credential in api.store.local_credentials(&api.bob).unwrap() {
-        api.store.revoke_local_credential(&credential.id).unwrap();
+    for credential in api.store.credentials(&api.bob).unwrap() {
+        api.store.revoke_credential(&credential.id).unwrap();
     }
     assert_eq!(
         api.get(&mine, Some(&rotated)).await.0,
@@ -975,7 +968,7 @@ async fn own_records_follow_the_principal_across_key_rotation_and_revocation() {
     );
     let reissued = api
         .store
-        .issue_local_credential(&api.bob, &grants, None)
+        .issue_credential(&api.bob, &grants, None)
         .unwrap()
         .into_secret();
     assert_eq!(ids(&api.get(&mine, Some(&reissued)).await.1), ["bobs"]);

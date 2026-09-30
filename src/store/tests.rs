@@ -39,14 +39,6 @@ fn is_constraint(result: rusqlite::Result<usize>) -> bool {
     )
 }
 
-fn store_constraint<T: fmt::Debug>(result: Result<T>) -> bool {
-    matches!(
-        result,
-        Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(error, _)))
-            if error.code == rusqlite::ErrorCode::ConstraintViolation
-    )
-}
-
 #[test]
 fn put_creates_and_get_returns_latest() {
     let (_directory, store) = open();
@@ -300,8 +292,9 @@ fn visibility_and_ownership_constraints() {
         "UPDATE collections SET visibility = 'public' WHERE id = ?1",
         [&a],
     )));
-    assert!(store_constraint(
-        store.create_collection("missing", Visibility::Restricted)
+    assert!(matches!(
+        store.create_collection("missing", Visibility::Restricted),
+        Err(StoreError::PrincipalNotFound(_))
     ));
     assert!("invalid".parse::<Visibility>().is_err());
     let public = store.create_collection(&owner, Visibility::Public).unwrap();

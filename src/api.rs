@@ -23,6 +23,7 @@ use crate::{
     store::{Collection, Metadata, StoreError},
 };
 
+mod admin;
 mod transfer;
 
 pub struct ApiError(StatusCode, &'static str, &'static str);
@@ -169,6 +170,11 @@ async fn authenticate(
     {
         return Err(ApiError::invalid());
     }
+    if request.uri().path().starts_with("/v1/admin/") {
+        admin::authorize(service.settings().admin_token.as_ref(), request.headers())?;
+        request.headers_mut().remove(AUTHORIZATION);
+        return Ok(next.run(request).await);
+    }
     let headers: Vec<_> = request.headers().get_all(AUTHORIZATION).iter().collect();
     let context = match headers.as_slice() {
         [] => match service.settings().mode {
@@ -312,6 +318,7 @@ pub fn router(service: Arc<Service>) -> Router {
             post(transfer::import),
         )
         .route("/v1/search", post(search))
+        .merge(admin::routes())
         .fallback(|| async { ApiError::not_found() })
         .method_not_allowed_fallback(|| async {
             ApiError(

@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::store::{StoreError, LOCAL_PRINCIPAL_ID};
 
@@ -28,7 +28,7 @@ pub type Result<T> = std::result::Result<T, AuthError>;
 
 /// Collection capabilities, each implying the ones before it. `write` covers
 /// creating records and changing your own; `admin` is owner-level control.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Operation {
     Read,
@@ -58,7 +58,8 @@ impl FromStr for Operation {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Grant {
     pub collection_id: String,
     pub operation: Operation,

@@ -24,7 +24,7 @@ fn expiry() -> i64 {
 }
 fn issue(store: &Store, operations: &[Operation]) -> (String, String) {
     let issued = store
-        .issue_local_credential(PRINCIPAL, &grants(operations), None)
+        .issue_credential(PRINCIPAL, &grants(operations), None)
         .unwrap();
     (issued.info.id.clone(), issued.into_secret())
 }
@@ -33,7 +33,7 @@ fn issue(store: &Store, operations: &[Operation]) -> (String, String) {
 fn secrets_are_random_returned_once_and_never_persisted_or_debugged() {
     let (directory, store) = setup();
     let issued = store
-        .issue_local_credential(PRINCIPAL, &grants(&[Operation::Read]), None)
+        .issue_credential(PRINCIPAL, &grants(&[Operation::Read]), None)
         .unwrap();
     let debug = format!("{issued:?}");
     let id = issued.info.id.clone();
@@ -62,7 +62,7 @@ fn secrets_are_random_returned_once_and_never_persisted_or_debugged() {
         )
         .unwrap();
     assert_eq!(verifier.len(), 32);
-    let listing = serde_json::to_string(&store.local_credentials(PRINCIPAL).unwrap()).unwrap();
+    let listing = serde_json::to_string(&store.credentials(PRINCIPAL).unwrap()).unwrap();
     assert!(!listing.contains(&secret));
     assert!(!listing.contains("verifier"));
     // Scan DB, WAL and SHM while live, and the checkpointed DB after close.
@@ -111,7 +111,7 @@ fn malformed_unknown_and_wrong_keys_have_one_redacted_error() {
 fn expiry_is_exclusive_and_expired_contexts_are_rejected() {
     let (_directory, store) = setup();
     let issued = store
-        .issue_local_credential(PRINCIPAL, &grants(&[Operation::Read]), Some(expiry()))
+        .issue_credential(PRINCIPAL, &grants(&[Operation::Read]), Some(expiry()))
         .unwrap();
     let id = issued.info.id.clone();
     let secret = issued.into_secret();
@@ -131,7 +131,7 @@ fn expiry_is_exclusive_and_expired_contexts_are_rejected() {
     assert!(store.validate_context(&context).is_err());
     for end in [now, now - 1, 0] {
         assert!(store
-            .issue_local_credential(PRINCIPAL, &grants(&[Operation::Read]), Some(end))
+            .issue_credential(PRINCIPAL, &grants(&[Operation::Read]), Some(end))
             .is_err());
     }
 }
@@ -143,8 +143,8 @@ fn independent_revocation_and_versioned_contexts() {
     let (_, second) = issue(&store, &[Operation::Write]);
     let first_context = store.authenticate(&first).unwrap();
     let second_context = store.authenticate(&second).unwrap();
-    store.revoke_local_credential(&first_id).unwrap();
-    store.revoke_local_credential(&first_id).unwrap(); // idempotent
+    store.revoke_credential(&first_id).unwrap();
+    store.revoke_credential(&first_id).unwrap(); // idempotent
     assert!(store.authenticate(&first).is_err());
     assert!(store.validate_context(&first_context).is_err());
     assert!(store.validate_context(&second_context).is_err()); // principal version changed
@@ -163,17 +163,13 @@ fn explicit_grants_are_deduplicated_bounded_and_owner_scoped() {
         .unwrap();
     for collection in [&collection, "missing", "*"] {
         assert!(matches!(
-            store.issue_local_credential(
-                PRINCIPAL,
-                &[Grant::new(collection, Operation::Read)],
-                None
-            ),
+            store.issue_credential(PRINCIPAL, &[Grant::new(collection, Operation::Read)], None),
             Err(AuthError::Forbidden)
         ));
     }
-    assert!(store.issue_local_credential("missing", &[], None).is_err());
+    assert!(store.issue_credential("missing", &[], None).is_err());
     let issued = store
-        .issue_local_credential(
+        .issue_credential(
             PRINCIPAL,
             &grants(&[Operation::Read, Operation::Read]),
             None,
@@ -181,9 +177,9 @@ fn explicit_grants_are_deduplicated_bounded_and_owner_scoped() {
         .unwrap();
     assert_eq!(issued.info.grants.len(), 1);
     assert!(store
-        .issue_local_credential(PRINCIPAL, &grants(&[Operation::Read; MAX_GRANTS + 1]), None)
+        .issue_credential(PRINCIPAL, &grants(&[Operation::Read; MAX_GRANTS + 1]), None)
         .is_err());
-    let empty = store.issue_local_credential(PRINCIPAL, &[], None).unwrap();
+    let empty = store.issue_credential(PRINCIPAL, &[], None).unwrap();
     assert!(!store
         .authenticate(&empty.into_secret())
         .unwrap()
@@ -203,19 +199,17 @@ fn grant_changes_invalidate_contexts_and_stay_grantable() {
         .create_collection(&other, Visibility::Restricted)
         .unwrap();
     assert!(matches!(
-        store.replace_local_credential_grants(&parent_id, &[Grant::new(&foreign, Operation::Read)]),
+        store.replace_credential_grants(&parent_id, &[Grant::new(&foreign, Operation::Read)]),
         Err(AuthError::Forbidden)
     ));
     assert!(store.validate_context(&before).is_ok());
-    store
-        .replace_local_credential_grants(&parent_id, &[])
-        .unwrap();
+    store.replace_credential_grants(&parent_id, &[]).unwrap();
     assert!(store.validate_context(&before).is_err());
     let after = store.authenticate(&parent).unwrap();
     assert!(after.credential().unwrap().grant_version > before.credential().unwrap().grant_version);
     assert!(!after.has_grant(LOCAL, Operation::Read));
     store
-        .replace_local_credential_grants(&parent_id, &grants(&[Operation::Admin]))
+        .replace_credential_grants(&parent_id, &grants(&[Operation::Admin]))
         .unwrap();
     let restored = store.authenticate(&parent).unwrap();
     assert!(restored.has_grant(LOCAL, Operation::Admin));
@@ -227,7 +221,7 @@ fn rotation_is_atomic_preserves_limits_and_revokes_the_old_key() {
     let (_directory, store) = setup();
     let end = expiry();
     let parent = store
-        .issue_local_credential(
+        .issue_credential(
             PRINCIPAL,
             &grants(&[Operation::Read, Operation::Write]),
             Some(end),
@@ -236,14 +230,14 @@ fn rotation_is_atomic_preserves_limits_and_revokes_the_old_key() {
     let id = parent.info.id.clone();
     let old = parent.into_secret();
     let before = store.authenticate(&old).unwrap();
-    let rotated = store.rotate_local_credential(&id).unwrap();
+    let rotated = store.rotate_credential(&id).unwrap();
     assert_ne!(rotated.info.id, id);
     assert_eq!(rotated.info.expires_at, Some(end));
     assert_eq!(rotated.info.grants, before.credential().unwrap().grants);
     assert!(store.authenticate(&old).is_err());
     assert!(store.validate_context(&before).is_err());
     assert!(store.authenticate(&rotated.into_secret()).is_ok());
-    assert!(store.rotate_local_credential(&id).is_err());
+    assert!(store.rotate_credential(&id).is_err());
 }
 
 #[test]
@@ -253,12 +247,12 @@ fn failed_rotation_and_grant_replacement_roll_back() {
     let before = store.authenticate(&secret).unwrap();
     let connection = Connection::open(store.path()).unwrap();
     connection.execute_batch("CREATE TRIGGER fail_revoke BEFORE UPDATE OF revoked_at ON credentials BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
-    assert!(store.rotate_local_credential(&id).is_err());
-    assert_eq!(store.local_credentials(PRINCIPAL).unwrap().len(), 1);
+    assert!(store.rotate_credential(&id).is_err());
+    assert_eq!(store.credentials(PRINCIPAL).unwrap().len(), 1);
     assert!(store.validate_context(&before).is_ok());
     connection.execute_batch("CREATE TRIGGER fail_grant BEFORE INSERT ON credential_grants BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
     assert!(store
-        .replace_local_credential_grants(&id, &grants(&[Operation::Write]))
+        .replace_credential_grants(&id, &grants(&[Operation::Write]))
         .is_err());
     assert!(store.validate_context(&before).is_ok());
 }
@@ -274,7 +268,7 @@ fn service_context_revalidation_observes_local_administration() {
     .unwrap();
     let context = service.authenticate(&secret).unwrap();
     service.validate_context(&context).unwrap();
-    store.revoke_local_credential(&id).unwrap();
+    store.revoke_credential(&id).unwrap();
     assert!(service.authenticate(&secret).is_err());
     assert!(service.validate_context(&context).is_err());
     // Existing operations are still explicitly local, pending step 06 policy.
@@ -311,7 +305,7 @@ fn principals_are_independent_and_revocation_does_not_cross_them() {
         .unwrap();
     let (_, own) = issue(&store, &[Operation::Read]);
     let both = store
-        .issue_local_credential(
+        .issue_credential(
             PRINCIPAL,
             &[
                 Grant::new(LOCAL, Operation::Read),
@@ -330,7 +324,7 @@ fn principals_are_independent_and_revocation_does_not_cross_them() {
         .create_collection(&other_principal, Visibility::Restricted)
         .unwrap();
     let other = store
-        .issue_local_credential(
+        .issue_credential(
             &other_principal,
             &[Grant::new(&other_collection, Operation::Read)],
             None,
@@ -341,7 +335,7 @@ fn principals_are_independent_and_revocation_does_not_cross_them() {
     assert_eq!(other_context.principal_id(), Some(other_principal.as_str()));
     assert!(!other_context.has_grant(LOCAL, Operation::Read));
     let own_context = store.authenticate(&own).unwrap();
-    store.revoke_local_credential(&other_id).unwrap();
+    store.revoke_credential(&other_id).unwrap();
     assert!(store.validate_context(&own_context).is_ok());
     assert!(store.validate_context(&other_context).is_err());
 }
@@ -356,7 +350,7 @@ fn public_collections_accept_record_grants_from_any_principal() {
         .unwrap();
     let record_operations = [Operation::Read, Operation::Write];
     let issued = store
-        .issue_local_credential(
+        .issue_credential(
             PRINCIPAL,
             &record_operations
                 .iter()
@@ -370,17 +364,17 @@ fn public_collections_accept_record_grants_from_any_principal() {
         assert!(context.has_grant(&public, operation));
     }
     assert!(matches!(
-        store.issue_local_credential(PRINCIPAL, &[Grant::new(&public, Operation::Admin)], None),
+        store.issue_credential(PRINCIPAL, &[Grant::new(&public, Operation::Admin)], None),
         Err(AuthError::Forbidden)
     ));
     for operation in record_operations {
         assert!(matches!(
-            store.issue_local_credential(PRINCIPAL, &[Grant::new(&restricted, operation)], None),
+            store.issue_credential(PRINCIPAL, &[Grant::new(&restricted, operation)], None),
             Err(AuthError::Forbidden)
         ));
     }
     assert!(store
-        .issue_local_credential(&owner, &[Grant::new(&public, Operation::Admin)], None)
+        .issue_credential(&owner, &[Grant::new(&public, Operation::Admin)], None)
         .is_ok());
 }
 
@@ -397,7 +391,7 @@ fn concurrent_rotation_has_exactly_one_successful_replacement() {
             std::thread::spawn(move || {
                 let store = Store::open(path).unwrap();
                 barrier.wait();
-                store.rotate_local_credential(&id)
+                store.rotate_credential(&id)
             })
         })
         .collect();
@@ -409,5 +403,5 @@ fn concurrent_rotation_has_exactly_one_successful_replacement() {
     let replacement = results.into_iter().find_map(Result::ok).unwrap();
     assert!(store.authenticate(&secret).is_err());
     assert!(store.authenticate(&replacement.into_secret()).is_ok());
-    assert_eq!(store.local_credentials(PRINCIPAL).unwrap().len(), 2);
+    assert_eq!(store.credentials(PRINCIPAL).unwrap().len(), 2);
 }

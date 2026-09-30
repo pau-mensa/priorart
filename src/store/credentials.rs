@@ -23,9 +23,9 @@ fn now() -> i64 {
 }
 
 impl Store {
-    /// Host-operator issuance only. Grants must name collections owned by this
-    /// principal, or public collections for record operations.
-    pub fn issue_local_credential(
+    /// Operator issuance only. Grants must name collections owned by this
+    /// principal, or public collections for `read` and `write`.
+    pub fn issue_credential(
         &self,
         principal: &str,
         grants: &[Grant],
@@ -77,9 +77,9 @@ impl Store {
         Ok(())
     }
 
-    /// Local inspection exposes no verifier or secret. Revoked records remain
-    /// visible here for administration; this is not a remote listing endpoint.
-    pub fn local_credentials(&self, principal: &str) -> Result<Vec<CredentialInfo>> {
+    /// Operator inspection exposes no verifier or secret. Revoked credentials
+    /// remain listed.
+    pub fn credentials(&self, principal: &str) -> Result<Vec<CredentialInfo>> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
         let ids = transaction
@@ -95,7 +95,7 @@ impl Store {
     }
 
     /// Immediately and permanently revoke the credential.
-    pub fn revoke_local_credential(&self, id: &str) -> Result<()> {
+    pub fn revoke_credential(&self, id: &str) -> Result<()> {
         let transaction = self.write()?;
         let credential = info(&transaction, id)?;
         if credential.revoked_at.is_none() {
@@ -107,7 +107,7 @@ impl Store {
 
     /// Rotation issues a fresh lookup ID and secret with exactly the same scope
     /// and expiry, and revokes the old credential atomically.
-    pub fn rotate_local_credential(&self, id: &str) -> Result<IssuedCredential> {
+    pub fn rotate_credential(&self, id: &str) -> Result<IssuedCredential> {
         let transaction = self.write()?;
         let timestamp = now();
         let old = active(&transaction, id, timestamp)?;
@@ -123,9 +123,9 @@ impl Store {
         Ok(issued)
     }
 
-    /// Explicit local grant replacement increments versions. Empty grants disable
+    /// Explicit grant replacement increments versions. Empty grants disable
     /// all operations; there is no wildcard.
-    pub fn replace_local_credential_grants(&self, id: &str, grants: &[Grant]) -> Result<()> {
+    pub fn replace_credential_grants(&self, id: &str, grants: &[Grant]) -> Result<()> {
         let transaction = self.write()?;
         let old = active(&transaction, id, now())?;
         let grants = validate_grants(grants)?;
