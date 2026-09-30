@@ -451,5 +451,5 @@ fn the_local_service_never_reads_other_collections() {
     let store = Store::open(directory.path().join("priorart.sqlite")).unwrap();
     let index = Index::load(&store, LOCAL_COLLECTION_ID).unwrap();
     assert_eq!(index.document_count(), 1);
-    assert_eq!(index.document(0), ("local-record", 1));
+    assert_eq!(index.revision("local-record"), Some(1));
 }

@@ -22,15 +22,11 @@ pub(crate) struct Migration {
 }
 
 const MIGRATIONS: &[Migration] = &[Migration {
-    version: "v0.9.0",
+    version: "v0.1.0",
     apply: create_schema,
 }];
 
 pub const SCHEMA_VERSION: &str = MIGRATIONS[MIGRATIONS.len() - 1].version;
-
-/// The last release of the Python implementation, which versioned its schema
-/// with `PRAGMA user_version`.
-const PYTHON_RELEASE: &str = "v0.1.0";
 
 pub fn migrate(connection: &Connection) -> Result<(), StoreError> {
     run(connection, MIGRATIONS)
@@ -40,15 +36,6 @@ pub fn migrate(connection: &Connection) -> Result<(), StoreError> {
 pub(crate) fn run(connection: &Connection, migrations: &[Migration]) -> Result<(), StoreError> {
     let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
     // Read under the write lock so concurrent openers cannot migrate twice.
-    let python_version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if python_version != 0 {
-        return Err(SchemaError::UnsupportedVersion(format!(
-            "Database was written by the Python implementation of priorart (schema version \
-             {python_version}); open it with priorart {PYTHON_RELEASE} or point \
-             PRIORART_DATA_DIR elsewhere."
-        ))
-        .into());
-    }
     let pending = match stored_version(&transaction)? {
         None => 0,
         Some(stored) => match migrations.iter().position(|m| m.version == stored) {
@@ -99,12 +86,11 @@ fn create_schema(transaction: &Transaction<'_>) -> Result<(), StoreError> {
         |row| row.get(0),
     )?;
     if existing > 0 {
-        return Err(SchemaError::Unrecognized(format!(
+        return Err(SchemaError::Unrecognized(
             "Unversioned database already contains a schema; priorart only initializes \
-                 empty databases. If the Python implementation wrote it, open it with priorart \
-                 {PYTHON_RELEASE}; otherwise inspect the file or point PRIORART_DATA_DIR \
-                 elsewhere."
-        ))
+             empty databases. Inspect the file or point PRIORART_DATA_DIR elsewhere."
+                .to_owned(),
+        )
         .into());
     }
     transaction.execute_batch(SCHEMA)?;

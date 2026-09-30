@@ -13,11 +13,10 @@ version.
 
 | Stored state | Startup behavior |
 |---|---|
-| Empty database | Create the current schema (`v0.9.0`) |
+| Empty database | Create the current schema (`v0.1.0`) |
 | Existing tables without `schema_version` | Reject |
-| `v0.9.0` | Open |
+| `v0.1.0` | Open |
 | A tag this build does not know | Reject, naming that release |
-| Nonzero `PRAGMA user_version` | Reject as a Python-era directory; use `v0.1.0` |
 
 ## Records and concurrency
 

@@ -28,8 +28,7 @@ protocol change.
 
 ## Install and run
 
-priorart needs a Rust toolchain (1.88 or newer). lateweave is fetched as a git
-dependency, so no sibling checkout is required.
+priorart needs a Rust toolchain (1.88 or newer).
 
 ```bash
 cargo install --path .        # or: cargo build --release

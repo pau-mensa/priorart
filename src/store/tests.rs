@@ -364,12 +364,6 @@ fn cross_collection_references_fail_in_the_database() {
     )));
 }
 
-fn user_version(connection: &Connection) -> i64 {
-    connection
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .unwrap()
-}
-
 fn schema_version(connection: &Connection) -> Option<String> {
     stored_version(connection).unwrap()
 }
@@ -384,7 +378,6 @@ fn dump(path: &Path) -> Vec<(String, String)> {
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    rows.push(("user_version".into(), user_version(&connection).to_string()));
     rows.push((
         "schema_version".into(),
         schema_version(&connection).unwrap_or_default(),
@@ -401,7 +394,6 @@ fn fresh_database_and_repeated_startup() {
         schema_version(&store.connection).as_deref(),
         Some(SCHEMA_VERSION)
     );
-    assert_eq!(user_version(&store.connection), 0);
     let foreign_keys: i64 = store
         .connection
         .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
@@ -451,16 +443,6 @@ fn unknown_schema_versions_are_rejected_without_modification() {
          INSERT INTO schema_version VALUES ('v9.0.0');",
         "open it with priorart v9.0.0 or later",
     );
-}
-
-#[test]
-fn python_databases_are_rejected_without_modification() {
-    for version in [1, 2] {
-        assert_rejected_unchanged(
-            &format!("CREATE TABLE records (id TEXT); PRAGMA user_version = {version};"),
-            "open it with priorart v0.1.0",
-        );
-    }
 }
 
 #[test]

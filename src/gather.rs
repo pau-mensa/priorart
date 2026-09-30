@@ -4,8 +4,11 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::SystemTime;
 
-use lateweave::{Candidate, CandidateGenerator, CorpusManifest, Query, Requirements, Result};
+use lateweave::{
+    Candidate, CandidateGenerator, DocumentKey, Gathered, Query, Requirements, Result, Subset,
+};
 
 use crate::analyzer::tokens;
 
@@ -76,25 +79,18 @@ impl Bm25 {
         });
     }
 
-    /// Positive scores, best first, ties by ascending document ID.
+    /// Positive scores, best first, ties by ascending document ID. `eligible`
+    /// masks documents by ID.
     fn search(
         &self,
         terms: &[String],
         limit: usize,
-        subset: Option<&[u64]>,
+        eligible: Option<&[bool]>,
         statistics: &Statistics,
-    ) -> Vec<(u64, f32)> {
-        let count = self.lengths.len();
+    ) -> Vec<(usize, f32)> {
         let documents = statistics.documents as f32;
         let average_length = statistics.total_length as f32 / documents;
-        let eligible = subset.map(|subset| {
-            let mut mask = vec![false; count];
-            for &document in subset {
-                mask[document as usize] = true;
-            }
-            mask
-        });
-        let mut scores = vec![0.0f32; count];
+        let mut scores = vec![0.0f32; self.lengths.len()];
         for term in terms {
             let Some(postings) = self.postings.get(term) else {
                 continue;
@@ -106,10 +102,7 @@ impl Bm25 {
                 .unwrap_or_default() as f32;
             let idf = (1.0 + (documents - frequency + 0.5) / (frequency + 0.5)).ln();
             for &(document, term_count) in postings {
-                if eligible
-                    .as_ref()
-                    .is_some_and(|mask| !mask[document as usize])
-                {
+                if eligible.is_some_and(|mask| !mask[document as usize]) {
                     continue;
                 }
                 let tf = term_count as f32;
@@ -119,11 +112,10 @@ impl Bm25 {
                 scores[document as usize] += idf * tf / (tf + normalization);
             }
         }
-        let mut ranked: Vec<(u64, f32)> = scores
+        let mut ranked: Vec<(usize, f32)> = scores
             .into_iter()
             .enumerate()
             .filter(|&(_, score)| score > 0.0)
-            .map(|(document, score)| (document as u64, score))
             .collect();
         ranked
             .sort_unstable_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
@@ -152,8 +144,10 @@ impl Statistics {
     }
 }
 
+/// One corpus: `record_ids[i]` names BM25 document `i`.
 pub struct LexicalGatherer {
-    corpus: CorpusManifest,
+    corpus: Arc<str>,
+    record_ids: Arc<Vec<Arc<str>>>,
     requires: Requirements,
     index: Arc<Bm25>,
     statistics: Arc<Statistics>,
@@ -162,29 +156,23 @@ pub struct LexicalGatherer {
 impl LexicalGatherer {
     /// `statistics` must include `index` and the query's terms.
     pub fn new(
-        corpus: CorpusManifest,
+        corpus: Arc<str>,
+        record_ids: Arc<Vec<Arc<str>>>,
         index: Arc<Bm25>,
         statistics: Arc<Statistics>,
-    ) -> Result<Self> {
-        if index.len() as u64 != corpus.document_count() {
-            return Err(lateweave::Error::InvalidInput(
-                "lexical texts do not match the corpus manifest".to_owned(),
-            ));
-        }
-        Ok(Self {
+    ) -> Self {
+        debug_assert_eq!(record_ids.len(), index.len());
+        Self {
             corpus,
+            record_ids,
             requires: Requirements::new(),
             index,
             statistics,
-        })
+        }
     }
 }
 
 impl CandidateGenerator for LexicalGatherer {
-    fn corpus(&self) -> &CorpusManifest {
-        &self.corpus
-    }
-
     fn requires(&self) -> &Requirements {
         &self.requires
     }
@@ -193,32 +181,34 @@ impl CandidateGenerator for LexicalGatherer {
         "bm25-lucene"
     }
 
-    fn gather(
-        &self,
-        query: &Query,
-        limit: usize,
-        subset: Option<&[u64]>,
-    ) -> Result<Vec<Candidate>> {
+    fn gather(&self, query: &Query, limit: usize, subset: Option<&Subset>) -> Result<Gathered> {
+        let as_of = SystemTime::now();
+        let eligible = subset.map(|subset| {
+            let ids = subset.ids(&self.corpus);
+            self.record_ids
+                .iter()
+                .map(|id| ids.is_some_and(|ids| ids.contains(id)))
+                .collect::<Vec<_>>()
+        });
         let terms = tokens(query.text());
-        Ok(self
+        let candidates = self
             .index
-            .search(&terms, limit, subset, &self.statistics)
+            .search(&terms, limit, eligible.as_deref(), &self.statistics)
             .into_iter()
             .enumerate()
-            .map(|(rank, (document_id, score))| Candidate {
-                document_id,
+            .map(|(rank, (document, score))| Candidate {
+                key: DocumentKey::new(self.corpus.clone(), self.record_ids[document].clone()),
                 gather_score: score,
                 gather_rank: rank,
                 provenance: "bm25".to_owned(),
             })
-            .collect())
+            .collect();
+        Ok(Gathered { candidates, as_of })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use lateweave::document_ids_digest;
-
     use super::*;
 
     const TEXTS: [&str; 3] = [
@@ -227,18 +217,16 @@ mod tests {
         "NCCL timeout: one worker never reached the barrier",
     ];
 
-    fn corpus() -> CorpusManifest {
-        let ids = (0..TEXTS.len()).map(|index| format!("r{index}"));
-        CorpusManifest::new("t", "v", TEXTS.len() as u64, document_ids_digest(ids)).unwrap()
-    }
-
-    fn gatherer(texts: &[&str]) -> Result<LexicalGatherer> {
-        let index = Arc::new(Bm25::new(texts));
+    fn gatherer() -> LexicalGatherer {
+        let index = Arc::new(Bm25::new(&TEXTS));
         let statistics = own(
             &index,
             &["cuda", "attention", "barrier", "worker", "timeout"],
         );
-        LexicalGatherer::new(corpus(), index, Arc::new(statistics))
+        let ids = (0..TEXTS.len())
+            .map(|i| Arc::from(format!("r{i}")))
+            .collect();
+        LexicalGatherer::new("t".into(), Arc::new(ids), index, Arc::new(statistics))
     }
 
     fn own(index: &Bm25, terms: &[&str]) -> Statistics {
@@ -251,38 +239,47 @@ mod tests {
         terms.iter().map(|term| term.to_string()).collect()
     }
 
-    fn ids(candidates: &[Candidate]) -> Vec<u64> {
-        candidates
+    fn ids(gathered: &Gathered) -> Vec<&str> {
+        gathered
+            .candidates
             .iter()
-            .map(|candidate| candidate.document_id)
+            .map(|candidate| {
+                assert_eq!(candidate.key.corpus(), "t");
+                candidate.key.id()
+            })
             .collect()
     }
 
     #[test]
     fn lexical_ranks_matches_first_and_drops_zero_scores() {
-        let gatherer = gatherer(&TEXTS).unwrap();
+        let gatherer = gatherer();
         let found = gatherer
             .gather(&Query::new("worker barrier timeout"), 10, None)
             .unwrap();
-        assert_eq!(ids(&found), [2]);
-        assert!(found[0].gather_score > 0.0);
+        assert_eq!(ids(&found), ["r2"]);
+        assert!(found.candidates[0].gather_score > 0.0);
         assert!(gatherer
             .gather(&Query::new(""), 10, None)
             .unwrap()
+            .candidates
             .is_empty());
     }
 
     #[test]
     fn lexical_honours_the_subset() {
-        let gatherer = gatherer(&TEXTS).unwrap();
-        let found = gatherer
-            .gather(&Query::new("cuda attention barrier"), 10, Some(&[1, 2]))
-            .unwrap();
-        assert_eq!(ids(&found), [2]);
-        assert!(gatherer
-            .gather(&Query::new("cuda"), 10, Some(&[]))
-            .unwrap()
-            .is_empty());
+        let gatherer = gatherer();
+        let query = Query::new("cuda attention barrier");
+        let subset = Subset::new().with("t", ["r1", "r2", "unknown"]);
+        assert_eq!(
+            ids(&gatherer.gather(&query, 10, Some(&subset)).unwrap()),
+            ["r2"]
+        );
+        for subset in [
+            Subset::new().with("t", [""; 0]),
+            Subset::new().with("other", ["r0"]),
+        ] {
+            assert!(ids(&gatherer.gather(&query, 10, Some(&subset)).unwrap()).is_empty());
+        }
     }
 
     #[test]
@@ -326,7 +323,7 @@ mod tests {
         shared.add(&left, &query);
         shared.add(&right, &query);
         let expected = whole.search(&query, 10, None, &own(&whole, &["a", "d"]));
-        let mut split: Vec<(u64, f32)> = left.search(&query, 10, None, &shared);
+        let mut split: Vec<(usize, f32)> = left.search(&query, 10, None, &shared);
         split.extend(
             right
                 .search(&query, 10, None, &shared)
@@ -335,10 +332,5 @@ mod tests {
         );
         split.sort_unstable_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
         assert_eq!(split, expected);
-    }
-
-    #[test]
-    fn mismatched_texts_are_rejected() {
-        assert!(gatherer(&TEXTS[..2]).is_err());
     }
 }

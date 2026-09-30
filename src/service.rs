@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::store::mutations::{Intent, Mutation};
-use lateweave::{Query, SearchRequest};
+use lateweave::{Query, SearchRequest, Subset};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -378,30 +378,32 @@ impl Service {
         let query = Query::new(text);
         let mut ranked: Vec<(f32, usize, String, i64)> = Vec::new();
         for (position, (collection, state)) in collection_ids.iter().zip(&mut states).enumerate() {
-            let subset = match filters {
-                Some(filters) => {
-                    let matching: HashSet<String> =
-                        state.store.matching_record_ids(collection, filters)?;
-                    Some(state.index(collection)?.internal_ids(&matching))
-                }
+            let matching = match filters {
+                Some(filters) => Some(state.store.matching_record_ids(collection, filters)?),
                 None => None,
             };
             let index = state.index(collection)?;
-            if subset.as_ref().map_or(index.document_count(), Vec::len) == 0 {
+            if matching
+                .as_ref()
+                .map_or(index.document_count(), HashSet::len)
+                == 0
+            {
                 continue;
             }
+            let subset = matching.map(|ids| Subset::new().with(*collection, ids));
             let mut request = SearchRequest::new(limit, limit);
             if let Some(subset) = &subset {
                 request = request.with_subset(subset);
             }
             let result = index
-                .pipeline(statistics.clone())?
+                .pipeline(statistics.clone())
                 .search(&query, &request)
                 .map_err(IndexError::from)?;
-            ranked.extend(result.documents.iter().map(|ranked| {
-                let (id, revision) = index.document(ranked.document_id);
-                (ranked.score, position, id.to_owned(), revision)
-            }));
+            for document in result.documents {
+                let id = document.key.id();
+                let revision = index.revision(id).expect("ranked documents are indexed");
+                ranked.push((document.score, position, id.to_owned(), revision));
+            }
         }
         ranked.sort_unstable_by(|left, right| {
             right

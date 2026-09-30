@@ -2,7 +2,7 @@
 
 ## Setup
 
-priorart is a Rust crate; lateweave is a git dependency pinned in `Cargo.toml`.
+priorart is a Rust crate built on [lateweave](https://crates.io/crates/lateweave).
 
 ```bash
 cargo test
