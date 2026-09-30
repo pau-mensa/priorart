@@ -16,6 +16,19 @@ pub async fn spawn(service: std::sync::Arc<priorart::service::Service>) -> Strin
     format!("http://{address}")
 }
 
+/// Serves `service` as if every connection came from `peer`.
+pub async fn spawn_as(
+    service: std::sync::Arc<priorart::service::Service>,
+    peer: std::net::SocketAddr,
+) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router =
+        priorart::api::router(service).layer(axum::extract::connect_info::MockConnectInfo(peer));
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    format!("http://{address}")
+}
+
 pub fn service(directory: &tempfile::TempDir) -> std::sync::Arc<priorart::service::Service> {
     let settings = priorart::config::Settings {
         data_dir: directory.path().to_path_buf(),

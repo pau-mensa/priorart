@@ -21,11 +21,39 @@ Malformed, expired, revoked, or unknown credentials return `401`; they never fal
 back to local or anonymous access. Credentials are not accepted as URL, JSON, or
 MCP arguments. See [credential administration](credentials.md).
 
-Both modes require a loopback listener and loopback peers. Forwarding headers are
-rejected. Hosted mode is rejected at startup before opening storage or loading a
-model. Do not expose these modes through a proxy: forwarding-header rejection is
-not proof that a request did not pass through a proxy. Hosted privacy, resource
-accounting, and deletion guarantees are still incomplete.
+## Network hosting
+
+By default the server binds and serves loopback only. `local` mode never serves
+anything else. `authenticated` mode is the network mode, and binding a
+non-loopback `PRIORART_HOST` requires one of:
+
+- `PRIORART_TRUSTED_PROXIES`: comma-separated IPs or CIDRs of TLS-terminating
+  proxies. A request from one of them must carry exactly one
+  `X-Forwarded-Proto: https`, or it gets `403 https_required`.
+- `PRIORART_ALLOW_INSECURE_HTTP=true`: plain HTTP from any peer. Only for a
+  network you trust, since keys then cross it in the clear.
+
+Other non-loopback peers get `403 https_required`, with or without credentials.
+`X-Forwarded-Proto` is the only forwarding header read. From trusted proxies,
+`Forwarded`, `X-Forwarded-For`, and `X-Forwarded-Host` are ignored; from any
+other peer, any forwarding header returns `400`. A proxy on the same host
+connects from loopback, so list `127.0.0.1` (or `::1`); direct local clients on
+that address must then send `X-Forwarded-Proto: https` too. The proxy must
+overwrite, not append to, `X-Forwarded-Proto`. Caddy and Traefik do this by
+default; with nginx:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8000;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+`PRIORART_KEY_REQUESTS_PER_MINUTE` limits each key separately; a key over its
+limit gets `429 rate_limited` with `Retry-After`. Anonymous and operator requests
+are not limited. Limits live in memory and reset on restart. Anything else about
+abuse (per-IP limits, quotas, blocking) is for the host to handle in front of
+priorart.
 
 Mutations require a principal and a [grant](policy.md): `read`, `write`, or
 `admin`, each implying the ones before it. Metadata, filters, and ownership never
@@ -264,6 +292,7 @@ SQL errors, and paths:
 |---|---|---|
 | 400 | `invalid_input` | invalid scope, identifier, revision, content, or field limit |
 | 401 | `unauthenticated` | invalid supplied credential, or missing mutation identity |
+| 403 | `https_required` | plain HTTP from a non-loopback peer, or a trusted proxy that did not report HTTPS |
 | 404 | `not_found` | unknown or forbidden resource, or absent route |
 | 405 | `method_not_allowed` | unsupported method |
 | 409 | `revision_conflict` | revision mismatch or explicit create collision |
@@ -272,11 +301,11 @@ SQL errors, and paths:
 | 413 | `payload_too_large` | HTTP body exceeds `256 * max_tokens + 65536` bytes |
 | 422 | `validation_error` | malformed JSON/query, wrong types, missing/unknown fields |
 | 429 | `resource_limit` | all cached collection execution slots are pinned |
-| 503 | `unavailable` | backend failure or unsupported transport configuration |
+| 429 | `rate_limited` | the key exceeded `PRIORART_KEY_REQUESTS_PER_MINUTE`; see `Retry-After` |
+| 503 | `unavailable` | backend failure |
 
 `GET /healthz` returns only `{"status":"ok"}`. These response rules do not promise
-constant timing or hide operational side channels. Limits are per request, not a
-rate limiter or hosted admission system.
+constant timing or hide operational side channels.
 
 ## Local MCP workflow
 

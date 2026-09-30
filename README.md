@@ -90,11 +90,14 @@ through it.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `PRIORART_MODE` | `local` | `local` identity or `authenticated` header access; both loopback-only; `hosted` is disabled |
+| `PRIORART_MODE` | `local` | `local` identity (loopback only) or `authenticated` header access |
 | `PRIORART_DATA_DIR` | `./data` | SQLite database location |
 | `PRIORART_MAX_LOADED_INDEXES` | `8` | cached collections and their in-memory indexes; idle LRU eviction, busy admission returns 429 |
 | `PRIORART_MAX_TOKENS` | `8192` | document cutoff in analyzer terms; longer text is truncated before storing |
-| `PRIORART_HOST` / `PRIORART_PORT` | `127.0.0.1` / `8000` | loopback bind address |
+| `PRIORART_HOST` / `PRIORART_PORT` | `127.0.0.1` / `8000` | bind address; non-loopback needs one of the next two |
+| `PRIORART_TRUSTED_PROXIES` | unset | IPs/CIDRs of TLS-terminating proxies; they must send `X-Forwarded-Proto: https` |
+| `PRIORART_ALLOW_INSECURE_HTTP` | `false` | accept plain HTTP from any peer (trusted networks only) |
+| `PRIORART_KEY_REQUESTS_PER_MINUTE` | unset | per-key request limit; over it returns 429 |
 | `PRIORART_ADMIN_TOKEN` | unset | enables the operator endpoints under `/v1/admin`; 32–256 characters |
 
 ## Local credentials
@@ -117,9 +120,9 @@ currently targets local mode.
 
 For database upgrades and backups, see [storage](docs/storage.md).
 
-- Hosted mode is disabled. Local and authenticated HTTP modes are loopback-only;
-  do not expose them through a proxy. Per-request limits exist, but rate limiting,
-  hosted admission, and full deletion guarantees remain future work.
+- Network hosting means authenticated mode behind a TLS-terminating proxy; see
+  [network hosting](docs/protocol.md#network-hosting). priorart does not terminate
+  TLS itself. Per-key limits are optional; other abuse handling is the host's job.
 - HTTP requests select explicit collections; search spans up to 16 with shared
   BM25 statistics. Storage is access-controlled by the trusted service and remains
   unencrypted.

@@ -169,8 +169,8 @@ fn serve(host: Option<String>, port: Option<u16>) -> Result<(), AnyError> {
             .await?
             .next()
             .ok_or("the host resolved to no address")?;
-        if !address.ip().is_loopback() {
-            return Err("only loopback listeners are supported".into());
+        if !address.ip().is_loopback() && !settings.accepts_remote_peers() {
+            return Err("the host resolved to a non-loopback address".into());
         }
         let listener = tokio::net::TcpListener::bind(address).await?;
         eprintln!("priorart: listening on http://{address}");

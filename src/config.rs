@@ -2,8 +2,10 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::net::IpAddr;
 use std::path::PathBuf;
 
+use ipnet::IpNet;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -16,7 +18,6 @@ pub enum ServerMode {
     #[default]
     Local,
     Authenticated,
-    Hosted,
 }
 
 /// The operator token for `/v1/admin`: 32–256 visible ASCII characters. Debug
@@ -58,6 +59,11 @@ pub struct Settings {
     pub max_tokens: usize,
     pub host: String,
     pub port: u16,
+    /// Peers whose `X-Forwarded-Proto` is believed; they must report `https`.
+    pub trusted_proxies: Vec<IpNet>,
+    /// Accepts plain HTTP from any peer. For private networks only.
+    pub allow_insecure_http: bool,
+    pub key_requests_per_minute: Option<u32>,
 }
 
 impl Default for Settings {
@@ -70,6 +76,9 @@ impl Default for Settings {
             max_tokens: 8192,
             host: "127.0.0.1".to_owned(),
             port: 8000,
+            trusted_proxies: Vec::new(),
+            allow_insecure_http: false,
+            key_requests_per_minute: None,
         }
     }
 }
@@ -86,7 +95,6 @@ impl Settings {
             settings.mode = match value.as_str() {
                 "local" => ServerMode::Local,
                 "authenticated" => ServerMode::Authenticated,
-                "hosted" => ServerMode::Hosted,
                 _ => return Err(ConfigError("unknown server mode".into())),
             };
         }
@@ -108,22 +116,58 @@ impl Settings {
         if let Some(value) = get("PORT") {
             settings.port = parse("PRIORART_PORT", &value)?;
         }
+        if let Some(value) = get("TRUSTED_PROXIES") {
+            settings.trusted_proxies = value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(|entry| {
+                    entry
+                        .parse()
+                        .or_else(|_| entry.parse::<IpAddr>().map(IpNet::from))
+                        .map_err(|_| {
+                            ConfigError(format!(
+                                "PRIORART_TRUSTED_PROXIES entries must be IPs or CIDRs, got {entry:?}"
+                            ))
+                        })
+                })
+                .collect::<Result<_, _>>()?;
+        }
+        if let Some(value) = get("ALLOW_INSECURE_HTTP") {
+            settings.allow_insecure_http = match value.as_str() {
+                "true" => true,
+                "false" => false,
+                _ => {
+                    return Err(ConfigError(
+                        "PRIORART_ALLOW_INSECURE_HTTP must be true or false".into(),
+                    ))
+                }
+            };
+        }
+        if let Some(value) = get("KEY_REQUESTS_PER_MINUTE") {
+            settings.key_requests_per_minute =
+                Some(parse("PRIORART_KEY_REQUESTS_PER_MINUTE", &value)?);
+        }
         settings.validate()?;
         Ok(settings)
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         let invalid = |message: &str| Err(ConfigError(message.to_owned()));
-        if self.mode == ServerMode::Hosted {
-            return invalid("hosted mode is not available");
+        let remote = self.accepts_remote_peers();
+        if self.mode == ServerMode::Local && remote {
+            return invalid("local mode serves loopback clients only; use authenticated mode");
         }
-        if self.host != "localhost"
-            && !self
-                .host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
+        if !remote
+            && self.host != "localhost"
+            && !self.host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
         {
-            return invalid("only loopback hosts are supported until hosted mode is available");
+            return invalid(
+                "a non-loopback host needs PRIORART_TRUSTED_PROXIES or PRIORART_ALLOW_INSECURE_HTTP",
+            );
+        }
+        if self.key_requests_per_minute == Some(0) {
+            return invalid("key_requests_per_minute must be positive");
         }
         if self.max_loaded_indexes == 0 {
             return invalid("max_loaded_indexes must be positive");
@@ -135,6 +179,15 @@ impl Settings {
             return invalid("port must be in 1..65535");
         }
         Ok(())
+    }
+
+    /// Whether anything but a loopback peer can be served.
+    pub fn accepts_remote_peers(&self) -> bool {
+        !self.trusted_proxies.is_empty() || self.allow_insecure_http
+    }
+
+    pub fn trusts_proxy(&self, peer: IpAddr) -> bool {
+        self.trusted_proxies.iter().any(|net| net.contains(&peer))
     }
 
     /// The coarse HTTP body limit: generous enough that text is truncated, not rejected.
@@ -161,36 +214,46 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_hosted_mode_and_non_loopback_binds_are_rejected() {
+    fn non_loopback_binds_need_authenticated_mode_and_a_transport_decision() {
+        let settings = |pairs: &[(&str, &str)]| Settings::from_vars(vars(pairs));
         for mode in ["local", "authenticated"] {
             for host in ["127.0.0.1", "::1", "localhost"] {
-                assert!(Settings::from_vars(vars(&[
-                    ("PRIORART_MODE", mode),
-                    ("PRIORART_HOST", host)
-                ]))
-                .is_ok());
+                assert!(settings(&[("PRIORART_MODE", mode), ("PRIORART_HOST", host)]).is_ok());
             }
             for host in ["0.0.0.0", "::", "192.168.1.2", "example.com"] {
-                assert!(Settings::from_vars(vars(&[
+                assert!(settings(&[("PRIORART_MODE", mode), ("PRIORART_HOST", host)]).is_err());
+            }
+            for opt_in in [
+                ("PRIORART_TRUSTED_PROXIES", "10.0.0.0/8"),
+                ("PRIORART_ALLOW_INSECURE_HTTP", "true"),
+            ] {
+                let result = settings(&[
                     ("PRIORART_MODE", mode),
-                    ("PRIORART_HOST", host)
-                ]))
-                .is_err());
+                    ("PRIORART_HOST", "0.0.0.0"),
+                    opt_in,
+                ]);
+                assert_eq!(result.is_ok(), mode == "authenticated", "{mode} {opt_in:?}");
             }
         }
-        assert!(Settings::from_vars(vars(&[("PRIORART_MODE", "hosted")])).is_err());
-        assert!(Settings::from_vars(vars(&[("PRIORART_MODE", "unknown")])).is_err());
-        let directory = tempfile::tempdir().unwrap();
-        let settings = Settings {
-            mode: ServerMode::Hosted,
-            data_dir: directory.path().join("unopened"),
-            ..Settings::default()
-        };
-        assert!(matches!(
-            crate::service::Service::open(settings),
-            Err(crate::service::OpenError::Config(_))
-        ));
-        assert!(!directory.path().join("unopened").exists());
+        let proxied = settings(&[
+            ("PRIORART_MODE", "authenticated"),
+            ("PRIORART_TRUSTED_PROXIES", " 10.0.0.0/8, ::1 ,192.168.1.7"),
+        ])
+        .unwrap();
+        for (peer, trusted) in [
+            ("10.2.3.4", true),
+            ("::1", true),
+            ("192.168.1.7", true),
+            ("192.168.1.8", false),
+            ("127.0.0.1", false),
+        ] {
+            assert_eq!(
+                proxied.trusts_proxy(peer.parse().unwrap()),
+                trusted,
+                "{peer}"
+            );
+        }
+        assert!(settings(&[("PRIORART_MODE", "unknown")]).is_err());
     }
 
     #[test]
@@ -201,6 +264,10 @@ mod tests {
             ("PRIORART_PORT", "0"),
             ("PRIORART_PORT", "70000"),
             ("PRIORART_ADMIN_TOKEN", "too-short"),
+            ("PRIORART_KEY_REQUESTS_PER_MINUTE", "0"),
+            ("PRIORART_TRUSTED_PROXIES", "10.0.0.0/33"),
+            ("PRIORART_TRUSTED_PROXIES", "proxy.internal"),
+            ("PRIORART_ALLOW_INSECURE_HTTP", "yes"),
             ("PRIORART_ADMIN_TOKEN", &format!("{} x", "a".repeat(40))),
         ] {
             assert!(

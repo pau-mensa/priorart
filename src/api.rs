@@ -1,12 +1,18 @@
 //! Collection-aware HTTP transport. Credentials are accepted only in headers.
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
 use axum::{
     extract::{
         rejection::{JsonRejection, PathRejection, QueryRejection},
         ConnectInfo, DefaultBodyLimit, Path, Query, Request, State,
     },
-    http::{header::AUTHORIZATION, StatusCode},
+    http::{
+        header::{AUTHORIZATION, RETRY_AFTER},
+        HeaderMap, StatusCode,
+    },
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -17,14 +23,17 @@ use serde_json::{json, Value};
 
 use crate::{
     auth::{AuthError, RequestContext},
-    config::ServerMode,
+    config::{ServerMode, Settings},
     policy::PolicyError,
     service::{is_record_id, DeleteOptions, Service, ServiceError, WriteOptions},
     store::{Collection, Metadata, StoreError},
 };
 
 mod admin;
+mod limit;
 mod transfer;
+
+use limit::KeyLimits;
 
 pub struct ApiError(StatusCode, &'static str, &'static str);
 impl ApiError {
@@ -50,6 +59,13 @@ impl ApiError {
             StatusCode::NOT_FOUND,
             "not_found",
             "requested resource is unavailable",
+        )
+    }
+    fn https_required() -> Self {
+        Self(
+            StatusCode::FORBIDDEN,
+            "https_required",
+            "requests must arrive over HTTPS",
         )
     }
     fn unavailable() -> Self {
@@ -148,28 +164,45 @@ async fn blocking<T: Send + 'static>(
         .map_err(Into::into)
 }
 
-/// Missing credentials have meaning only in the explicitly selected local mode.
-/// Supplied invalid credentials never fall back to local or anonymous authority.
-async fn authenticate(
-    State(service): State<Arc<Service>>,
-    mut request: Request,
-    next: Next,
-) -> ApiResult<Response> {
-    if service.settings().mode == ServerMode::Hosted
-        || !request
-            .extensions()
-            .get::<ConnectInfo<SocketAddr>>()
-            .is_some_and(|peer| peer.0.ip().is_loopback())
-    {
-        return Err(ApiError::unavailable());
+/// Loopback peers speak for themselves. A trusted proxy must report that the
+/// client used HTTPS; any other peer needs `allow_insecure_http`. Forwarding
+/// headers from untrusted peers mean a proxy nobody configured, so they fail.
+fn admit_peer(settings: &Settings, peer: IpAddr, headers: &HeaderMap) -> ApiResult<()> {
+    let peer = peer.to_canonical();
+    if settings.trusts_proxy(peer) {
+        let mut proto = headers.get_all("x-forwarded-proto").iter();
+        let https = matches!(
+            (proto.next(), proto.next()),
+            (Some(value), None) if value.as_bytes().eq_ignore_ascii_case(b"https")
+        );
+        return if https || settings.allow_insecure_http {
+            Ok(())
+        } else {
+            Err(ApiError::https_required())
+        };
     }
-    if request
-        .headers()
+    if headers
         .keys()
         .any(|name| name == "forwarded" || name.as_str().starts_with("x-forwarded-"))
     {
         return Err(ApiError::invalid());
     }
+    if peer.is_loopback() || settings.allow_insecure_http {
+        Ok(())
+    } else {
+        Err(ApiError::https_required())
+    }
+}
+
+/// Missing credentials have meaning only in the explicitly selected local mode.
+/// Supplied invalid credentials never fall back to local or anonymous authority.
+async fn authenticate(
+    State((service, limits)): State<(Arc<Service>, Arc<KeyLimits>)>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    mut request: Request,
+    next: Next,
+) -> ApiResult<Response> {
+    admit_peer(service.settings(), peer.ip(), request.headers())?;
     if request.uri().path().starts_with("/v1/admin/") {
         admin::authorize(service.settings().admin_token.as_ref(), request.headers())?;
         request.headers_mut().remove(AUTHORIZATION);
@@ -180,7 +213,6 @@ async fn authenticate(
         [] => match service.settings().mode {
             ServerMode::Local => RequestContext::local(),
             ServerMode::Authenticated => RequestContext::anonymous(),
-            ServerMode::Hosted => return Err(ApiError::unavailable()),
         },
         [header] => {
             let value = header.to_str().map_err(|_| ApiError::unauthenticated())?;
@@ -205,6 +237,21 @@ async fn authenticate(
         _ => return Err(ApiError::unauthenticated()),
     };
     request.headers_mut().remove(AUTHORIZATION);
+    if let Some(credential) = context.credential() {
+        if let Err(wait) = limits.take(&credential.id) {
+            let mut response = ApiError(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "the key's request limit is exhausted",
+            )
+            .into_response();
+            response.headers_mut().insert(
+                RETRY_AFTER,
+                (wait.as_secs_f64().ceil() as u64).max(1).into(),
+            );
+            return Ok(response);
+        }
+    }
     if !matches!(
         *request.method(),
         axum::http::Method::GET | axum::http::Method::HEAD
@@ -329,7 +376,10 @@ pub fn router(service: Arc<Service>) -> Router {
         })
         .layer(DefaultBodyLimit::max(limit))
         .layer(middleware::from_fn_with_state(
-            service.clone(),
+            (
+                service.clone(),
+                Arc::new(KeyLimits::new(service.settings().key_requests_per_minute)),
+            ),
             authenticate,
         ))
         .with_state(service)

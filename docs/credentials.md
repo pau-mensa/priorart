@@ -3,8 +3,9 @@
 Credential lifecycle, [service policy](policy.md), and [HTTP header authentication](protocol.md)
 are implemented. `PRIORART_MODE=authenticated` enables credential-based access with
 anonymous public reads; default `local` mode uses the local principal when no key
-is supplied. Invalid supplied keys always fail. Both modes are loopback-only;
-hosted operation is disabled. MCP currently supports the local workflow only.
+is supplied. Invalid supplied keys always fail. Only authenticated mode can be
+[served beyond loopback](protocol.md#network-hosting). MCP currently supports the
+local workflow only.
 
 ## Principals, collections, and keys
 
@@ -81,8 +82,8 @@ are returned once, with `Cache-Control: no-store`.
 
 The same grant rules apply as for the CLI. Unknown principals, unknown or revoked
 credentials, and grants the principal may not hold return `404`. Grant replacement
-bumps the key's grant version, so it applies to the next request. Until network listeners are
-supported, these endpoints are loopback-only like the rest of the API.
+bumps the key's grant version, so it applies to the next request. The operator
+token is a bearer secret like any key: send it only over HTTPS or loopback.
 
 ## Contexts
 
