@@ -118,6 +118,7 @@ impl Index {
     }
 }
 
+/// JSON equality with integers and floats compared numerically.
 fn scalar_eq(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Number(left), Value::Number(right)) => match (left.as_i64(), right.as_i64()) {

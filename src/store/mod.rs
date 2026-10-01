@@ -177,7 +177,6 @@ fn decode(encoded: Option<String>) -> rusqlite::Result<Option<Metadata>> {
         .transpose()
 }
 
-/// JSON equality with integers and floats compared numerically.
 const REVISION_COLUMNS: &str = "r.collection_id, r.record_id, r.revision, r.text, r.metadata, \
      r.text_sha256, r.created_at, rec.author_principal_id, r.truncated FROM revisions r JOIN records rec \
      ON rec.collection_id = r.collection_id AND rec.id = r.record_id";
