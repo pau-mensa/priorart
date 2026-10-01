@@ -311,8 +311,9 @@ disappear when the collection is deleted. Counters reset on restart.
 | `PRIORART_WRITE_COLLECTION` | the search scope, if it is one collection | default destination |
 | `PRIORART_ALLOW_INSECURE_HTTP` | `false` | allow a non-loopback `http://` URL |
 
-Every tool takes an optional collection override, and hits carry `collection_id`
-for follow-up reads. When the server logs searches, `search_experiences` returns
+`search_experiences` takes an optional `collections` scope; the other tools take an
+optional `collection_id`, the same field hits carry for follow-up reads. Unknown
+arguments are rejected. When the server logs searches, `search_experiences` returns
 the `search_id` and `rate_hits` sends the agent's ratings. The key never appears in tool schemas, results, or errors.
 The URL must not embed credentials, redirects are not followed, and the key is
 checked against `/healthz` at startup. Transport failures and `502`–`504` are

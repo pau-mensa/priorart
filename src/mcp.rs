@@ -98,6 +98,7 @@ pub enum Scalar {
 type Scalars = BTreeMap<String, Scalar>;
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SearchParams {
     problem: String,
     filters: Option<Scalars>,
@@ -112,29 +113,32 @@ fn default_limit() -> i64 {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetParams {
     id: String,
     revision: Option<i64>,
-    /// The hit's `collection_id`; defaults to the configured write collection.
-    collection: Option<String>,
+    /// The hit's collection_id; defaults to the configured write collection.
+    collection_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ContributeParams {
     text: String,
     metadata: Option<Scalars>,
     id: Option<String>,
     expected_revision: Option<i64>,
     /// Destination instead of the configured write collection.
-    collection: Option<String>,
+    collection_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteParams {
     id: String,
     expected_revision: Option<i64>,
     /// Defaults to the configured write collection.
-    collection: Option<String>,
+    collection_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -156,6 +160,7 @@ pub struct SearchOutput {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Rating {
     /// The hit's collection_id.
     collection_id: String,
@@ -166,6 +171,7 @@ pub struct Rating {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RateParams {
     /// The search_id returned by search_experiences.
     search_id: String,
@@ -354,7 +360,7 @@ impl PriorartMcp {
     fn collection(&self, chosen: Option<String>) -> Result<String, String> {
         let collection = chosen
             .or_else(|| self.write_collection.clone())
-            .ok_or("no default collection: pass `collection` (for a hit, its collection_id)")?;
+            .ok_or("no default collection: pass the collection_id")?;
         check_id("collection", &collection)?;
         Ok(collection)
     }
@@ -373,7 +379,7 @@ impl PriorartMcp {
     ///
     /// Each hit has a collection_id, id, revision, score, an excerpt chosen by lexical
     /// overlap, and metadata. Fetch the full text with get_experience, passing the
-    /// hit's collection_id as `collection`. Optional
+    /// hit's collection_id. Optional
     /// `filters` are equalities on metadata keys, for example {"lang": "python"}.
     #[tool(annotations(read_only_hint = true, open_world_hint = false))]
     async fn search_experiences(
@@ -425,7 +431,7 @@ impl PriorartMcp {
         &self,
         Parameters(params): Parameters<GetParams>,
     ) -> Result<Json<Experience>, String> {
-        let collection = self.collection(params.collection)?;
+        let collection = self.collection(params.collection_id)?;
         let mut request = self.client.get(self.record(&collection, &params.id)?);
         if let Some(revision) = params.revision {
             request = request.query(&[("revision", revision)]);
@@ -457,7 +463,7 @@ impl PriorartMcp {
         &self,
         Parameters(params): Parameters<ContributeParams>,
     ) -> Result<Json<Contributed>, String> {
-        let collection = self.collection(params.collection)?;
+        let collection = self.collection(params.collection_id)?;
         send_json(
             self.client
                 .post(self.endpoint(&format!("/v1/collections/{collection}/records")))
@@ -479,7 +485,7 @@ impl PriorartMcp {
         &self,
         Parameters(params): Parameters<DeleteParams>,
     ) -> Result<Json<Deleted>, String> {
-        let collection = self.collection(params.collection)?;
+        let collection = self.collection(params.collection_id)?;
         send(
             self.client
                 .delete(self.record(&collection, &params.id)?)
