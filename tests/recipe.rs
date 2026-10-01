@@ -51,11 +51,11 @@ impl Recipe for Reverse {
             .collect())))
     }
 
-    fn pipeline(
+    fn pipeline<'a>(
         &self,
         _: &Query,
-        indexes: &[(&str, &dyn CollectionIndex)],
-    ) -> recipe::Result<SearchPipeline> {
+        indexes: &[(&'a str, &'a dyn CollectionIndex)],
+    ) -> recipe::Result<SearchPipeline<'a>> {
         let keys = indexes
             .iter()
             .flat_map(|&(collection, index)| {
@@ -98,13 +98,7 @@ impl CandidateGenerator for Fixed {
         let mut keys: Vec<&DocumentKey> = self
             .keys
             .iter()
-            .filter(|key| {
-                subset.is_none_or(|subset| {
-                    subset
-                        .ids(key.corpus())
-                        .is_some_and(|ids| ids.contains(key.id()))
-                })
-            })
+            .filter(|key| subset.is_none_or(|subset| subset.contains(key)))
             .collect();
         keys.sort_by(|left, right| right.id().cmp(left.id()));
         keys.truncate(limit);
@@ -200,11 +194,11 @@ impl Recipe for Rendezvous {
         priorart::gather::Bm25Recipe.load(collection, documents)
     }
 
-    fn pipeline(
+    fn pipeline<'a>(
         &self,
         query: &Query,
-        indexes: &[(&str, &dyn CollectionIndex)],
-    ) -> recipe::Result<SearchPipeline> {
+        indexes: &[(&'a str, &'a dyn CollectionIndex)],
+    ) -> recipe::Result<SearchPipeline<'a>> {
         self.arrived.fetch_add(1, Ordering::SeqCst);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while self.arrived.load(Ordering::SeqCst) < self.parties {

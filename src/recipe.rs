@@ -42,11 +42,11 @@ pub trait Recipe: Send + Sync {
     /// One pipeline over every selected collection, given in collection ID
     /// order. Keys are (collection ID, record ID) of indexed records; scores
     /// must compare across collections, and ties must break deterministically.
-    fn pipeline(
+    fn pipeline<'a>(
         &self,
         query: &Query,
-        indexes: &[(&str, &dyn CollectionIndex)],
-    ) -> Result<SearchPipeline>;
+        indexes: &[(&'a str, &'a dyn CollectionIndex)],
+    ) -> Result<SearchPipeline<'a>>;
 }
 
 /// One collection's in-memory index, owned by the service and updated after

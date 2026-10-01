@@ -512,7 +512,7 @@ impl Service {
                 (Some(filters), Some(selected)) => {
                     let ids = index.matching(filters);
                     eligible += ids.len();
-                    subset = Some(selected.with(*collection, ids));
+                    subset = Some(selected.including(*collection, ids));
                 }
                 _ => eligible += count,
             }

@@ -1059,9 +1059,9 @@ dependencies = [
 
 [[package]]
 name = "lateweave"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fafda564026a6c32f2d10e2b5b94b137ba26b8f6b5920e8cc52d92513892e15"
+checksum = "d7a0a8edd1cb4ae84833bee51b59c34da0d938007fa5e51ccddf98224dec1162"
 dependencies = [
  "blas",
  "blas-src",

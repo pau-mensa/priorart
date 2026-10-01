@@ -24,7 +24,7 @@ pub const LEXICAL_B: f32 = 0.75;
 /// (repeated query terms count again). `N`, `df`, and `avgdl` come from
 /// [`Statistics`], so several indexes can score as one corpus. Maintained
 /// incrementally so a write tokenizes only the document it changes.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct Bm25 {
     postings: HashMap<String, Vec<(u32, u32)>>,
     lengths: Vec<u32>,
@@ -148,13 +148,12 @@ impl Statistics {
     }
 }
 
-/// One collection's BM25 index: `record_ids[i]` names document `i`. Shared
-/// with pipelines through `Arc`s, copied only when a write finds it shared.
+/// One collection's BM25 index: `record_ids[i]` names document `i`.
 #[derive(Default)]
 pub struct Bm25Index {
-    record_ids: Arc<Vec<Arc<str>>>,
+    record_ids: Vec<Arc<str>>,
     positions: HashMap<Arc<str>, usize>,
-    lexical: Arc<Bm25>,
+    lexical: Bm25,
 }
 
 impl Bm25Index {
@@ -162,8 +161,8 @@ impl Bm25Index {
         let record_id: Arc<str> = record_id.into();
         self.positions
             .insert(record_id.clone(), self.record_ids.len());
-        Arc::make_mut(&mut self.record_ids).push(record_id);
-        Arc::make_mut(&mut self.lexical).push(text);
+        self.record_ids.push(record_id);
+        self.lexical.push(text);
     }
 }
 
@@ -178,11 +177,11 @@ impl CollectionIndex for Bm25Index {
         let Some(position) = self.positions.remove(record_id) else {
             return Ok(());
         };
-        Arc::make_mut(&mut self.record_ids).remove(position);
+        self.record_ids.remove(position);
         for later in &self.record_ids[position..] {
             *self.positions.get_mut(later).expect("indexed record") -= 1;
         }
-        Arc::make_mut(&mut self.lexical).remove(position);
+        self.lexical.remove(position);
         Ok(())
     }
 }
@@ -204,11 +203,11 @@ impl Recipe for Bm25Recipe {
         Ok(Box::new(index))
     }
 
-    fn pipeline(
+    fn pipeline<'a>(
         &self,
         query: &Query,
-        indexes: &[(&str, &dyn CollectionIndex)],
-    ) -> recipe::Result<SearchPipeline> {
+        indexes: &[(&'a str, &'a dyn CollectionIndex)],
+    ) -> recipe::Result<SearchPipeline<'a>> {
         let terms = tokens(query.text());
         let mut statistics = Statistics::default();
         let mut corpora = Vec::with_capacity(indexes.len());
@@ -218,32 +217,32 @@ impl Recipe for Bm25Recipe {
                 .ok_or("BM25 was given another recipe's index")?;
             statistics.add(&index.lexical, &terms);
             corpora.push(Corpus {
-                id: collection.into(),
-                record_ids: index.record_ids.clone(),
-                index: index.lexical.clone(),
+                id: collection,
+                record_ids: &index.record_ids,
+                index: &index.lexical,
             });
         }
-        let gatherer = LexicalGatherer::new(corpora, Arc::new(statistics));
+        let gatherer = LexicalGatherer::new(corpora, statistics);
         Ok(SearchPipeline::new(Arc::new(gatherer), None))
     }
 }
 
-pub struct Corpus {
-    pub id: Arc<str>,
-    pub record_ids: Arc<Vec<Arc<str>>>,
-    pub index: Arc<Bm25>,
+pub struct Corpus<'a> {
+    pub id: &'a str,
+    pub record_ids: &'a [Arc<str>],
+    pub index: &'a Bm25,
 }
 
 /// BM25 over several corpora scored as one.
-pub struct LexicalGatherer {
-    corpora: Vec<Corpus>,
+pub struct LexicalGatherer<'a> {
+    corpora: Vec<Corpus<'a>>,
     requires: Requirements,
-    statistics: Arc<Statistics>,
+    statistics: Statistics,
 }
 
-impl LexicalGatherer {
+impl<'a> LexicalGatherer<'a> {
     /// `statistics` must include every corpus and the query's terms.
-    pub fn new(corpora: Vec<Corpus>, statistics: Arc<Statistics>) -> Self {
+    pub fn new(corpora: Vec<Corpus<'a>>, statistics: Statistics) -> Self {
         for corpus in &corpora {
             debug_assert_eq!(corpus.record_ids.len(), corpus.index.len());
         }
@@ -255,7 +254,7 @@ impl LexicalGatherer {
     }
 }
 
-impl CandidateGenerator for LexicalGatherer {
+impl CandidateGenerator for LexicalGatherer<'_> {
     fn requires(&self) -> &Requirements {
         &self.requires
     }
@@ -270,11 +269,11 @@ impl CandidateGenerator for LexicalGatherer {
         let mut scored: Vec<(f32, &Corpus, usize)> = Vec::new();
         for corpus in &self.corpora {
             let eligible = subset.map(|subset| {
-                let ids = subset.ids(&corpus.id);
+                let restriction = subset.restriction(corpus.id);
                 corpus
                     .record_ids
                     .iter()
-                    .map(|id| ids.is_some_and(|ids| ids.contains(id)))
+                    .map(|id| restriction.is_some_and(|restriction| restriction.allows(id)))
                     .collect::<Vec<_>>()
             });
             scored.extend(
@@ -289,7 +288,7 @@ impl CandidateGenerator for LexicalGatherer {
             right
                 .0
                 .total_cmp(&left.0)
-                .then_with(|| left.1.id.cmp(&right.1.id))
+                .then_with(|| left.1.id.cmp(right.1.id))
                 .then_with(|| left.1.record_ids[left.2].cmp(&right.1.record_ids[right.2]))
         });
         scored.truncate(limit);
@@ -297,7 +296,7 @@ impl CandidateGenerator for LexicalGatherer {
             .into_iter()
             .enumerate()
             .map(|(rank, (score, corpus, document))| Candidate {
-                key: DocumentKey::new(corpus.id.clone(), corpus.record_ids[document].clone()),
+                key: DocumentKey::new(corpus.id, corpus.record_ids[document].clone()),
                 gather_score: score,
                 gather_rank: rank,
                 provenance: "bm25".to_owned(),
@@ -317,22 +316,25 @@ mod tests {
         "NCCL timeout: one worker never reached the barrier",
     ];
 
-    fn gatherer() -> LexicalGatherer {
-        let index = Arc::new(Bm25::new(&TEXTS));
-        let statistics = own(
-            &index,
-            &["cuda", "attention", "barrier", "worker", "timeout"],
-        );
+    fn corpus() -> (Bm25, Vec<Arc<str>>) {
         let ids = (0..TEXTS.len())
             .map(|i| Arc::from(format!("r{i}")))
             .collect();
+        (Bm25::new(&TEXTS), ids)
+    }
+
+    fn gatherer<'a>(index: &'a Bm25, record_ids: &'a [Arc<str>]) -> LexicalGatherer<'a> {
+        let statistics = own(
+            index,
+            &["cuda", "attention", "barrier", "worker", "timeout"],
+        );
         LexicalGatherer::new(
             vec![Corpus {
-                id: "t".into(),
-                record_ids: Arc::new(ids),
+                id: "t",
+                record_ids,
                 index,
             }],
-            Arc::new(statistics),
+            statistics,
         )
     }
 
@@ -359,7 +361,8 @@ mod tests {
 
     #[test]
     fn lexical_ranks_matches_first_and_drops_zero_scores() {
-        let gatherer = gatherer();
+        let (index, record_ids) = corpus();
+        let gatherer = gatherer(&index, &record_ids);
         let found = gatherer
             .gather(&Query::new("worker barrier timeout"), 10, None)
             .unwrap();
@@ -374,16 +377,17 @@ mod tests {
 
     #[test]
     fn lexical_honours_the_subset() {
-        let gatherer = gatherer();
+        let (index, record_ids) = corpus();
+        let gatherer = gatherer(&index, &record_ids);
         let query = Query::new("cuda attention barrier");
-        let subset = Subset::new().with("t", ["r1", "r2", "unknown"]);
+        let subset = Subset::new().including("t", ["r1", "r2", "unknown"]);
         assert_eq!(
             ids(&gatherer.gather(&query, 10, Some(&subset)).unwrap()),
             ["r2"]
         );
         for subset in [
-            Subset::new().with("t", [""; 0]),
-            Subset::new().with("other", ["r0"]),
+            Subset::new().including("t", [""; 0]),
+            Subset::new().including("other", ["r0"]),
         ] {
             assert!(ids(&gatherer.gather(&query, 10, Some(&subset)).unwrap()).is_empty());
         }
