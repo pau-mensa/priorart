@@ -49,9 +49,10 @@ pub trait Recipe: Send + Sync {
     ) -> Result<SearchPipeline>;
 }
 
-/// One collection's in-memory index, owned by the service under the
-/// collection's lock and updated after every committed write.
-pub trait CollectionIndex: Any + Send {
+/// One collection's in-memory index, owned by the service and updated after
+/// every committed write. Searches on a collection share it concurrently;
+/// updates are exclusive.
+pub trait CollectionIndex: Any + Send + Sync {
     /// An error discards the index so the next search rebuilds it from
     /// SQLite; the write has already committed and still succeeds.
     fn upsert(&mut self, record_id: &str, revision: i64, text: &str) -> Result<()>;

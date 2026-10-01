@@ -4,7 +4,7 @@
 //! Revision preconditions are checked again inside the storage transaction.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock};
 use std::time::Instant;
 
 use crate::store::mutations::{Intent, Mutation};
@@ -93,28 +93,9 @@ pub struct Health {
     pub document_count: usize,
 }
 
-/// A cached collection: its own connection, and its index once a search needs it.
-struct State {
-    store: Store,
-    index: Option<Index>,
-}
-
-impl State {
-    fn index(
-        &mut self,
-        collection: &str,
-        recipe: &dyn Recipe,
-        metrics: &Metrics,
-    ) -> Result<&mut Index> {
-        if self.index.is_none() {
-            let started = Instant::now();
-            let index = Index::load(&self.store, collection, recipe)?;
-            metrics.index_loaded(collection, started.elapsed(), index.document_count());
-            self.index = Some(index);
-        }
-        Ok(self.index.as_mut().expect("loaded above"))
-    }
-}
+/// A cached collection's index, once a search needs it. Searches share it;
+/// writes, which commit and then update it, hold it exclusively.
+type Slot = Arc<RwLock<Option<Index>>>;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WriteOptions<'a> {
@@ -135,13 +116,17 @@ pub struct Service {
     states: Mutex<States>,
     metrics: Metrics,
     search_log: Option<SearchLog>,
+    /// Requests use their own connections; this one stays open, attached to the
+    /// WAL by one read at startup, so SQLite does not checkpoint and delete the
+    /// WAL each time the last request connection closes.
+    _wal: Mutex<Store>,
     // Declared last so collection state is dropped before releasing ownership.
     _owner: crate::ownership::DirectoryOwner,
 }
 
 #[derive(Default)]
 struct States {
-    loaded: HashMap<String, Arc<Mutex<State>>>,
+    loaded: HashMap<String, Slot>,
     lru: VecDeque<String>,
 }
 
@@ -154,7 +139,8 @@ impl Service {
     pub fn open_with(settings: Settings, recipe: Arc<dyn Recipe>) -> Result<Self, OpenError> {
         settings.validate()?;
         let owner = crate::ownership::DirectoryOwner::acquire(&settings.data_dir)?;
-        Store::open(settings.data_dir.join(DATABASE_FILE))?;
+        let wal = Store::open(settings.data_dir.join(DATABASE_FILE))?;
+        wal.live_record_count(crate::store::LOCAL_COLLECTION_ID)?; // maps the WAL index
         let search_log = settings
             .search_log_days
             .map(|days| SearchLog::open(&settings.data_dir.join(crate::searchlog::FILE), days))
@@ -165,6 +151,7 @@ impl Service {
             states: Mutex::default(),
             metrics: Metrics::default(),
             search_log,
+            _wal: Mutex::new(wal),
             _owner: owner,
         })
     }
@@ -243,21 +230,21 @@ impl Service {
             .len()
     }
 
-    /// Authorization precedes admission.
-    fn state(
+    /// Authorization precedes admission. The request's own connection comes
+    /// back with the collection's slot.
+    fn authorize(
         &self,
         context: &RequestContext,
         collection: &str,
         operation: Operation,
-    ) -> Result<Arc<Mutex<State>>> {
+    ) -> Result<(Store, Slot)> {
         let store = self.connect()?;
         policy::collection(&store, context, collection, operation)?;
-        self.admit(collection, store)
+        Ok((store, self.admit(collection)?))
     }
 
-    /// Each cached collection owns its connection and mutex. Pinned entries
-    /// cannot be evicted or replaced while a request uses them.
-    fn admit(&self, collection: &str, store: Store) -> Result<Arc<Mutex<State>>> {
+    /// Pinned entries cannot be evicted or replaced while a request uses them.
+    fn admit(&self, collection: &str) -> Result<Slot> {
         let mut states = self.states.lock().map_err(|_| ServiceError::Poisoned)?;
         if !states.loaded.contains_key(collection) {
             if states.loaded.len() == self.settings.max_loaded_indexes {
@@ -273,14 +260,50 @@ impl Service {
                 states.loaded.remove(&id);
                 self.metrics.evicted(&id);
             }
-            states.loaded.insert(
-                collection.into(),
-                Arc::new(Mutex::new(State { store, index: None })),
-            );
+            states.loaded.insert(collection.into(), Slot::default());
         }
         states.lru.retain(|id| id != collection);
         states.lru.push_back(collection.into());
         Ok(states.loaded[collection].clone())
+    }
+
+    /// Read guards on every slot, in collection ID order, each holding a
+    /// loaded index. Missing indexes are loaded first, each under its write
+    /// lock with no other lock held. The read locks are then taken in
+    /// collection ID order, so a search can wait while holding one but never
+    /// in a cycle; any lock taken here must keep that order. If a write
+    /// discards an index in between, the search loads it again.
+    fn read_loaded<'a>(
+        &self,
+        store: &Store,
+        collections: &[&str],
+        slots: &'a [Slot],
+    ) -> Result<Vec<std::sync::RwLockReadGuard<'a, Option<Index>>>> {
+        loop {
+            for (collection, slot) in collections.iter().zip(slots) {
+                if slot.read().map_err(|_| ServiceError::Poisoned)?.is_some() {
+                    continue;
+                }
+                let mut index = slot.write().map_err(|_| ServiceError::Poisoned)?;
+                if index.is_none() {
+                    let started = Instant::now();
+                    let loaded = Index::load(store, collection, &*self.recipe)?;
+                    self.metrics.index_loaded(
+                        collection,
+                        started.elapsed(),
+                        loaded.document_count(),
+                    );
+                    *index = Some(loaded);
+                }
+            }
+            let guards = slots
+                .iter()
+                .map(|slot| slot.read().map_err(|_| ServiceError::Poisoned))
+                .collect::<Result<Vec<_>>>()?;
+            if guards.iter().all(|guard| guard.is_some()) {
+                return Ok(guards);
+            }
+        }
     }
 
     /// Applies a committed write to the loaded index, if any. A recipe failure
@@ -321,9 +344,8 @@ impl Service {
         record_id: Option<&str>,
         options: WriteOptions<'_>,
     ) -> Result<Mutation<(String, i64, bool)>> {
-        let handle = self.state(context, collection_id, Operation::Write)?;
-        let mut state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
-        let State { store, index } = &mut *state;
+        let (store, slot) = self.authorize(context, collection_id, Operation::Write)?;
+        let mut index = slot.write().map_err(|_| ServiceError::Poisoned)?;
         let intent = intent(
             context,
             collection_id,
@@ -332,7 +354,7 @@ impl Service {
             json!([record_id, text, metadata, options.expected_revision]),
         )?;
         if let Some(result) = store.replay::<(String, i64, bool)>(&intent)? {
-            policy::mutation(store, context, collection_id, &result.value.0)?;
+            policy::mutation(&store, context, collection_id, &result.value.0)?;
             store.get(collection_id, &result.value.0, None)?;
             return Ok(result);
         }
@@ -352,7 +374,7 @@ impl Service {
             if options.expected_revision != Some(0)
                 && store.record_author(collection_id, record_id)?.is_some()
             {
-                policy::mutation(store, context, collection_id, record_id)?;
+                policy::mutation(&store, context, collection_id, record_id)?;
             }
         }
         let stored = self.cutoff(text);
@@ -365,7 +387,7 @@ impl Service {
             record_id,
             options.expected_revision,
         )?;
-        self.reindex(collection_id, "put", index, |index| {
+        self.reindex(collection_id, "put", &mut index, |index| {
             index.upsert(&created.value.0, created.value.1, stored, metadata)
         });
         Ok(created)
@@ -378,9 +400,9 @@ impl Service {
         record_id: &str,
         revision: Option<i64>,
     ) -> Result<Revision> {
-        let handle = self.state(context, collection_id, Operation::Read)?;
-        let state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
-        Ok(state.store.get(collection_id, record_id, revision)?)
+        let store = self.connect()?;
+        policy::collection(&store, context, collection_id, Operation::Read)?;
+        Ok(store.get(collection_id, record_id, revision)?)
     }
 
     pub fn delete(
@@ -390,10 +412,9 @@ impl Service {
         record_id: &str,
         options: DeleteOptions<'_>,
     ) -> Result<Mutation<()>> {
-        let handle = self.state(context, collection_id, Operation::Write)?;
-        let mut state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
-        let State { store, index } = &mut *state;
-        policy::mutation(store, context, collection_id, record_id)?;
+        let (store, slot) = self.authorize(context, collection_id, Operation::Write)?;
+        let mut index = slot.write().map_err(|_| ServiceError::Poisoned)?;
+        policy::mutation(&store, context, collection_id, record_id)?;
         let intent = intent(
             context,
             collection_id,
@@ -408,16 +429,16 @@ impl Service {
             return invalid("invalid revision precondition");
         }
         let committed = store.commit_delete(&intent, record_id, options.expected_revision)?;
-        self.reindex(collection_id, "delete", index, |index| {
+        self.reindex(collection_id, "delete", &mut index, |index| {
             index.remove(record_id)
         });
         Ok(committed)
     }
 
     pub fn delete_collection(&self, context: &RequestContext, collection: &str) -> Result<()> {
-        let handle = self.state(context, collection, Operation::Admin)?;
-        let state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
-        state.store.purge_collection(collection)?;
+        let (store, slot) = self.authorize(context, collection, Operation::Admin)?;
+        let _exclusive = slot.write().map_err(|_| ServiceError::Poisoned)?;
+        store.purge_collection(collection)?;
         let mut states = self.states.lock().map_err(|_| ServiceError::Poisoned)?;
         states.loaded.remove(collection);
         states.lru.retain(|id| id != collection);
@@ -474,19 +495,18 @@ impl Service {
             }
         }
         let filters = filters.filter(|filters| !filters.is_empty());
-        let handles = collection_ids
+        let slots = collection_ids
             .iter()
-            .map(|collection| self.admit(collection, self.connect()?))
+            .map(|collection| self.admit(collection))
             .collect::<Result<Vec<_>>>()?;
-        // Locked in collection ID order; writers only ever hold one.
-        let mut states = handles
+        let guards = self.read_loaded(&authority, &collection_ids, &slots)?;
+        let loaded: Vec<&Index> = guards
             .iter()
-            .map(|handle| handle.lock().map_err(|_| ServiceError::Poisoned))
-            .collect::<Result<Vec<_>>>()?;
+            .map(|guard| guard.as_ref().expect("loaded by read_loaded"))
+            .collect();
         let mut subset = filters.map(|_| Subset::new());
         let mut eligible = 0;
-        for (collection, state) in collection_ids.iter().zip(&mut states) {
-            let index = state.index(collection, &*self.recipe, &self.metrics)?;
+        for (collection, index) in collection_ids.iter().zip(&loaded) {
             let count = index.document_count();
             match (filters, subset.take()) {
                 (Some(filters), Some(selected)) => {
@@ -503,11 +523,8 @@ impl Service {
             let started = Instant::now();
             let indexes: Vec<(&str, &dyn CollectionIndex)> = collection_ids
                 .iter()
-                .zip(&states)
-                .map(|(collection, state)| {
-                    let index = state.index.as_ref().expect("loaded above");
-                    (*collection, index.recipe_index())
-                })
+                .zip(&loaded)
+                .map(|(collection, index)| (*collection, index.recipe_index()))
                 .collect();
             let query = self.recipe.query(text).map_err(IndexError::from)?;
             let pipeline = self
@@ -527,11 +544,7 @@ impl Service {
                     .binary_search(&document.key.corpus())
                     .map_err(|_| unknown())?;
                 let id = document.key.id();
-                let revision = states[position]
-                    .index
-                    .as_ref()
-                    .and_then(|index| index.revision(id))
-                    .ok_or_else(unknown)?;
+                let revision = loaded[position].revision(id).ok_or_else(unknown)?;
                 ranked.push((document.score, position, id.to_owned(), revision));
             }
             ranked.truncate(limit);
@@ -540,10 +553,7 @@ impl Service {
         let hits = ranked
             .into_iter()
             .map(|(score, position, id, revision)| {
-                let revision =
-                    states[position]
-                        .store
-                        .get(collection_ids[position], &id, Some(revision))?;
+                let revision = authority.get(collection_ids[position], &id, Some(revision))?;
                 Ok(Hit {
                     excerpt: excerpt(
                         revision.text.as_deref().unwrap_or_default(),
