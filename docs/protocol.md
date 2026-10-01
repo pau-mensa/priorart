@@ -35,23 +35,35 @@ requires one of:
 
 Any other non-loopback peer gets `403 https_required`. `X-Forwarded-Proto` is the
 only forwarding header read. Other forwarding headers from trusted proxies are
-ignored; from any other peer, any forwarding header returns `400 untrusted_proxy`. A proxy on the
-same host connects from loopback, so list `127.0.0.1` (or `::1`); direct local
-clients on that address must then send `X-Forwarded-Proto: https` too. The proxy
-must overwrite, not append to, `X-Forwarded-Proto`. Caddy and Traefik do this by
-default; with nginx:
+ignored; from any other peer, any forwarding header returns `400 untrusted_proxy`.
+A proxy on the same host connects from loopback, so list `127.0.0.1` (or `::1`);
+direct local clients on that address, health checks included, must then send
+`X-Forwarded-Proto: https` too. The proxy must overwrite, not append to,
+`X-Forwarded-Proto`. Caddy and Traefik do this by default; with nginx, also raise
+the body limit to the server's own (`256 * PRIORART_MAX_TOKENS + 65536` bytes,
+128 MiB for imports):
 
 ```nginx
 location / {
     proxy_pass http://127.0.0.1:8000;
     proxy_set_header X-Forwarded-Proto $scheme;
+    client_max_body_size 2200k;
+}
+location ~ ^/v1/collections/[^/]+/import$ {
+    proxy_pass http://127.0.0.1:8000;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    client_max_body_size 130m;
 }
 ```
 
 `PRIORART_KEY_REQUESTS_PER_MINUTE` limits each key separately; a key over its
 limit gets `429 rate_limited` with `Retry-After`. Anonymous and operator requests
 are not limited, and limits reset on restart. Other abuse handling (per-IP
-limits, quotas, blocking) belongs in front of priorart.
+limits, quotas, blocking) belongs in front of priorart. Serving a public
+collection to the internet needs at least a per-IP limit, for example nginx's
+`limit_req` or a Cloudflare rate-limiting rule. Behind Cloudflare, Browser Integrity
+Check refuses some scripted clients (Python's `urllib` gets `403`, error 1010);
+disable it for priorart's hostname. [`deploy/`](../deploy) has a Docker setup.
 
 ## Collections
 
