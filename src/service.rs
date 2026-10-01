@@ -232,7 +232,7 @@ impl Service {
 
     /// Authorization precedes admission. The request's own connection comes
     /// back with the collection's slot.
-    fn state(
+    fn authorize(
         &self,
         context: &RequestContext,
         collection: &str,
@@ -268,9 +268,11 @@ impl Service {
     }
 
     /// Read guards on every slot, in collection ID order, each holding a
-    /// loaded index. Missing indexes are loaded first under their write lock,
-    /// one at a time, so a search never waits for a lock while holding one;
-    /// if a write discards an index in between, the search loads it again.
+    /// loaded index. Missing indexes are loaded first, each under its write
+    /// lock with no other lock held. The read locks are then taken in
+    /// collection ID order, so a search can wait while holding one but never
+    /// in a cycle; any lock taken here must keep that order. If a write
+    /// discards an index in between, the search loads it again.
     fn read_loaded<'a>(
         &self,
         store: &Store,
@@ -342,9 +344,8 @@ impl Service {
         record_id: Option<&str>,
         options: WriteOptions<'_>,
     ) -> Result<Mutation<(String, i64, bool)>> {
-        let (store, slot) = self.state(context, collection_id, Operation::Write)?;
+        let (store, slot) = self.authorize(context, collection_id, Operation::Write)?;
         let mut index = slot.write().map_err(|_| ServiceError::Poisoned)?;
-        let store = &store;
         let intent = intent(
             context,
             collection_id,
@@ -353,7 +354,7 @@ impl Service {
             json!([record_id, text, metadata, options.expected_revision]),
         )?;
         if let Some(result) = store.replay::<(String, i64, bool)>(&intent)? {
-            policy::mutation(store, context, collection_id, &result.value.0)?;
+            policy::mutation(&store, context, collection_id, &result.value.0)?;
             store.get(collection_id, &result.value.0, None)?;
             return Ok(result);
         }
@@ -373,7 +374,7 @@ impl Service {
             if options.expected_revision != Some(0)
                 && store.record_author(collection_id, record_id)?.is_some()
             {
-                policy::mutation(store, context, collection_id, record_id)?;
+                policy::mutation(&store, context, collection_id, record_id)?;
             }
         }
         let stored = self.cutoff(text);
@@ -411,10 +412,9 @@ impl Service {
         record_id: &str,
         options: DeleteOptions<'_>,
     ) -> Result<Mutation<()>> {
-        let (store, slot) = self.state(context, collection_id, Operation::Write)?;
+        let (store, slot) = self.authorize(context, collection_id, Operation::Write)?;
         let mut index = slot.write().map_err(|_| ServiceError::Poisoned)?;
-        let store = &store;
-        policy::mutation(store, context, collection_id, record_id)?;
+        policy::mutation(&store, context, collection_id, record_id)?;
         let intent = intent(
             context,
             collection_id,
@@ -436,7 +436,7 @@ impl Service {
     }
 
     pub fn delete_collection(&self, context: &RequestContext, collection: &str) -> Result<()> {
-        let (store, slot) = self.state(context, collection, Operation::Admin)?;
+        let (store, slot) = self.authorize(context, collection, Operation::Admin)?;
         let _exclusive = slot.write().map_err(|_| ServiceError::Poisoned)?;
         store.purge_collection(collection)?;
         let mut states = self.states.lock().map_err(|_| ServiceError::Poisoned)?;

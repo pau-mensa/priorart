@@ -97,9 +97,8 @@ impl Service {
                 source.revision
             ]))
         );
-        let (store, slot) = self.state(context, collection, Operation::Write)?;
+        let (store, slot) = self.authorize(context, collection, Operation::Write)?;
         let mut index = slot.write().map_err(|_| ServiceError::Poisoned)?;
-        let store = &store;
         let intent = intent(
             context,
             collection,
@@ -109,12 +108,12 @@ impl Service {
         )?;
         let record = source.record_id.as_str();
         if let Some(result) = store.replay::<(String, i64)>(&intent)? {
-            policy::mutation(store, context, collection, record)?;
+            policy::mutation(&store, context, collection, record)?;
             store.get(collection, record, Some(result.value.1))?;
             return Ok(result);
         }
         if store.record_author(collection, record)?.is_some() {
-            policy::mutation(store, context, collection, record)?;
+            policy::mutation(&store, context, collection, record)?;
         }
         let fitted = self.cutoff(&source.text);
         let committed = store.commit_import(

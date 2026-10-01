@@ -24,17 +24,17 @@ recipe. `priorart::lateweave` re-exports the lateweave version priorart uses.
 - `load` builds a collection's index from the latest revision of each live
   record. It runs on the first search and again after an eviction, a restart,
   or a failed update.
-- The index is `Send + Sync`: searches on a collection read it concurrently,
-  while `upsert` and `remove` run alone, after every committed write. An error discards the index and the next search rebuilds
-  it; the write still succeeds and is counted in
-  `priorart_index_update_failures_total`.
+- `upsert` and `remove` run after every committed write, alone; searches on
+  the collection read the index concurrently, so it is `Send + Sync`. An error
+  discards the index and the next search rebuilds it; the write still succeeds
+  and is counted in `priorart_index_update_failures_total`.
 - `query` turns the text into the lateweave query, adding any query features.
 - `gather_limit` sets how many candidates to gather for a requested limit.
-- `pipeline` may run for several searches at once over the same indexes. It
-  builds one lateweave pipeline over every selected collection,
-  given in collection ID order. Documents are keyed by (collection ID, record
-  ID) and must be indexed records; scores must compare across collections and
-  ties must break deterministically. The pipeline receives the metadata filter
+- `pipeline` builds one lateweave pipeline over every selected collection,
+  given in collection ID order, and may run for several searches at once over
+  the same indexes. Documents are keyed by (collection ID, record ID) and must
+  be indexed records; scores must compare across collections and ties must
+  break deterministically. The pipeline receives the metadata filter
   as a subset.
 
 The service keeps everything else: authorization, locking, caching, filters,
