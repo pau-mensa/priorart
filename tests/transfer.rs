@@ -339,7 +339,7 @@ fn frames(body: &str) -> Vec<Value> {
 }
 
 #[tokio::test]
-async fn paginated_streams_round_trip_and_report_partial_imports() {
+async fn paginated_streams_round_trip_and_reject_incomplete_imports() {
     let f = Fixture::new();
     let url = common::spawn(f.service.clone()).await;
     let client = reqwest::Client::new();
@@ -411,19 +411,54 @@ async fn paginated_streams_round_trip_and_report_partial_imports() {
         .unwrap();
     assert_eq!(frames(&overwritten)[0]["record_id"], "record");
     assert_eq!(frames(&overwritten)[0]["revision"], 3);
-    let truncated = format!("{}\n", first_rows[0]);
-    let partial = send(truncated).send().await.unwrap().text().await.unwrap();
-    assert_eq!(frames(&partial)[0]["type"], "imported");
-    assert_eq!(frames(&partial).last().unwrap()["type"], "error");
+    let mut fresh = first_rows[0].clone();
+    fresh["record"]["record_id"] = json!("fresh");
+    let truncated = client
+        .post(&import)
+        .bearer_auth(&f.bob_key)
+        .header("content-type", "application/x-ndjson")
+        .header("idempotency-key", "http-truncated")
+        .body(format!("{fresh}\n"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(truncated.status(), 400);
+    let mut blank = fresh.clone();
+    blank["record"]["record_id"] = json!("blank");
+    blank["record"]["text"] = json!("  ");
+    let refused = client
+        .post(&import)
+        .bearer_auth(&f.bob_key)
+        .header("content-type", "application/x-ndjson")
+        .header("idempotency-key", "http-blank")
+        .body(format!(
+            "{fresh}\n{blank}\n{}\n",
+            json!({"type": "end", "count": 2, "generation": 0, "next_cursor": null})
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+    let unwritten = client
+        .get(format!(
+            "{url}/v1/collections/{}/records/fresh",
+            f.destination
+        ))
+        .bearer_auth(&f.bob_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unwritten.status(), 404);
     let invalid = send("{private malformed payload}\n".into())
         .send()
         .await
-        .unwrap()
+        .unwrap();
+    assert_eq!(invalid.status(), 422);
+    assert!(!invalid
         .text()
         .await
-        .unwrap();
-    assert!(!invalid.contains("private malformed payload"));
-    assert_eq!(frames(&invalid)[0]["type"], "error");
+        .unwrap()
+        .contains("private malformed payload"));
     assert_eq!(client.get(&export).send().await.unwrap().status(), 404);
     assert_eq!(
         client
@@ -437,4 +472,63 @@ async fn paginated_streams_round_trip_and_report_partial_imports() {
             .status(),
         400
     );
+}
+
+/// nginx and Cloudflare stop forwarding a request body once the upstream starts its response.
+#[tokio::test]
+async fn import_reads_the_whole_body_before_responding() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let f = Fixture::new();
+    let url = common::spawn(f.service.clone()).await;
+    let mut row = serde_json::to_value(&f.records()[0]).unwrap();
+    let rows = 2000;
+    let mut body = String::new();
+    for i in 0..rows {
+        row["record_id"] = json!(format!("r{i}"));
+        body += &json!({"type": "revision", "record": row}).to_string();
+        body.push('\n');
+    }
+    body +=
+        &json!({"type": "end", "count": rows, "generation": 0, "next_cursor": null}).to_string();
+    body.push('\n');
+    let address = url.trim_start_matches("http://");
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST /v1/collections/{}/import HTTP/1.1\r\nhost: {address}\r\n\
+                 authorization: Bearer {}\r\ncontent-type: application/x-ndjson\r\n\
+                 idempotency-key: whole-body\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                f.destination,
+                f.bob_key,
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    for chunk in body.as_bytes().chunks(4096) {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let mut buffer = [0; 4096];
+        match stream.try_read(&mut buffer) {
+            Ok(read) => {
+                response.extend_from_slice(&buffer[..read]);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("{error}"),
+        }
+        stream.write_all(chunk).await.unwrap();
+    }
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        stream.read_to_end(&mut response),
+    )
+    .await
+    .expect("the response must not start before the body is read")
+    .unwrap();
+    let response = String::from_utf8(response).unwrap();
+    assert_eq!(response.matches("\"type\":\"imported\"").count(), rows);
+    assert!(response.contains(&format!("{{\"count\":{rows},\"type\":\"end\"}}")));
 }

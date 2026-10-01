@@ -1,5 +1,5 @@
 use priorart::auth::RequestContext;
-use priorart::service::WriteOptions;
+use priorart::service::{DeleteOptions, WriteOptions};
 mod common;
 
 use priorart::config::Settings;
@@ -180,6 +180,57 @@ fn filters_restrict() {
         .search(&CALLER, &[LOCAL], "error", Some(&nothing), 10)
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn filters_follow_latest_metadata_across_writes_and_reloads() {
+    let (directory, service) = seeded();
+    let ids = |service: &Service, filters: serde_json::Value| {
+        let mut ids = service
+            .search(
+                &CALLER,
+                &[LOCAL],
+                "error fixed timeout",
+                Some(&metadata(filters)),
+                10,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    };
+    let retag = |record: &str, tags: serde_json::Value| {
+        let text = DOCS.iter().find(|(id, _)| *id == record).unwrap().1;
+        service
+            .put(
+                &CALLER,
+                LOCAL,
+                text,
+                Some(&metadata(tags)),
+                Some(record),
+                WriteOptions::default(),
+            )
+            .unwrap();
+    };
+    retag("cuda", json!({"kind": "fix", "topic": "gpu", "size": 2}));
+    retag("nccl", json!({"topic": "gpu"}));
+    assert_eq!(ids(&service, json!({"topic": "gpu"})), ["cuda", "nccl"]);
+    assert_eq!(
+        ids(&service, json!({"topic": "gpu", "kind": "fix"})),
+        ["cuda"]
+    );
+    assert_eq!(ids(&service, json!({"size": 2.0})), ["cuda"]);
+    assert!(ids(&service, json!({"topic": "cuda"})).is_empty());
+    service
+        .delete(&CALLER, LOCAL, "cuda", DeleteOptions::default())
+        .unwrap();
+    assert_eq!(ids(&service, json!({"topic": "gpu"})), ["nccl"]);
+    drop(service);
+    let service = Service::open(settings(&directory)).unwrap();
+    assert_eq!(ids(&service, json!({"topic": "gpu"})), ["nccl"]);
+    assert_eq!(ids(&service, json!({"kind": "fix"})), ["pytest"]);
 }
 
 #[test]

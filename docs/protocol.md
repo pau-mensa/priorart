@@ -35,23 +35,35 @@ requires one of:
 
 Any other non-loopback peer gets `403 https_required`. `X-Forwarded-Proto` is the
 only forwarding header read. Other forwarding headers from trusted proxies are
-ignored; from any other peer, any forwarding header returns `400`. A proxy on the
-same host connects from loopback, so list `127.0.0.1` (or `::1`); direct local
-clients on that address must then send `X-Forwarded-Proto: https` too. The proxy
-must overwrite, not append to, `X-Forwarded-Proto`. Caddy and Traefik do this by
-default; with nginx:
+ignored; from any other peer, any forwarding header returns `400 untrusted_proxy`.
+A proxy on the same host connects from loopback, so list `127.0.0.1` (or `::1`);
+direct local clients on that address, health checks included, must then send
+`X-Forwarded-Proto: https` too. The proxy must overwrite, not append to,
+`X-Forwarded-Proto`. Caddy and Traefik do this by default; with nginx, also raise
+the body limit to the server's own (`256 * PRIORART_MAX_TOKENS + 65536` bytes,
+128 MiB for imports):
 
 ```nginx
 location / {
     proxy_pass http://127.0.0.1:8000;
     proxy_set_header X-Forwarded-Proto $scheme;
+    client_max_body_size 2200k;
+}
+location ~ ^/v1/collections/[^/]+/import$ {
+    proxy_pass http://127.0.0.1:8000;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    client_max_body_size 130m;
 }
 ```
 
 `PRIORART_KEY_REQUESTS_PER_MINUTE` limits each key separately; a key over its
 limit gets `429 rate_limited` with `Retry-After`. Anonymous and operator requests
 are not limited, and limits reset on restart. Other abuse handling (per-IP
-limits, quotas, blocking) belongs in front of priorart.
+limits, quotas, blocking) belongs in front of priorart. Serving a public
+collection to the internet needs at least a per-IP limit, for example nginx's
+`limit_req` or a Cloudflare rate-limiting rule. Behind Cloudflare, Browser Integrity
+Check refuses some scripted clients (Python's `urllib` gets `403`, error 1010);
+disable it for priorart's hostname. [`deploy/`](../deploy) has a Docker setup.
 
 ## Collections
 
@@ -234,10 +246,15 @@ Each row is acknowledged once committed and searchable:
 {"type":"end","count":1}
 ```
 
-An upload holds at most 10000 rows and 128 MiB, and must end with the export's
-`end` footer carrying the right count. Rows commit one at a time: after a failure,
-retry the same input with the same batch key; committed rows are not duplicated.
-Changing a row or the mode under the same key conflicts.
+An upload holds at most 10000 rows and 128 MiB, must arrive within 5 minutes
+(`408 request_timeout`), and must end with the export's `end` footer carrying the
+right count. The server reads and checks the whole upload before responding, so a
+malformed row or footer returns an error status and writes nothing; this also keeps
+imports working behind proxies that stop forwarding a body once the response
+starts. Rows then commit one at a time, and a row refused by the destination's
+state (an ID collision, a deleted ID, a missing permission) stops the stream with
+earlier rows committed. Retry the same input with the same batch key; committed
+rows are not duplicated. Changing a row or the mode under the same key conflicts.
 
 Failures after the response starts arrive as a final
 `{"type":"error","error":{"code":"…","message":"…"}}` line. Only an `end` line
@@ -257,10 +274,12 @@ Errors have fixed messages that never echo request contents:
 | Status | Code | Meaning |
 |---|---|---|
 | 400 | `invalid_input` | invalid scope, identifier, revision, content, or limit |
+| 400 | `untrusted_proxy` | a forwarding header from a peer not in `PRIORART_TRUSTED_PROXIES` |
 | 401 | `unauthenticated` | invalid key, or a mutation without one |
 | 403 | `https_required` | plain HTTP from a non-loopback peer, or a trusted proxy that did not report HTTPS |
 | 404 | `not_found` | unknown or forbidden resource, or unknown route |
 | 405 | `method_not_allowed` | unsupported method |
+| 408 | `request_timeout` | an import body took over 5 minutes to arrive |
 | 409 | `revision_conflict` | `expected_revision` mismatch, or an import ID collision |
 | 409 | `idempotency_conflict` | idempotency key reused with different input |
 | 409 | `export_changed` | collection changed between export pages |
@@ -308,8 +327,9 @@ disappear when the collection is deleted. Counters reset on restart.
 | `PRIORART_WRITE_COLLECTION` | the search scope, if it is one collection | default destination |
 | `PRIORART_ALLOW_INSECURE_HTTP` | `false` | allow a non-loopback `http://` URL |
 
-Every tool takes an optional collection override, and hits carry `collection_id`
-for follow-up reads. When the server logs searches, `search_experiences` returns
+`search_experiences` takes an optional `collections` scope; the other tools take an
+optional `collection_id`, the same field hits carry for follow-up reads. Unknown
+arguments are rejected. When the server logs searches, `search_experiences` returns
 the `search_id` and `rate_hits` sends the agent's ratings. The key never appears in tool schemas, results, or errors.
 The URL must not embed credentials, redirects are not followed, and the key is
 checked against `/healthz` at startup. Transport failures and `502`–`504` are

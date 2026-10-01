@@ -366,7 +366,7 @@ impl Service {
             options.expected_revision,
         )?;
         self.reindex(collection_id, "put", index, |index| {
-            index.upsert(&created.value.0, created.value.1, stored)
+            index.upsert(&created.value.0, created.value.1, stored, metadata)
         });
         Ok(created)
     }
@@ -486,12 +486,11 @@ impl Service {
         let mut subset = filters.map(|_| Subset::new());
         let mut eligible = 0;
         for (collection, state) in collection_ids.iter().zip(&mut states) {
-            let count = state
-                .index(collection, &*self.recipe, &self.metrics)?
-                .document_count();
+            let index = state.index(collection, &*self.recipe, &self.metrics)?;
+            let count = index.document_count();
             match (filters, subset.take()) {
                 (Some(filters), Some(selected)) => {
-                    let ids = state.store.matching_record_ids(collection, filters)?;
+                    let ids = index.matching(filters);
                     eligible += ids.len();
                     subset = Some(selected.with(*collection, ids));
                 }

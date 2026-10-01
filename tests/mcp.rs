@@ -216,8 +216,14 @@ async fn server_errors_surface_to_the_model() {
 async fn ids_that_would_change_the_url_are_rejected() {
     let session = session().await;
     for id in ["..", ".", "x/reports", "cuda?revision=1", "a#b"] {
-        for tool in ["get_experience", "delete_experience"] {
-            let result = call(&session, tool, json!({"id": id, "expected_revision": 1})).await;
+        for (tool, arguments) in [
+            ("get_experience", json!({"id": id})),
+            (
+                "delete_experience",
+                json!({"id": id, "expected_revision": 1}),
+            ),
+        ] {
+            let result = call(&session, tool, arguments).await;
             assert!(error_text(&result).contains("invalid id"), "{tool} {id}");
         }
     }
@@ -346,7 +352,7 @@ async fn a_key_searches_mixed_scopes_and_writes_to_its_collection() {
     let shared = invoke(
         &client,
         "get_experience",
-        json!({"id": "shared", "collection": h.public}),
+        json!({"id": "shared", "collection_id": h.public}),
     )
     .await;
     assert_eq!(structured(&shared)["text"], "public barrier fix");
@@ -360,10 +366,40 @@ async fn a_key_searches_mixed_scopes_and_writes_to_its_collection() {
     let refused = invoke(
         &client,
         "contribute_experience",
-        json!({"text": "not mine", "collection": h.public}),
+        json!({"text": "not mine", "collection_id": h.public}),
     )
     .await;
     assert!(error_text(&refused).contains("not_found"));
+    for (tool, arguments) in [
+        (
+            "get_experience",
+            json!({"id": "shared", "collection": h.public}),
+        ),
+        (
+            "delete_experience",
+            json!({"id": "mine", "collection": h.private}),
+        ),
+        (
+            "search_experiences",
+            json!({"problem": "barrier", "scope": "all"}),
+        ),
+    ] {
+        let rejected = client
+            .call_tool(
+                CallToolRequestParams::new(tool)
+                    .with_arguments(arguments.as_object().unwrap().clone()),
+            )
+            .await;
+        let message = match rejected {
+            Ok(result) => error_text(&result),
+            Err(error) => error.to_string(),
+        };
+        assert!(message.contains("unknown field"), "{tool}: {message}");
+    }
+    assert_eq!(
+        structured(&invoke(&client, "get_experience", json!({"id": "mine"})).await)["id"],
+        "mine"
+    );
 
     let mixed = attach(config(
         &h.url,

@@ -71,6 +71,20 @@ impl ApiError {
             "requests must arrive over HTTPS",
         )
     }
+    fn untrusted_proxy() -> Self {
+        Self(
+            StatusCode::BAD_REQUEST,
+            "untrusted_proxy",
+            "forwarding headers are accepted only from trusted proxies",
+        )
+    }
+    fn request_timeout() -> Self {
+        Self(
+            StatusCode::REQUEST_TIMEOUT,
+            "request_timeout",
+            "request body did not arrive in time",
+        )
+    }
     fn unavailable() -> Self {
         Self(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -188,7 +202,7 @@ fn admit_peer(settings: &Settings, peer: IpAddr, headers: &HeaderMap) -> ApiResu
         .keys()
         .any(|name| name == "forwarded" || name.as_str().starts_with("x-forwarded-"))
     {
-        return Err(ApiError::invalid());
+        return Err(ApiError::untrusted_proxy());
     }
     if peer.is_loopback() || settings.allow_insecure_http {
         Ok(())

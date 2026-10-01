@@ -186,6 +186,14 @@ fn serve(
         }
         let listener = tokio::net::TcpListener::bind(address).await?;
         eprintln!("priorart: listening on http://{address}");
+        if !settings.trusted_proxies.is_empty() {
+            let proxies: Vec<_> = settings
+                .trusted_proxies
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            eprintln!("priorart: trusting proxies {}", proxies.join(", "));
+        }
         axum::serve(
             listener,
             api::router(service).into_make_service_with_connect_info::<SocketAddr>(),

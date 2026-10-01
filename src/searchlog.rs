@@ -118,6 +118,7 @@ pub struct SearchLog {
 
 impl SearchLog {
     pub fn open(path: &Path, days: u32) -> Result<Self, StoreError> {
+        crate::ownership::create_private_file(path)?;
         let mut connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;

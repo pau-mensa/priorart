@@ -9,8 +9,8 @@ pub(crate) struct DirectoryOwner {
 }
 impl DirectoryOwner {
     pub(crate) fn acquire(directory: &Path) -> std::io::Result<Self> {
-        std::fs::create_dir_all(directory)?;
-        let file = OpenOptions::new()
+        create_private_dir(directory)?;
+        let file = private_options()
             .read(true)
             .write(true)
             .create(true)
@@ -25,4 +25,31 @@ impl DirectoryOwner {
         })?;
         Ok(Self { _file: file })
     }
+}
+
+/// Creates `directory` and any missing parents readable by the owner only.
+pub(crate) fn create_private_dir(directory: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(directory)
+}
+
+/// Creates `path` if missing, readable by the owner only. SQLite gives its WAL
+/// and shared-memory files the database file's permissions.
+pub(crate) fn create_private_file(path: &Path) -> std::io::Result<()> {
+    private_options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map(drop)
+}
+
+fn private_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options
 }
