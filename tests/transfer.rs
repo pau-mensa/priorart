@@ -423,6 +423,22 @@ async fn paginated_streams_round_trip_and_reject_incomplete_imports() {
         .await
         .unwrap();
     assert_eq!(truncated.status(), 400);
+    let mut blank = fresh.clone();
+    blank["record"]["record_id"] = json!("blank");
+    blank["record"]["text"] = json!("  ");
+    let refused = client
+        .post(&import)
+        .bearer_auth(&f.bob_key)
+        .header("content-type", "application/x-ndjson")
+        .header("idempotency-key", "http-blank")
+        .body(format!(
+            "{fresh}\n{blank}\n{}\n",
+            json!({"type": "end", "count": 2, "generation": 0, "next_cursor": null})
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
     let unwritten = client
         .get(format!(
             "{url}/v1/collections/{}/records/fresh",

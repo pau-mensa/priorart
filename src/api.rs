@@ -78,6 +78,13 @@ impl ApiError {
             "forwarding headers are accepted only from trusted proxies",
         )
     }
+    fn request_timeout() -> Self {
+        Self(
+            StatusCode::REQUEST_TIMEOUT,
+            "request_timeout",
+            "request body did not arrive in time",
+        )
+    }
     fn unavailable() -> Self {
         Self(
             StatusCode::SERVICE_UNAVAILABLE,

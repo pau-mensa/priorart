@@ -67,6 +67,19 @@ impl Service {
     /// Imports one exported revision under its source record ID. By default
     /// source revision N must land as revision N, so an existing record with
     /// that ID conflicts; `overwrite` appends it as a new revision instead.
+    /// The checks on an import row that need no store, so a batch can be refused whole.
+    pub fn validate_import(source: &TransferRecord) -> Result<()> {
+        if source.version != 1
+            || !is_record_id(&source.collection_id)
+            || !is_record_id(&source.record_id)
+            || source.revision <= 0
+            || source.text.trim().is_empty()
+        {
+            return invalid("invalid import revision");
+        }
+        validate_metadata(source.metadata.as_ref(), 65_536)
+    }
+
     pub fn import_revision(
         &self,
         context: &RequestContext,
@@ -76,15 +89,7 @@ impl Service {
         overwrite: bool,
     ) -> Result<Mutation<(String, i64)>> {
         self.authorize_import(context, collection, batch_key)?;
-        if source.version != 1
-            || !is_record_id(&source.collection_id)
-            || !is_record_id(&source.record_id)
-            || source.revision <= 0
-            || source.text.trim().is_empty()
-        {
-            return invalid("invalid import revision");
-        }
-        validate_metadata(source.metadata.as_ref(), 65_536)?;
+        Self::validate_import(source)?;
         let key = format!(
             "import:{}",
             transfer_digest(json!([

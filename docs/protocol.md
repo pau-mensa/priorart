@@ -246,13 +246,15 @@ Each row is acknowledged once committed and searchable:
 {"type":"end","count":1}
 ```
 
-An upload holds at most 10000 rows and 128 MiB, and must end with the export's
-`end` footer carrying the right count. The server reads the whole upload before
-responding, so an invalid row or footer returns an error status and writes nothing;
-this also keeps imports working behind proxies that stop forwarding a body once the
-response starts. Rows then commit one at a time: after a failure,
-retry the same input with the same batch key; committed rows are not duplicated.
-Changing a row or the mode under the same key conflicts.
+An upload holds at most 10000 rows and 128 MiB, must arrive within 5 minutes
+(`408 request_timeout`), and must end with the export's `end` footer carrying the
+right count. The server reads and checks the whole upload before responding, so a
+malformed row or footer returns an error status and writes nothing; this also keeps
+imports working behind proxies that stop forwarding a body once the response
+starts. Rows then commit one at a time, and a row refused by the destination's
+state (an ID collision, a deleted ID, a missing permission) stops the stream with
+earlier rows committed. Retry the same input with the same batch key; committed
+rows are not duplicated. Changing a row or the mode under the same key conflicts.
 
 Failures after the response starts arrive as a final
 `{"type":"error","error":{"code":"…","message":"…"}}` line. Only an `end` line
@@ -277,6 +279,7 @@ Errors have fixed messages that never echo request contents:
 | 403 | `https_required` | plain HTTP from a non-loopback peer, or a trusted proxy that did not report HTTPS |
 | 404 | `not_found` | unknown or forbidden resource, or unknown route |
 | 405 | `method_not_allowed` | unsupported method |
+| 408 | `request_timeout` | an import body took over 5 minutes to arrive |
 | 409 | `revision_conflict` | `expected_revision` mismatch, or an import ID collision |
 | 409 | `idempotency_conflict` | idempotency key reused with different input |
 | 409 | `export_changed` | collection changed between export pages |

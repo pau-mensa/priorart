@@ -11,6 +11,8 @@ const MAX_ROWS: usize = 10_000;
 const MAX_BYTES: usize = 128 * 1024 * 1024;
 /// Bounds the memory held by import bodies to this many times `MAX_BYTES`.
 static BUFFERED_IMPORTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+/// How long an import may hold a buffering slot while its body arrives.
+const BODY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -238,41 +240,53 @@ pub(super) async fn import(
         .acquire()
         .await
         .expect("import semaphore is never closed");
-    let mut records = Vec::new();
-    loop {
-        let bytes = lines.next().await?.ok_or_else(ApiError::invalid)?;
-        match serde_json::from_slice(&bytes).map_err(|_| ApiError::validation())? {
-            Frame::Revision { record } if records.len() < MAX_ROWS => records.push(record),
-            Frame::Revision { .. } => return Err(ApiError::invalid()),
-            Frame::End { count, .. } => {
-                if count != records.len() || lines.next().await?.is_some() {
-                    return Err(ApiError::invalid());
+    // Rows are kept as raw lines, so the slot holds at most `MAX_BYTES`; parsed
+    // records can be many times larger.
+    let rows = tokio::time::timeout(BODY_DEADLINE, async {
+        let mut rows = Vec::new();
+        loop {
+            let bytes = lines.next().await?.ok_or_else(ApiError::invalid)?;
+            match serde_json::from_slice(&bytes).map_err(|_| ApiError::validation())? {
+                Frame::Revision { record } if rows.len() < MAX_ROWS => {
+                    Service::validate_import(&record)?;
+                    rows.push(bytes);
                 }
-                break;
+                Frame::Revision { .. } => return Err(ApiError::invalid()),
+                Frame::End { count, .. } => {
+                    if count != rows.len() || lines.next().await?.is_some() {
+                        return Err(ApiError::invalid());
+                    }
+                    return Ok(rows);
+                }
             }
         }
-    }
-    let count = records.len();
+    })
+    .await
+    .map_err(|_| ApiError::request_timeout())??;
+    let count = rows.len();
     let state = (
         service,
         context,
         collection,
         key,
-        records.into_iter(),
+        rows.into_iter(),
         permit,
         false,
     );
     let output = stream::unfold(
         state,
-        move |(service, context, collection, key, mut records, permit, done)| async move {
+        move |(service, context, collection, key, mut rows, permit, done)| async move {
             if done {
                 return None;
             }
             let c = collection.clone();
             let ctx = context.clone();
             let k = key.clone();
-            let (bytes, finished) = match records.next() {
-                Some(record) => {
+            let (bytes, finished) = match rows.next() {
+                Some(row) => {
+                    let Ok(Frame::Revision { record }) = serde_json::from_slice(&row) else {
+                        unreachable!("rows are parsed while buffering");
+                    };
                     let source = json!({"collection_id": record.collection_id, "record_id": record.record_id, "revision": record.revision});
                     match blocking(&service, move |s| {
                         s.import_revision(&ctx, &c, &record, &k, overwrite)
@@ -296,7 +310,7 @@ pub(super) async fn import(
             };
             Some((
                 Ok::<_, std::convert::Infallible>(bytes),
-                (service, context, collection, key, records, permit, finished),
+                (service, context, collection, key, rows, permit, finished),
             ))
         },
     );
