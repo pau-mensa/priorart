@@ -125,7 +125,7 @@ impl Service {
             },
         )?;
         self.reindex(collection, "import", index, |index| {
-            index.upsert(record, committed.value.1, fitted)
+            index.upsert(record, committed.value.1, fitted, source.metadata.as_ref())
         });
         Ok(committed)
     }

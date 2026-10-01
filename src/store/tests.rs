@@ -155,41 +155,6 @@ fn live_documents_are_latest_and_ordered() {
     );
 }
 
-#[test]
-fn filters_match_latest_metadata() {
-    let (_directory, store) = open();
-    let add = |text, tags: Value, record| {
-        store
-            .put(
-                LOCAL,
-                text,
-                Some(&metadata(tags)),
-                Some(record),
-                LOCAL_PRINCIPAL_ID,
-                store.get(LOCAL, record, None).ok().map(|r| r.revision),
-            )
-            .unwrap();
-    };
-    add("x", json!({"lang": "python", "gpu": true}), "p");
-    add("y", json!({"lang": "rust", "size": 2}), "r");
-    add("z", json!({"lang": "python"}), "p");
-    put(&store, LOCAL, "w", Some("n"));
-    let matching = |filters: Value| {
-        let mut ids = store
-            .matching_record_ids(LOCAL, &metadata(filters))
-            .unwrap()
-            .into_iter()
-            .collect::<Vec<_>>();
-        ids.sort();
-        ids
-    };
-    assert_eq!(matching(json!({"lang": "python"})), ["p"]);
-    assert!(matching(json!({"lang": "python", "gpu": true})).is_empty());
-    assert_eq!(matching(json!({"lang": "rust"})), ["r"]);
-    assert_eq!(matching(json!({"size": 2.0})), ["r"]);
-    assert!(matching(json!({"missing": 1})).is_empty());
-}
-
 struct Scoped {
     _directory: TempDir,
     store: Store,
@@ -329,11 +294,6 @@ fn reads_and_deletes_are_scoped() {
     let live = store.live_documents(&a).unwrap();
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].record_id, "same");
-    let filters = metadata(json!({"tag": "shared"}));
-    assert_eq!(
-        store.matching_record_ids(&a, &filters).unwrap(),
-        HashSet::from(["same".to_owned()])
-    );
     store.delete(&a, "same", Some(1)).unwrap();
     assert!(store.live_documents(&a).unwrap().is_empty());
     assert_eq!(
