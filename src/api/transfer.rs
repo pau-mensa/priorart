@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 
 const MAX_ROWS: usize = 10_000;
 const MAX_BYTES: usize = 128 * 1024 * 1024;
+/// Bounds the memory held by import bodies to this many times `MAX_BYTES`.
+static BUFFERED_IMPORTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -223,52 +225,78 @@ pub(super) async fn import(
     let ctx = context.clone();
     let k = key.clone();
     blocking(&service, move |s| s.authorize_import(&ctx, &c, &k)).await?;
-    let lines = Lines {
+    let mut lines = Lines {
         body: body.into_data_stream(),
         pending: Bytes::new(),
         partial: Vec::new(),
         bytes: 0,
         max_line: service.settings().max_body_bytes(),
     };
-    let state = (service, context, collection, key, lines, 0usize, false);
+    // Proxies stop forwarding a request body once the response starts, so the
+    // whole batch is read before anything is committed or acknowledged.
+    let permit = BUFFERED_IMPORTS
+        .acquire()
+        .await
+        .expect("import semaphore is never closed");
+    let mut records = Vec::new();
+    loop {
+        let bytes = lines.next().await?.ok_or_else(ApiError::invalid)?;
+        match serde_json::from_slice(&bytes).map_err(|_| ApiError::validation())? {
+            Frame::Revision { record } if records.len() < MAX_ROWS => records.push(record),
+            Frame::Revision { .. } => return Err(ApiError::invalid()),
+            Frame::End { count, .. } => {
+                if count != records.len() || lines.next().await?.is_some() {
+                    return Err(ApiError::invalid());
+                }
+                break;
+            }
+        }
+    }
+    let count = records.len();
+    let state = (
+        service,
+        context,
+        collection,
+        key,
+        records.into_iter(),
+        permit,
+        false,
+    );
     let output = stream::unfold(
         state,
-        move |(service, context, collection, key, mut lines, count, done)| async move {
+        move |(service, context, collection, key, mut records, permit, done)| async move {
             if done {
                 return None;
             }
-            let result: ApiResult<(Bytes, bool)> = async {
-            let bytes = lines.next().await?.ok_or_else(ApiError::invalid)?;
-            let frame: Frame = serde_json::from_slice(&bytes).map_err(|_| ApiError::validation())?;
-            match frame {
-                Frame::Revision {record} => {
-                    if count >= MAX_ROWS { return Err(ApiError::invalid()); }
+            let c = collection.clone();
+            let ctx = context.clone();
+            let k = key.clone();
+            let (bytes, finished) = match records.next() {
+                Some(record) => {
                     let source = json!({"collection_id": record.collection_id, "record_id": record.record_id, "revision": record.revision});
-                    let c = collection.clone();
-                    let ctx = context.clone();
-                    let k = key.clone();
-                    let imported = blocking(&service, move |s| s.import_revision(&ctx, &c, &record, &k, overwrite)).await?;
-                    Ok((line(json!({"type":"imported", "source":source, "collection_id":collection,
-                        "record_id":imported.value.0, "revision":imported.value.1, "mutation_id":imported.mutation_id})), false))
+                    match blocking(&service, move |s| {
+                        s.import_revision(&ctx, &c, &record, &k, overwrite)
+                    })
+                    .await
+                    {
+                        Ok(imported) => (
+                            line(
+                                json!({"type":"imported", "source":source, "collection_id":collection,
+                            "record_id":imported.value.0, "revision":imported.value.1, "mutation_id":imported.mutation_id}),
+                            ),
+                            false,
+                        ),
+                        Err(error) => (failure(error), true),
+                    }
+                }
+                None => match blocking(&service, move |s| s.authorize_import(&ctx, &c, &k)).await {
+                    Ok(()) => (line(json!({"type":"end", "count":count})), true),
+                    Err(error) => (failure(error), true),
                 },
-                Frame::End {count: expected, ..} => {
-                    if expected != count || lines.next().await?.is_some() { return Err(ApiError::invalid()); }
-                    let c = collection.clone();
-                    let ctx = context.clone();
-                    let k = key.clone();
-                    blocking(&service, move |s| s.authorize_import(&ctx, &c, &k)).await?;
-                    Ok((line(json!({"type":"end", "count":count})), true))
-                },
-            }
-        }.await;
-            let (bytes, finished) = match result {
-                Ok(result) => result,
-                Err(error) => (failure(error), true),
             };
-            let count = if finished { count } else { count + 1 };
             Some((
                 Ok::<_, std::convert::Infallible>(bytes),
-                (service, context, collection, key, lines, count, finished),
+                (service, context, collection, key, records, permit, finished),
             ))
         },
     );

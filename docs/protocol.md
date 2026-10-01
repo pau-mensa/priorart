@@ -235,7 +235,10 @@ Each row is acknowledged once committed and searchable:
 ```
 
 An upload holds at most 10000 rows and 128 MiB, and must end with the export's
-`end` footer carrying the right count. Rows commit one at a time: after a failure,
+`end` footer carrying the right count. The server reads the whole upload before
+responding, so an invalid row or footer returns an error status and writes nothing;
+this also keeps imports working behind proxies that stop forwarding a body once the
+response starts. Rows then commit one at a time: after a failure,
 retry the same input with the same batch key; committed rows are not duplicated.
 Changing a row or the mode under the same key conflicts.
 
