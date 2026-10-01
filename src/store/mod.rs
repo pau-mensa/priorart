@@ -206,8 +206,9 @@ impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            crate::ownership::create_private_dir(parent)?;
         }
+        crate::ownership::create_private_file(&path)?;
         let connection = Connection::open(&path)?;
         connection.pragma_update(None, "foreign_keys", true)?;
         connection.pragma_update(None, "synchronous", "FULL")?;

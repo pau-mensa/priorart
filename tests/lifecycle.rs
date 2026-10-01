@@ -175,3 +175,43 @@ fn collection_purge_revokes_only_its_grants_and_never_recreates_local() {
         Err(StoreError::CollectionNotFound(_))
     ));
 }
+
+#[cfg(unix)]
+#[test]
+fn data_directory_and_databases_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let parent = tempfile::tempdir().unwrap();
+    let data = parent.path().join("data");
+    let service = Service::open(Settings {
+        data_dir: data.clone(),
+        search_log_days: Some(1),
+        ..Default::default()
+    })
+    .unwrap();
+    service
+        .put(
+            &RequestContext::local(),
+            LOCAL,
+            "text",
+            None,
+            None,
+            WriteOptions::default(),
+        )
+        .unwrap();
+    let mode = |name: &str| {
+        std::fs::metadata(data.join(name))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert_eq!(mode(""), 0o700);
+    for file in [
+        DATABASE_FILE,
+        "priorart.sqlite-wal",
+        "searchlog.sqlite",
+        "writer.lock",
+    ] {
+        assert_eq!(mode(file), 0o600, "{file}");
+    }
+}
