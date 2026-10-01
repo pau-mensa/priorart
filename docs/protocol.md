@@ -56,11 +56,12 @@ location ~ ^/v1/collections/[^/]+/import$ {
 }
 ```
 
-`PRIORART_KEY_REQUESTS_PER_MINUTE` limits each key separately; a key over its
-limit gets `429 rate_limited` with `Retry-After`. Anonymous and operator requests
-are not limited, and limits reset on restart. Other abuse handling (per-IP
-limits, quotas, blocking) belongs in front of priorart. Serving a public
-collection to the internet needs at least a per-IP limit, for example nginx's
+`PRIORART_KEY_REQUESTS_PER_MINUTE` limits each key separately, as a bucket of
+that many requests that refills evenly over a minute, so a key can burst its
+whole allowance at once. A key over its limit gets `429 rate_limited` with
+`Retry-After`. Anonymous and operator requests are not limited, and limits reset
+on restart. Other abuse handling (per-IP limits, quotas, blocking) belongs in
+front of priorart. Serving a public collection to the internet needs at least a per-IP limit, for example nginx's
 `limit_req` or a Cloudflare rate-limiting rule. Behind Cloudflare, Browser Integrity
 Check refuses some scripted clients (Python's `urllib` gets `403`, error 1010);
 disable it for priorart's hostname. [`deploy/`](../deploy) has a Docker setup.
