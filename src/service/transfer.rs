@@ -23,9 +23,7 @@ impl Service {
         {
             return invalid("invalid export cursor");
         }
-        let handle = self.state(context, collection, Operation::Admin)?;
-        let state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
-        let store = &state.store;
+        let store = &self.connect()?;
         let scope = policy::collection(store, context, collection, Operation::Admin)?;
         if store.content_version(collection)? != generation {
             return Err(StoreError::ExportChanged.into());
@@ -99,9 +97,9 @@ impl Service {
                 source.revision
             ]))
         );
-        let handle = self.state(context, collection, Operation::Write)?;
-        let mut state = handle.lock().map_err(|_| ServiceError::Poisoned)?;
-        let State { store, index } = &mut *state;
+        let (store, slot) = self.state(context, collection, Operation::Write)?;
+        let mut index = slot.write().map_err(|_| ServiceError::Poisoned)?;
+        let store = &store;
         let intent = intent(
             context,
             collection,
@@ -129,7 +127,7 @@ impl Service {
                 metadata: source.metadata.as_ref(),
             },
         )?;
-        self.reindex(collection, "import", index, |index| {
+        self.reindex(collection, "import", &mut index, |index| {
             index.upsert(record, committed.value.1, fitted, source.metadata.as_ref())
         });
         Ok(committed)

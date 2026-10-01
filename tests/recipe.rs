@@ -184,3 +184,80 @@ fn another_recipe_ranks_and_a_failed_update_rebuilds_its_index() {
     put("a", "revised", "rust");
     assert_eq!(search(None)[2], ("a".into(), 2));
 }
+
+/// BM25, except that each search waits for `parties` searches to be ranking at once.
+struct Rendezvous {
+    parties: usize,
+    arrived: AtomicUsize,
+}
+
+impl Recipe for Rendezvous {
+    fn load(
+        &self,
+        collection: &str,
+        documents: Vec<IndexDocument>,
+    ) -> recipe::Result<Box<dyn CollectionIndex>> {
+        priorart::gather::Bm25Recipe.load(collection, documents)
+    }
+
+    fn pipeline(
+        &self,
+        query: &Query,
+        indexes: &[(&str, &dyn CollectionIndex)],
+    ) -> recipe::Result<SearchPipeline> {
+        self.arrived.fetch_add(1, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.arrived.load(Ordering::SeqCst) < self.parties {
+            if std::time::Instant::now() > deadline {
+                return Err("searches on one collection did not overlap".into());
+            }
+            std::thread::yield_now();
+        }
+        priorart::gather::Bm25Recipe.pipeline(query, indexes)
+    }
+}
+
+#[test]
+fn searches_on_one_collection_run_concurrently() {
+    let directory = tempfile::tempdir().unwrap();
+    let recipe = Arc::new(Rendezvous {
+        parties: 4,
+        arrived: AtomicUsize::new(0),
+    });
+    let service = Service::open_with(
+        Settings {
+            data_dir: directory.path().to_path_buf(),
+            ..Settings::default()
+        },
+        recipe.clone(),
+    )
+    .unwrap();
+    let local = RequestContext::local();
+    service
+        .put(
+            &local,
+            LOCAL_COLLECTION_ID,
+            "nccl barrier timeout",
+            None,
+            Some("nccl"),
+            WriteOptions::default(),
+        )
+        .unwrap();
+    let search = || {
+        let hits = service
+            .search(&local, &[LOCAL_COLLECTION_ID], "barrier", None, 5)
+            .unwrap();
+        assert_eq!(hits[0].id, "nccl");
+    };
+    std::thread::scope(|scope| {
+        // The first search is ranking, and holding the collection, before the rest start.
+        let first = scope.spawn(search);
+        while recipe.arrived.load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        let rest: Vec<_> = (1..recipe.parties).map(|_| scope.spawn(search)).collect();
+        for search in std::iter::once(first).chain(rest) {
+            search.join().unwrap();
+        }
+    });
+}

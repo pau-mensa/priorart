@@ -29,8 +29,9 @@ leaves a tombstone, so a deleted ID is never reused.
 
 One server owns a data directory: it holds an exclusive lock on `writer.lock`, and
 a second server on the same directory fails at startup. Use a local filesystem
-with reliable advisory locks. Within a collection, operations run one at a time;
-different collections run concurrently. `PRIORART_MAX_LOADED_INDEXES` (default 8)
+with reliable advisory locks. Searches run concurrently, also on one collection;
+writes to a collection run one at a time and wait for its in-flight searches, and
+reads of single records and exports take no collection lock. `PRIORART_MAX_LOADED_INDEXES` (default 8)
 bounds cached collections; idle ones are evicted, and when all are busy a request
 for another collection gets `429 resource_limit`.
 
