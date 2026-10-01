@@ -149,13 +149,12 @@ async fn forwarding_headers_from_untrusted_peers_are_rejected() {
     for peer in ["10.1.2.3:9", "127.0.0.1:9"] {
         let server = Server::start(peer, behind("192.168.0.1/32")).await;
         let forged = [("X-Forwarded-Proto", "https")];
-        assert_eq!(
-            server
-                .get(&server.records, Some(&server.keys[0]), &forged)
-                .await,
-            StatusCode::BAD_REQUEST,
-            "{peer}"
-        );
+        let response = server
+            .request(&server.records, Some(&server.keys[0]), &forged)
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{peer}");
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "untrusted_proxy", "{peer}");
     }
     let server = Server::start("10.1.2.3:9", behind("192.168.0.1/32")).await;
     assert_eq!(

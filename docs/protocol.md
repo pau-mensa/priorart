@@ -35,7 +35,7 @@ requires one of:
 
 Any other non-loopback peer gets `403 https_required`. `X-Forwarded-Proto` is the
 only forwarding header read. Other forwarding headers from trusted proxies are
-ignored; from any other peer, any forwarding header returns `400`. A proxy on the
+ignored; from any other peer, any forwarding header returns `400 untrusted_proxy`. A proxy on the
 same host connects from loopback, so list `127.0.0.1` (or `::1`); direct local
 clients on that address must then send `X-Forwarded-Proto: https` too. The proxy
 must overwrite, not append to, `X-Forwarded-Proto`. Caddy and Traefik do this by
@@ -260,6 +260,7 @@ Errors have fixed messages that never echo request contents:
 | Status | Code | Meaning |
 |---|---|---|
 | 400 | `invalid_input` | invalid scope, identifier, revision, content, or limit |
+| 400 | `untrusted_proxy` | a forwarding header from a peer not in `PRIORART_TRUSTED_PROXIES` |
 | 401 | `unauthenticated` | invalid key, or a mutation without one |
 | 403 | `https_required` | plain HTTP from a non-loopback peer, or a trusted proxy that did not report HTTPS |
 | 404 | `not_found` | unknown or forbidden resource, or unknown route |
